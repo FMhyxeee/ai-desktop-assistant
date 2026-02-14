@@ -1,0 +1,65 @@
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentProvider {
+    OpenAi,
+    Glm,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRuntimeConfig {
+    pub provider: AgentProvider,
+    pub model: String,
+    pub api_key_env: String,
+    pub system_prompt: String,
+}
+
+impl Default for AgentRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            provider: AgentProvider::OpenAi,
+            model: "gpt-4o-mini".to_string(),
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            system_prompt: "You are a desktop AI assistant.".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentEvent {
+    Started {
+        task_id: String,
+    },
+    Delta {
+        task_id: String,
+        chunk: String,
+    },
+    Completed {
+        task_id: String,
+        output: String,
+    },
+    Error {
+        task_id: String,
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum AppError {
+    #[error("missing environment variable: {0}")]
+    MissingEnv(String),
+    #[error("agent error: {0}")]
+    Agent(String),
+    #[error("task not found: {0}")]
+    TaskNotFound(String),
+}
+
+impl From<agent_lib::AgentError> for AppError {
+    fn from(value: agent_lib::AgentError) -> Self {
+        Self::Agent(value.to_string())
+    }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "ai-desktop-assistant",
+  "version": "0.1.0",
+  "description": "Desktop assistant app powered by agent-lib",
+  "type": "module",
+  "scripts": {
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "tauri": "tauri"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.10.0"
+  }
+}

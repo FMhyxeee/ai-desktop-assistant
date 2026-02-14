@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MotherDuck 风格设计系统演示</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&family=Fira+Code:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      /* 主色板 */
+      --color-primary: #FF6B35;
+      --color-primary-dark: #E85A2E;
+      --color-primary-light: #FF8B62;
+
+      /* 辅助色 */
+      --color-secondary: #2C3E50;
+      --color-secondary-dark: #1A252F;
+      --color-secondary-light: #34495E;
+
+      /* 强调色 */
+      --color-accent: #F7B731;
+      --color-accent-light: #FFD93D;
+
+      /* 文本颜色 */
+      --color-text-primary: #1F2937;
+      --color-text-secondary: #6B7280;
+      --color-text-tertiary: #9CA3AF;
+      --color-text-inverse: #FFFFFF;
+
+      /* 背景颜色 */
+      --color-bg-primary: #FFFFFF;
+      --color-bg-secondary: #F9FAFB;
+      --color-bg-tertiary: #F3F4F6;
+      --color-bg-inverse: #1F2937;
+
+      /* 边框颜色 */
+      --color-border-primary: #E5E7EB;
+      --color-border-secondary: #D1D5DB;
+      --color-border-focus: #FF6B35;
+
+      /* 语义色板 */
+      --color-success: #10B981;
+      --color-success-bg: #D1FAE5;
+      --color-warning: #F59E0B;
+      --color-warning-bg: #FEF3C7;
+      --color-error: #EF4444;
+      --color-error-bg: #FEE2E2;
+      --color-info: #3B82F6;
+      --color-info-bg: #DBEAFE;
+
+      /* 阴影 */
+      --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+      --shadow-base: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+      --shadow-md: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+      --shadow-lg: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+      --shadow-glow: 0 0 20px rgba(255, 107, 53, 0.3);
+
+      /* 字体 */
+      --font-heading: 'Space Grotesk', sans-serif;
+      --font-body: 'Inter', sans-serif;
+      --font-mono: 'Fira Code', monospace;
+
+      /* 间距 */
+      --spacing-1: 4px;
+      --spacing-2: 8px;
+      --spacing-3: 12px;
+      --spacing-4: 16px;
+      --spacing-6: 24px;
+      --spacing-8: 32px;
+      --spacing-12: 48px;
+
+      /* 过渡 */
+      --ease-out-cubic: cubic-bezier(0.33, 1, 0.68, 1);
+      --ease-in-out-cubic: cubic-bezier(0.65, 0, 0.35, 1);
+      --duration-base: 250ms;
+    }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: var(--font-body);
+      color: var(--color-text-primary);
+      background: var(--color-bg-secondary);
+      line-height: 1.7;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    /* 布局 */
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 0 var(--spacing-4);
+    }
+
+    .section {
+      padding: var(--spacing-12) 0;
+      margin-bottom: var(--spacing-8);
+    }
+
+    /* 排版 */
+    h1, h2, h3, h4, h5, h6 {
+      font-family: var(--font-heading);
+      font-weight: 700;
+      line-height: 1.2;
+      color: var(--color-text-primary);
+      margin-bottom: var(--spacing-4);
+    }
+
+    h1 { font-size: 56px; letter-spacing: -0.015em; }
+    h2 { font-size: 44px; letter-spacing: -0.01em; }
+    h3 { font-size: 30px; letter-spacing: -0.005em; }
+    h4 { font-size: 24px; }
+
+    p {
+      font-size: 16px;
+      color: var(--color-text-secondary);
+      margin-bottom: var(--spacing-4);
+    }
+
+    /* 按钮 */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 14px 28px;
+      border-radius: 12px;
+      font-weight: 600;
+      font-size: 16px;
+      border: none;
+      cursor: pointer;
+      transition: all var(--duration-base) var(--ease-out-cubic);
+      text-decoration: none;
+      gap: var(--spacing-2);
+    }
+
+    .btn-primary {
+      background: linear-gradient(135deg, #FF6B35 0%, #FF8B62 100%);
+      color: white;
+      box-shadow: 0 4px 14px rgba(255, 107, 53, 0.3);
+    }
+
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 20px rgba(255, 107, 53, 0.4);
+    }
+
+    .btn-primary:active {
+      transform: translateY(0);
+    }
+
+    .btn-secondary {
+      background: white;
+      color: #FF6B35;
+      border: 2px solid #FF6B35;
+    }
+
+    .btn-secondary:hover {
+      background: #FF6B35;
+      color: white;
+    }
+
+    .btn-text {
+      background: transparent;
+      color: #FF6B35;
+      padding: 8px 16px;
+      border-radius: 8px;
+    }
+
+    .btn-text:hover {
+      background: rgba(255, 107, 53, 0.1);
+    }
+
+    /* 卡片 */
+    .card {
+      background: white;
+      border-radius: 16px;
+      padding: var(--spacing-6);
+      box-shadow: var(--shadow-base);
+      border: 1px solid var(--color-border-primary);
+      transition: all var(--duration-base) var(--ease-out-cubic);
+    }
+
+    .card:hover {
+      transform: translateY(-4px);
+      box-shadow: var(--shadow-lg);
+      border-color: var(--color-primary);
+    }
+
+    .card-interactive {
+      cursor: pointer;
+    }
+
+    /* 标签 */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 6px 12px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+
+    .badge-primary {
+      background: rgba(255, 107, 53, 0.1);
+      color: #FF6B35;
+    }
+
+    .badge-success {
+      background: #D1FAE5;
+      color: #10B981;
+    }
+
+    .badge-warning {
+      background: #FEF3C7;
+      color: #F59E0B;
+    }
+
+    /* 输入框 */
+    .input {
+      width: 100%;
+      padding: 14px 16px;
+      border: 2px solid var(--color-border-primary);
+      border-radius: 12px;
+      font-size: 16px;
+      font-family: var(--font-body);
+      background: white;
+      transition: all var(--duration-base) var(--ease-in-out-cubic);
+    }
+
+    .input:focus {
+      outline: none;
+      border-color: var(--color-border-focus);
+      box-shadow: 0 0 0 4px rgba(255, 107, 53, 0.1);
+    }
+
+    .input::placeholder {
+      color: #9CA3AF;
+    }
+
+    /* 网格布局 */
+    .grid {
+      display: grid;
+      gap: var(--spacing-6);
+    }
+
+    .grid-2 {
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    }
+
+    .grid-3 {
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    }
+
+    .grid-4 {
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    }
+
+    /* Flex 布局 */
+    .flex {
+      display: flex;
+    }
+
+    .flex-center {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .flex-between {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .gap-2 { gap: var(--spacing-2); }
+    .gap-4 { gap: var(--spacing-4); }
+    .gap-6 { gap: var(--spacing-6); }
+
+    /* Hero Section */
+    .hero {
+      padding: var(--spacing-12) 0;
+      background: linear-gradient(180deg, #FFFFFF 0%, #F9FAFB 100%);
+      overflow: hidden;
+      position: relative;
+    }
+
+    .hero-content {
+      max-width: 800px;
+      margin: 0 auto;
+      text-align: center;
+      position: relative;
+      z-index: 1;
+    }
+
+    .hero h1 {
+      margin-bottom: var(--spacing-6);
+      background: linear-gradient(135deg, #FF6B35 0%, #2C3E50 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .hero-actions {
+      display: flex;
+      gap: var(--spacing-4);
+      justify-content: center;
+      margin-top: var(--spacing-8);
+    }
+
+    /* 颜色展示 */
+    .color-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: var(--spacing-4);
+    }
+
+    .color-card {
+      background: white;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: var(--shadow-base);
+      transition: transform var(--duration-base) var(--ease-out-cubic);
+    }
+
+    .color-card:hover {
+      transform: scale(1.05);
+    }
+
+    .color-swatch {
+      height: 120px;
+      width: 100%;
+    }
+
+    .color-info {
+      padding: var(--spacing-4);
+    }
+
+    .color-name {
+      font-weight: 600;
+      color: var(--color-text-primary);
+      margin-bottom: var(--spacing-1);
+    }
+
+    .color-hex {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      color: var(--color-text-tertiary);
+    }
+
+    /* 组件展示区 */
+    .component-section {
+      background: white;
+      border-radius: 16px;
+      padding: var(--spacing-8);
+      margin-bottom: var(--spacing-8);
+      box-shadow: var(--shadow-base);
+    }
+
+    .component-title {
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--color-text-tertiary);
+      margin-bottom: var(--spacing-4);
+    }
+
+    /* 动画 */
+    @keyframes fadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+
+    @keyframes slideUpFade {
+      from {
+        opacity: 0;
+        transform: translateY(20px);
+      }
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
+    }
+
+    .animate-fade-in {
+      animation: fadeIn 0.5s ease-out;
+    }
+
+    .animate-slide-up {
+      animation: slideUpFade 0.6s ease-out;
+    }
+
+    /* 响应式 */
+    @media (max-width: 768px) {
+      h1 { font-size: 36px; }
+      h2 { font-size: 30px; }
+
+      .hero-actions {
+        flex-direction: column;
+      }
+
+      .btn {
+        width: 100%;
+      }
+    }
+
+    /* 装饰元素 */
+    .decoration {
+      position: absolute;
+      width: 300px;
+      height: 300px;
+      background: radial-gradient(circle, rgba(255, 107, 53, 0.1) 0%, transparent 70%);
+      border-radius: 50%;
+      pointer-events: none;
+    }
+
+    .decoration-1 {
+      top: -100px;
+      right: -100px;
+    }
+
+    .decoration-2 {
+      bottom: -100px;
+      left: -100px;
+    }
+  </style>
+</head>
+<body>
+  <!-- Header -->
+  <header style="background: white; border-bottom: 1px solid var(--color-border-primary); padding: 16px 0;">
+    <div class="container">
+      <div class="flex-between">
+        <div class="flex" style="gap: 12px; align-items: center;">
+          <div style="width: 40px; height: 40px; background: linear-gradient(135deg, #FF6B35 0%, #FF8B62 100%); border-radius: 10px; display: flex; align-items: center; justify-content: center;">
+            <span style="color: white; font-weight: 700; font-size: 20px;">🦆</span>
+          </div>
+          <span style="font-family: var(--font-heading); font-weight: 700; font-size: 20px; color: var(--color-text-primary);">Design System</span>
+        </div>
+        <nav class="flex" style="gap: 24px;">
+          <a href="#colors" style="text-decoration: none; color: var(--color-text-secondary); font-weight: 500;">Colors</a>
+          <a href="#typography" style="text-decoration: none; color: var(--color-text-secondary); font-weight: 500;">Typography</a>
+          <a href="#components" style="text-decoration: none; color: var(--color-text-secondary); font-weight: 500;">Components</a>
+        </nav>
+      </div>
+    </div>
+  </header>
+
+  <!-- Hero Section -->
+  <section class="hero">
+    <div class="decoration decoration-1"></div>
+    <div class="decoration decoration-2"></div>
+    <div class="container">
+      <div class="hero-content animate-slide-up">
+        <span class="badge badge-primary" style="margin-bottom: 24px;">🎨 MotherDuck Style</span>
+        <h1>让设计变得简单有趣</h1>
+        <p style="font-size: 20px; color: var(--color-text-secondary); margin-bottom: 32px;">
+          一套现代、友好、专业的数据平台设计系统,充满活力又不失稳重
+        </p>
+        <div class="hero-actions">
+          <a href="#components" class="btn btn-primary">查看组件</a>
+          <a href="#colors" class="btn btn-secondary">探索配色</a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Color Palette -->
+  <section id="colors" class="section">
+    <div class="container">
+      <div class="component-section">
+        <div class="component-title">Color Palette 配色系统</div>
+        <h2 style="margin-bottom: 32px;">主色板</h2>
+        <div class="color-grid">
+          <div class="color-card">
+            <div class="color-swatch" style="background: #FF6B35;"></div>
+            <div class="color-info">
+              <div class="color-name">Primary</div>
+              <div class="color-hex">#FF6B35</div>
+            </div>
+          </div>
+          <div class="color-card">
+            <div class="color-swatch" style="background: #E85A2E;"></div>
+            <div class="color-info">
+              <div class="color-name">Primary Dark</div>
+              <div class="color-hex">#E85A2E</div>
+            </div>
+          </div>
+          <div class="color-card">
+            <div class="color-swatch" style="background: #FF8B62;"></div>
+            <div class="color-info">
+              <div class="color-name">Primary Light</div>
+              <div class="color-hex">#FF8B62</div>
+            </div>
+          </div>
+          <div class="color-card">
+            <div class="color-swatch" style="background: #2C3E50;"></div>
+            <div class="color-info">
+              <div class="color-name">Secondary</div>
+              <div class="color-hex">#2C3E50</div>
+            </div>
+          </div>
+          <div class="color-card">
+            <div class="color-swatch" style="background: #F7B731;"></div>
+            <div class="color-info">
+              <div class="color-name">Accent</div>
+              <div class="color-hex">#F7B731</div>
+            </div>
+          </div>
+          <div class="color-card">
+            <div class="color-swatch" style="background: #10B981;"></div>
+            <div class="color-info">
+              <div class="color-name">Success</div>
+              <div class="color-hex">#10B981</div>
+            </div>
+          </div>
+          <div class="color-card">
+            <div class="color-swatch" style="background: #F59E0B;"></div>
+            <div class="color-info">
+              <div class="color-name">Warning</div>
+              <div class="color-hex">#F59E0B</div>
+            </div>
+          </div>
+          <div class="color-card">
+            <div class="color-swatch" style="background: #EF4444;"></div>
+            <div class="color-info">
+              <div class="color-name">Error</div>
+              <div class="color-hex">#EF4444</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Typography -->
+  <section id="typography" class="section">
+    <div class="container">
+      <div class="component-section">
+        <div class="component-title">Typography 排版系统</div>
+        <h2 style="margin-bottom: 32px;">字体层级</h2>
+
+        <div style="margin-bottom: 48px;">
+          <h1 style="font-size: 72px; line-height: 1; margin-bottom: 8px;">Display XL</h1>
+          <p style="font-family: var(--font-mono); font-size: 14px; color: var(--color-text-tertiary);">72px / Bold / -0.02em letter-spacing</p>
+        </div>
+
+        <div style="margin-bottom: 48px;">
+          <h1 style="font-size: 56px; line-height: 1.1; margin-bottom: 8px;">Display LG</h1>
+          <p style="font-family: var(--font-mono); font-size: 14px; color: var(--color-text-tertiary);">56px / Bold / -0.015em letter-spacing</p>
+        </div>
+
+        <div style="margin-bottom: 48px;">
+          <h1>Heading 1</h1>
+          <p style="font-family: var(--font-mono); font-size: 14px; color: var(--color-text-tertiary);">36px / Bold / 1.3 line-height</p>
+        </div>
+
+        <div style="margin-bottom: 48px;">
+          <h2>Heading 2</h2>
+          <p style="font-family: var(--font-mono); font-size: 14px; color: var(--color-text-tertiary);">30px / Semibold / 1.4 line-height</p>
+        </div>
+
+        <div style="margin-bottom: 48px;">
+          <h3>Heading 3</h3>
+          <p style="font-family: var(--font-mono); font-size: 14px; color: var(--color-text-tertiary);">24px / Semibold / 1.5 line-height</p>
+        </div>
+
+        <div style="margin-bottom: 48px;">
+          <h4>Heading 4</h4>
+          <p style="font-family: var(--font-mono); font-size: 14px; color: var(--color-text-tertiary);">20px / Semibold / 1.5 line-height</p>
+        </div>
+
+        <div style="margin-bottom: 32px;">
+          <p style="font-size: 20px; font-weight: 400; line-height: 1.6; margin-bottom: 8px; color: var(--color-text-primary);">Body Large</p>
+          <p style="font-family: var(--font-mono); font-size: 14px; color: var(--color-text-tertiary);">20px / Regular / 1.6 line-height</p>
+        </div>
+
+        <div style="margin-bottom: 32px;">
+          <p style="font-size: 16px; font-weight: 400; line-height: 1.7; margin-bottom: 8px; color: var(--color-text-primary);">Body Medium</p>
+          <p style="font-family: var(--font-mono); font-size: 14px; color: var(--color-text-tertiary);">16px / Regular / 1.7 line-height</p>
+        </div>
+
+        <div style="margin-bottom: 32px;">
+          <p style="font-size: 14px; font-weight: 400; line-height: 1.7; margin-bottom: 8px; color: var(--color-text-primary);">Body Small</p>
+          <p style="font-family: var(--font-mono); font-size: 14px; color: var(--color-text-tertiary);">14px / Regular / 1.7 line-height</p>
+        </div>
+
+        <div>
+          <p style="font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 8px; color: var(--color-text-primary);">CAPTION / OVERLINE</p>
+          <p style="font-family: var(--font-mono); font-size: 14px; color: var(--color-text-tertiary);">12px / Semibold / 0.06em letter-spacing / uppercase</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Components -->
+  <section id="components" class="section">
+    <div class="container">
+      <div class="component-section">
+        <div class="component-title">Components 组件展示</div>
+        <h2 style="margin-bottom: 32px;">按钮</h2>
+
+        <div class="grid grid-3" style="margin-bottom: 48px;">
+          <div>
+            <h4 style="margin-bottom: 16px;">Primary Button</h4>
+            <button class="btn btn-primary">Primary Action</button>
+          </div>
+          <div>
+            <h4 style="margin-bottom: 16px;">Secondary Button</h4>
+            <button class="btn btn-secondary">Secondary</button>
+          </div>
+          <div>
+            <h4 style="margin-bottom: 16px;">Text Button</h4>
+            <button class="btn btn-text">Text Only</button>
+          </div>
+        </div>
+
+        <h2 style="margin-bottom: 32px;">标签 / Badges</h2>
+
+        <div class="flex gap-4" style="margin-bottom: 48px;">
+          <span class="badge badge-primary">Primary</span>
+          <span class="badge badge-success">Success</span>
+          <span class="badge badge-warning">Warning</span>
+        </div>
+
+        <h2 style="margin-bottom: 32px;">输入框</h2>
+
+        <div style="max-width: 500px; margin-bottom: 48px;">
+          <input type="text" class="input" placeholder="Enter your email address...">
+        </div>
+
+        <h2 style="margin-bottom: 32px;">卡片</h2>
+
+        <div class="grid grid-2">
+          <div class="card card-interactive">
+            <h4 style="margin-bottom: 12px;">Data Warehouse + AI</h4>
+            <p>Scale per-user compute nodes independently, serving sub-second latency without resource contention.</p>
+            <a href="#" class="btn-text" style="margin-top: 16px;">Learn more →</a>
+          </div>
+
+          <div class="card card-interactive">
+            <h4 style="margin-bottom: 12px;">MotherDuck MCP Server</h4>
+            <p>Turn natural language questions into accurate, traceable SQL queries with fully sandboxed compute.</p>
+            <a href="#" class="btn-text" style="margin-top: 16px;">Learn more →</a>
+          </div>
+
+          <div class="card card-interactive">
+            <h4 style="margin-bottom: 12px;">Customer-facing Analytics</h4>
+            <p>Built directly into your product for end users. Delivers near real-time, low-latency insights at scale.</p>
+            <a href="#" class="btn-text" style="margin-top: 16px;">Learn more →</a>
+          </div>
+
+          <div class="card card-interactive">
+            <h4 style="margin-bottom: 12px;">Hypertenancy</h4>
+            <p>Scale per-user compute nodes independently, serving sub-second latency without resource contention.</p>
+            <a href="#" class="btn-text" style="margin-top: 16px;">Learn more →</a>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Interactive Section -->
+  <section class="section">
+    <div class="container">
+      <div class="component-section" style="background: linear-gradient(135deg, #FF6B35 0%, #FF8B62 100%); color: white;">
+        <div class="flex-between" style="flex-wrap: wrap; gap: 32px;">
+          <div style="max-width: 600px;">
+            <h2 style="color: white; margin-bottom: 16px;">开始使用这个设计系统</h2>
+            <p style="color: rgba(255, 255, 255, 0.9); margin-bottom: 24px;">
+              这套设计系统可以直接用于生产环境。所有组件都经过精心设计,具有良好的可访问性和用户体验。
+            </p>
+            <div class="flex gap-4">
+              <button class="btn" style="background: white; color: #FF6B35;">获取代码</button>
+              <button class="btn" style="background: transparent; color: white; border: 2px solid white;">查看文档</button>
+            </div>
+          </div>
+          <div style="flex: 1; min-width: 300px; text-align: center;">
+            <div style="font-size: 120px; animation: fadeIn 1s ease-out;">🦆</div>
+            <p style="color: rgba(255, 255, 255, 0.9); margin-top: 16px;">Make it ducking awesome!</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer style="background: var(--color-bg-inverse); color: white; padding: 48px 0;">
+    <div class="container">
+      <div class="flex-between" style="flex-wrap: wrap; gap: 32px;">
+        <div>
+          <div class="flex" style="gap: 12px; align-items: center; margin-bottom: 16px;">
+            <div style="width: 40px; height: 40px; background: linear-gradient(135deg, #FF6B35 0%, #FF8B62 100%); border-radius: 10px; display: flex; align-items: center; justify-content: center;">
+              <span style="color: white; font-weight: 700; font-size: 20px;">🦆</span>
+            </div>
+            <span style="font-family: var(--font-heading); font-weight: 700; font-size: 20px;">Design System</span>
+          </div>
+          <p style="color: rgba(255, 255, 255, 0.6);">Made with ❤️ inspired by MotherDuck</p>
+        </div>
+        <div class="flex gap-6">
+          <a href="#" style="color: rgba(255, 255, 255, 0.6); text-decoration: none; transition: color 0.2s;">Documentation</a>
+          <a href="#" style="color: rgba(255, 255, 255, 0.6); text-decoration: none; transition: color 0.2s;">Components</a>
+          <a href="#" style="color: rgba(255, 255, 255, 0.6); text-decoration: none; transition: color 0.2s;">Examples</a>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    // 添加滚动动画
+    const observerOptions = {
+      threshold: 0.1,
+      rootMargin: '0px 0px -50px 0px'
+    };
+
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          entry.target.style.opacity = '1';
+          entry.target.style.transform = 'translateY(0)';
+        }
+      });
+    }, observerOptions);
+
+    // 观察所有卡片
+    document.querySelectorAll('.card').forEach(card => {
+      card.style.opacity = '0';
+      card.style.transform = 'translateY(20px)';
+      card.style.transition = 'opacity 0.6s ease-out, transform 0.6s ease-out';
+      observer.observe(card);
+    });
+
+    // 平滑滚动
+    document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+      anchor.addEventListener('click', function (e) {
+        e.preventDefault();
+        const target = document.querySelector(this.getAttribute('href'));
+        if (target) {
+          target.scrollIntoView({
+            behavior: 'smooth',
+            block: 'start'
+          });
+        }
+      });
+    });
+  </script>
+</body>
+</html>
