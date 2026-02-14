@@ -8,6 +8,7 @@ Desktop assistant app that integrates `agent-lib` as the AI core.
 - `agent-lib` is managed in its own repository.
 - During local iteration this project uses a path dependency:
   - `src-tauri/Cargo.toml` -> `agent-lib = { path = "../../agent-lib" }`
+  - `agent-lib` uses flattened build now, so do not add `features = [...]` on this dependency.
 
 ## Run Locally
 
@@ -46,5 +47,6 @@ After `agent-lib` is stable:
 agent-lib = { git = "https://<your-host>/<org>/agent-lib.git", tag = "v0.1.0" }
 ```
 
-3. Commit dependency upgrade in this repository.
+Do not add a feature list for `agent-lib` in the git dependency form either.
 
+3. Commit dependency upgrade in this repository.
