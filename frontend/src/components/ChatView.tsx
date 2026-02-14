@@ -1,14 +1,24 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Menu, Settings } from 'lucide-react';
+import { Menu, PanelRight, Settings } from 'lucide-react';
 import MessageList from './MessageList';
 import ChatInput from './ChatInput';
+import ProtocolPanel from './ProtocolPanel';
 import Sidebar from './Sidebar';
 import SettingsModal from './SettingsModal';
-import type { AgentEvent } from '../types';
+import type { AgentEvent, InputCard, ProtocolEventPayload, ProtocolOpPayload } from '../types';
 import { AgentEventType } from '../types';
 import { TauriAPI } from '../lib/tauri';
 import { logger } from '../lib/logger';
 import { useAppStore } from '../store/appStore';
+
+const COMPACT_LAYOUT_QUERY = '(max-width: 1024px)';
+
+const detectCompactLayout = (): boolean => {
+  if (typeof window === 'undefined') {
+    return false;
+  }
+  return window.matchMedia(COMPACT_LAYOUT_QUERY).matches;
+};
 
 const createTaskId = (): string => {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -25,6 +35,8 @@ const ChatView: React.FC = () => {
     createConversation,
     ensureConversation,
     addMessage,
+    addOpCard,
+    addProtocolEventCard,
     beginStream,
     appendStreamDelta,
     completeStream,
@@ -34,12 +46,15 @@ const ChatView: React.FC = () => {
     streamingTaskId,
     exportConversation,
     deleteConversation,
+    retryFromCard,
     hydrate,
     isHydrated,
   } = useAppStore();
 
-  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [isCompactLayout, setIsCompactLayout] = useState(detectCompactLayout);
+  const [sidebarOpen, setSidebarOpen] = useState(() => !detectCompactLayout());
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [protocolOpen, setProtocolOpen] = useState(() => !detectCompactLayout());
   const unlistenRef = useRef<(() => void) | null>(null);
 
   const currentConversation = conversations.find(
@@ -70,6 +85,29 @@ const ChatView: React.FC = () => {
     });
   }, [config, isHydrated]);
 
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    const mediaQuery = window.matchMedia(COMPACT_LAYOUT_QUERY);
+    const handleChange = (event: MediaQueryListEvent) => {
+      setIsCompactLayout(event.matches);
+    };
+
+    setIsCompactLayout(mediaQuery.matches);
+    mediaQuery.addEventListener('change', handleChange);
+    return () => mediaQuery.removeEventListener('change', handleChange);
+  }, []);
+
+  useEffect(() => {
+    if (!isCompactLayout) {
+      return;
+    }
+    setSidebarOpen(false);
+    setProtocolOpen(false);
+  }, [isCompactLayout]);
+
   const handleAgentEvent = useCallback(
     (event: AgentEvent) => {
       switch (event.type) {
@@ -97,12 +135,24 @@ const ChatView: React.FC = () => {
           });
           break;
         }
+        case AgentEventType.OpSubmitted: {
+          if (event.payload && typeof event.seq === 'number') {
+            addOpCard(event.task_id, event.seq, event.payload as ProtocolOpPayload);
+          }
+          break;
+        }
+        case AgentEventType.ProtocolEvent: {
+          if (event.payload && typeof event.seq === 'number') {
+            addProtocolEventCard(event.task_id, event.seq, event.payload as ProtocolEventPayload);
+          }
+          break;
+        }
         default: {
           logger.warn('Unknown agent event type', { event });
         }
       }
     },
-    [appendStreamDelta, completeStream, failStream]
+    [addOpCard, addProtocolEventCard, appendStreamDelta, completeStream, failStream]
   );
 
   useEffect(() => {
@@ -135,7 +185,7 @@ const ChatView: React.FC = () => {
   }, [handleAgentEvent]);
 
   const handleSendMessage = useCallback(
-    async (content: string) => {
+    async (input: InputCard) => {
       if (!isHydrated || streamingTaskId) {
         return;
       }
@@ -145,9 +195,10 @@ const ChatView: React.FC = () => {
         setCurrentConversation(conversationId);
       }
 
+      const userContent = input.kind === 'command' ? `$ ${input.content}` : input.content;
       const userMessageId = addMessage(conversationId, {
         role: 'user',
-        content,
+        content: userContent,
       });
 
       if (!userMessageId) {
@@ -156,7 +207,7 @@ const ChatView: React.FC = () => {
       }
 
       const taskId = createTaskId();
-      const assistantMessageId = beginStream(conversationId, taskId);
+      const assistantMessageId = beginStream(conversationId, taskId, input);
       if (!assistantMessageId) {
         logger.error('Failed to create stream placeholder message', {
           conversationId,
@@ -166,11 +217,12 @@ const ChatView: React.FC = () => {
       }
 
       try {
-        await TauriAPI.startAgentStream(content, taskId);
+        await TauriAPI.startAgentStream(input, taskId);
         logger.info('Agent stream request sent', {
           taskId,
           conversationId,
           assistantMessageId,
+          inputKind: input.kind,
         });
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -192,6 +244,19 @@ const ChatView: React.FC = () => {
       setCurrentConversation,
       streamingTaskId,
     ]
+  );
+
+  const handleRetryCard = useCallback(
+    (cardId: string) => {
+      if (!currentConversationId || streamingTaskId) {
+        return;
+      }
+      const input = retryFromCard(currentConversationId, cardId);
+      if (input) {
+        void handleSendMessage(input);
+      }
+    },
+    [currentConversationId, handleSendMessage, retryFromCard, streamingTaskId]
   );
 
   const handleCancelStream = useCallback(async () => {
@@ -216,12 +281,21 @@ const ChatView: React.FC = () => {
   return (
     <div className="app-shell">
       <div className="app-canvas">
-        {sidebarOpen && (
+        {isCompactLayout && sidebarOpen && (
           <button
             type="button"
             aria-label="关闭侧边栏"
             className="app-overlay"
             onClick={() => setSidebarOpen(false)}
+          />
+        )}
+
+        {isCompactLayout && protocolOpen && (
+          <button
+            type="button"
+            aria-label="关闭协议面板"
+            className="protocol-overlay"
+            onClick={() => setProtocolOpen(false)}
           />
         )}
 
@@ -231,11 +305,15 @@ const ChatView: React.FC = () => {
             currentConversationId={currentConversationId}
             onNewConversation={() => {
               createConversation();
-              setSidebarOpen(false);
+              if (isCompactLayout) {
+                setSidebarOpen(false);
+              }
             }}
             onSelectConversation={(id) => {
               setCurrentConversation(id);
-              setSidebarOpen(false);
+              if (isCompactLayout) {
+                setSidebarOpen(false);
+              }
             }}
             onDeleteConversation={deleteConversation}
             onExportConversation={exportConversation}
@@ -248,21 +326,20 @@ const ChatView: React.FC = () => {
             <div className="topbar-left">
               <button
                 type="button"
-                onClick={() => setSidebarOpen(true)}
-                className="icon-btn mobile-only"
-                aria-label="打开侧边栏"
+                onClick={() => setSidebarOpen((value) => !value)}
+                className={`icon-btn ${sidebarOpen ? 'is-active' : ''}`}
+                title={sidebarOpen ? '隐藏侧边栏' : '显示侧边栏'}
+                aria-label={sidebarOpen ? '隐藏侧边栏' : '显示侧边栏'}
               >
                 <Menu size={20} />
               </button>
 
               <div>
-                <h1 className="topbar-title">
-                  {currentConversation?.title || 'AI 桌面助手'}
-                </h1>
+                <h1 className="topbar-title">{currentConversation?.title || 'AI 桌面助手'}</h1>
                 <p className="topbar-subtitle">
                   {isStreaming
-                    ? '正在实时生成回复...'
-                    : '支持流式输出与 Markdown 渲染的结构化对话工作区'}
+                    ? '正在实时生成回复与协议事件...'
+                    : '左侧对话 + 右侧 Op/Event 协议卡片时间线'}
                 </p>
               </div>
             </div>
@@ -271,6 +348,16 @@ const ChatView: React.FC = () => {
               <span className={`status-pill ${isStreaming ? 'live' : ''}`}>
                 {isStreaming ? '进行中' : '就绪'}
               </span>
+
+              <button
+                type="button"
+                onClick={() => setProtocolOpen((value) => !value)}
+                className={`icon-btn ${protocolOpen ? 'is-active' : ''}`}
+                title={protocolOpen ? '隐藏协议面板' : '显示协议面板'}
+                aria-label={protocolOpen ? '隐藏协议面板' : '显示协议面板'}
+              >
+                <PanelRight size={20} />
+              </button>
 
               <button
                 type="button"
@@ -284,14 +371,21 @@ const ChatView: React.FC = () => {
             </div>
           </header>
 
-          <MessageList messages={currentConversation?.messages || []} />
+          <div className="workspace">
+            <section className="chat-column">
+              <MessageList messages={currentConversation?.messages || []} />
+              <ChatInput
+                onSend={handleSendMessage}
+                disabled={!isHydrated || isStreaming}
+                isStreaming={isStreaming}
+                onCancel={handleCancelStream}
+              />
+            </section>
 
-          <ChatInput
-            onSend={handleSendMessage}
-            disabled={!isHydrated || isStreaming}
-            isStreaming={isStreaming}
-            onCancel={handleCancelStream}
-          />
+            <section className={`protocol-column ${protocolOpen ? 'open' : ''}`}>
+              <ProtocolPanel cards={currentConversation?.protocolCards || []} onRetry={handleRetryCard} />
+            </section>
+          </div>
         </main>
       </div>
 
