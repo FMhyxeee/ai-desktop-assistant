@@ -1,4 +1,4 @@
-﻿import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Menu, Settings } from 'lucide-react';
 import MessageList from './MessageList';
 import ChatInput from './ChatInput';
@@ -19,6 +19,7 @@ const createTaskId = (): string => {
 
 const ChatView: React.FC = () => {
   const {
+    config,
     conversations,
     currentConversationId,
     createConversation,
@@ -54,6 +55,20 @@ const ChatView: React.FC = () => {
       createConversation();
     }
   }, [isHydrated, conversations.length, currentConversationId, createConversation]);
+
+  useEffect(() => {
+    if (!isHydrated) {
+      return;
+    }
+
+    void TauriAPI.updateRuntimeConfig(config).catch((error) => {
+      logger.error('Failed to sync runtime config', {
+        error,
+        provider: config.provider,
+        model: config.model,
+      });
+    });
+  }, [config, isHydrated]);
 
   const handleAgentEvent = useCallback(
     (event: AgentEvent) => {

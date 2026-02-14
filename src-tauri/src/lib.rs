@@ -1,21 +1,31 @@
 pub mod agent_service;
 
-use agent_service::types::AgentEvent;
+use std::sync::Arc;
+use std::time::Instant;
+
+use agent_service::types::{AgentEvent, AgentRuntimeConfig};
 use agent_service::AgentService;
+use serde::Serialize;
+use tauri::async_runtime::Mutex;
 use tauri::Emitter;
 
 #[derive(Clone)]
 struct AppState {
-    agent_service: AgentService,
+    agent_service: Arc<Mutex<AgentService>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionTestResult {
+    success: bool,
+    message: String,
+    latency_ms: u128,
 }
 
 #[tauri::command]
 async fn ask_agent(state: tauri::State<'_, AppState>, input: String) -> Result<String, String> {
-    state
-        .agent_service
-        .chat(input)
-        .await
-        .map_err(|err| err.to_string())
+    let service = { state.agent_service.lock().await.clone() };
+    service.chat(input).await.map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -26,8 +36,8 @@ async fn start_agent_stream(
     task_id: Option<String>,
 ) -> Result<String, String> {
     let task_id = task_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    state
-        .agent_service
+    let service = { state.agent_service.lock().await.clone() };
+    service
         .chat_stream(task_id.clone(), input, move |event: AgentEvent| {
             let _ = app.emit("agent://event", &event);
         })
@@ -41,11 +51,68 @@ async fn cancel_agent_task(
     state: tauri::State<'_, AppState>,
     task_id: String,
 ) -> Result<(), String> {
-    state
-        .agent_service
+    let service = { state.agent_service.lock().await.clone() };
+    service
         .cancel(&task_id)
         .await
         .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn update_runtime_config(
+    state: tauri::State<'_, AppState>,
+    config: AgentRuntimeConfig,
+) -> Result<(), String> {
+    let service = AgentService::new_with_config(config).map_err(|err| err.to_string())?;
+    let mut guard = state.agent_service.lock().await;
+    *guard = service;
+    Ok(())
+}
+
+#[tauri::command]
+async fn test_runtime_config(config: AgentRuntimeConfig) -> Result<ConnectionTestResult, String> {
+    let started = Instant::now();
+    let service = match AgentService::new_with_config(config) {
+        Ok(service) => service,
+        Err(err) => {
+            return Ok(ConnectionTestResult {
+                success: false,
+                message: format!("配置校验失败：{err}"),
+                latency_ms: started.elapsed().as_millis(),
+            });
+        }
+    };
+
+    let response = service.chat("请只回复：OK".to_string()).await;
+    let latency_ms = started.elapsed().as_millis();
+
+    match response {
+        Ok(output) => Ok(ConnectionTestResult {
+            success: true,
+            message: format!("连接成功，模型返回：{}", summarize_text(&output, 80)),
+            latency_ms,
+        }),
+        Err(err) => Ok(ConnectionTestResult {
+            success: false,
+            message: format!("连接失败：{err}"),
+            latency_ms,
+        }),
+    }
+}
+
+fn summarize_text(input: &str, max_chars: usize) -> String {
+    let compact = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut buf = String::new();
+    for ch in compact.chars().take(max_chars) {
+        buf.push(ch);
+    }
+    if compact.chars().count() > max_chars {
+        format!("{buf}...")
+    } else if buf.is_empty() {
+        "(空响应)".to_string()
+    } else {
+        buf
+    }
 }
 
 #[tauri::command]
@@ -73,11 +140,15 @@ pub fn run() {
     let agent_service = AgentService::from_env().expect("agent service bootstrap failed");
 
     tauri::Builder::default()
-        .manage(AppState { agent_service })
+        .manage(AppState {
+            agent_service: Arc::new(Mutex::new(agent_service)),
+        })
         .invoke_handler(tauri::generate_handler![
             ask_agent,
             start_agent_stream,
             cancel_agent_task,
+            update_runtime_config,
+            test_runtime_config,
             frontend_log
         ])
         .plugin(tauri_plugin_store::Builder::new().build())

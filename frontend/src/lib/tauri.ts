@@ -1,6 +1,40 @@
-﻿import { invoke } from '@tauri-apps/api/core';
+import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { AgentEvent } from '../types';
+import type { AgentEvent, AppConfig } from '../types';
+
+interface RuntimeConfigPayload {
+  provider: string;
+  model: string;
+  apiKeyEnv: string;
+  apiKey: string | null;
+  baseUrl: string | null;
+  maxTokens: number | null;
+  systemPrompt: string;
+}
+
+export interface RuntimeConnectionTestResult {
+  success: boolean;
+  message: string;
+  latencyMs: number;
+}
+
+const toRuntimeConfigPayload = (config: AppConfig): RuntimeConfigPayload => {
+  const apiKey = config.apiKey?.trim() ?? '';
+  const baseUrl = config.baseUrl?.trim() ?? '';
+
+  return {
+    provider: config.provider,
+    model: config.model.trim(),
+    apiKeyEnv: config.apiKeyEnv.trim(),
+    apiKey: apiKey.length > 0 ? apiKey : null,
+    baseUrl: baseUrl.length > 0 ? baseUrl : null,
+    maxTokens:
+      typeof config.maxTokens === 'number' && Number.isFinite(config.maxTokens) && config.maxTokens > 0
+        ? Math.floor(config.maxTokens)
+        : null,
+    systemPrompt: config.systemPrompt.trim(),
+  };
+};
 
 export type FrontendLogLevel = 'debug' | 'info' | 'warn' | 'error';
 
@@ -32,6 +66,28 @@ export class TauriAPI {
     } catch (error) {
       console.error('cancel_agent_task error:', error);
       throw new Error(typeof error === 'string' ? error : 'Failed to cancel task');
+    }
+  }
+
+  static async updateRuntimeConfig(config: AppConfig): Promise<void> {
+    try {
+      await invoke('update_runtime_config', {
+        config: toRuntimeConfigPayload(config),
+      });
+    } catch (error) {
+      console.error('update_runtime_config error:', error);
+      throw new Error(typeof error === 'string' ? error : 'Failed to update runtime config');
+    }
+  }
+
+  static async testRuntimeConfig(config: AppConfig): Promise<RuntimeConnectionTestResult> {
+    try {
+      return await invoke<RuntimeConnectionTestResult>('test_runtime_config', {
+        config: toRuntimeConfigPayload(config),
+      });
+    } catch (error) {
+      console.error('test_runtime_config error:', error);
+      throw new Error(typeof error === 'string' ? error : 'Failed to test runtime config');
     }
   }
 

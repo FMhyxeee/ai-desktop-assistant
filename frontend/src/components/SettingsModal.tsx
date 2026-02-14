@@ -1,25 +1,121 @@
 ﻿import React from 'react';
-import { Eye, EyeOff, Save, X } from 'lucide-react';
+import { Eye, EyeOff, PlugZap, Save, X } from 'lucide-react';
+import { applyProviderDefaults, getProviderPreset, PROVIDER_PRESETS } from '../config/providers';
+import { TauriAPI } from '../lib/tauri';
 import { useAppStore } from '../store/appStore';
-import { AgentProvider } from '../types';
+import { AgentProvider, type AppConfig } from '../types';
 
 interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
 }
 
+interface TestFeedback {
+  type: 'success' | 'error';
+  message: string;
+}
+
+const getErrorMessage = (error: unknown): string => {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  if (typeof error === 'string' && error.trim()) {
+    return error;
+  }
+  return '保存设置失败，请检查配置后重试。';
+};
+
+const normalizeConfigForSave = (config: AppConfig): AppConfig => ({
+  ...config,
+  model: config.model.trim(),
+  apiKeyEnv: config.apiKeyEnv.trim(),
+  apiKey: (config.apiKey ?? '').trim(),
+  baseUrl: (config.baseUrl ?? '').trim(),
+  systemPrompt: config.systemPrompt.trim(),
+});
+
 const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
-  const { config, updateConfig } = useAppStore();
+  const { config, updateConfig, streamingTaskId } = useAppStore();
   const [localConfig, setLocalConfig] = React.useState(config);
   const [showApiKey, setShowApiKey] = React.useState(false);
+  const [isSaving, setIsSaving] = React.useState(false);
+  const [isTesting, setIsTesting] = React.useState(false);
+  const [saveError, setSaveError] = React.useState<string | null>(null);
+  const [testFeedback, setTestFeedback] = React.useState<TestFeedback | null>(null);
 
   React.useEffect(() => {
     setLocalConfig(config);
+    setShowApiKey(false);
+    setSaveError(null);
+    setTestFeedback(null);
+    setIsTesting(false);
   }, [config, isOpen]);
 
-  const handleSave = () => {
-    updateConfig(localConfig);
-    onClose();
+  const providerPreset = getProviderPreset(localConfig.provider);
+
+  const handleProviderChange = (provider: AgentProvider) => {
+    setLocalConfig((prev) => applyProviderDefaults(prev, provider));
+    setShowApiKey(false);
+    setSaveError(null);
+    setTestFeedback(null);
+  };
+
+  const handleTestConnection = async () => {
+    if (streamingTaskId) {
+      setTestFeedback({
+        type: 'error',
+        message: '当前有进行中的会话，请先停止生成再测试连接。',
+      });
+      return;
+    }
+
+    const normalized = normalizeConfigForSave(localConfig);
+    if (!normalized.model) {
+      setTestFeedback({ type: 'error', message: '模型名称不能为空。' });
+      return;
+    }
+
+    setIsTesting(true);
+    setSaveError(null);
+    setTestFeedback(null);
+
+    try {
+      const result = await TauriAPI.testRuntimeConfig(normalized);
+      setTestFeedback({
+        type: result.success ? 'success' : 'error',
+        message: `${result.message}（${result.latencyMs} ms）`,
+      });
+    } catch (error) {
+      setTestFeedback({ type: 'error', message: getErrorMessage(error) });
+    } finally {
+      setIsTesting(false);
+    }
+  };
+
+  const handleSave = async () => {
+    if (streamingTaskId) {
+      setSaveError('当前有进行中的会话，请先停止生成再保存设置。');
+      return;
+    }
+
+    const normalized = normalizeConfigForSave(localConfig);
+    if (!normalized.model) {
+      setSaveError('模型名称不能为空。');
+      return;
+    }
+
+    setIsSaving(true);
+    setSaveError(null);
+
+    try {
+      await TauriAPI.updateRuntimeConfig(normalized);
+      updateConfig(normalized);
+      onClose();
+    } catch (error) {
+      setSaveError(getErrorMessage(error));
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   if (!isOpen) {
@@ -49,17 +145,16 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
             <select
               id="provider-select"
               value={localConfig.provider}
-              onChange={(event) =>
-                setLocalConfig({
-                  ...localConfig,
-                  provider: event.target.value as AgentProvider,
-                })
-              }
+              onChange={(event) => handleProviderChange(event.target.value as AgentProvider)}
               className="field-select"
             >
-              <option value={AgentProvider.OpenAi}>OpenAI</option>
-              <option value={AgentProvider.Glm}>GLM</option>
+              {PROVIDER_PRESETS.map((preset) => (
+                <option key={preset.value} value={preset.value}>
+                  {preset.label}
+                </option>
+              ))}
             </select>
+            <p className="field-help">{providerPreset.description}</p>
           </section>
 
           <section className="field-group">
@@ -71,26 +166,39 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
               type="text"
               value={localConfig.model}
               onChange={(event) => setLocalConfig({ ...localConfig, model: event.target.value })}
-              placeholder="gpt-4o-mini / glm-4"
+              placeholder={providerPreset.defaultModel}
               className="field-input"
             />
-            <p className="field-help">请填写当前提供商支持的模型名称。</p>
+            <p className="field-help">{providerPreset.modelHint}</p>
           </section>
 
-          {localConfig.provider === AgentProvider.OpenAi ? (
+          <section className="field-group">
+            <label className="field-label" htmlFor="api-key-env-input">
+              API Key 环境变量
+            </label>
+            <input
+              id="api-key-env-input"
+              type="text"
+              value={localConfig.apiKeyEnv}
+              onChange={(event) => setLocalConfig({ ...localConfig, apiKeyEnv: event.target.value })}
+              placeholder={providerPreset.defaultApiKeyEnv}
+              className="field-input"
+            />
+            <p className="field-help">未填写 API Key 时，后端将从该环境变量读取。</p>
+          </section>
+
+          {providerPreset.supportsApiKey && (
             <section className="field-group">
-              <label className="field-label" htmlFor="openai-key">
-                OpenAI API Key
+              <label className="field-label" htmlFor="provider-api-key">
+                {providerPreset.apiKeyLabel ?? 'API Key'}
               </label>
               <div className="password-wrap">
                 <input
-                  id="openai-key"
+                  id="provider-api-key"
                   type={showApiKey ? 'text' : 'password'}
-                  value={localConfig.openAiApiKey || ''}
-                  onChange={(event) =>
-                    setLocalConfig({ ...localConfig, openAiApiKey: event.target.value })
-                  }
-                  placeholder="sk-..."
+                  value={localConfig.apiKey || ''}
+                  onChange={(event) => setLocalConfig({ ...localConfig, apiKey: event.target.value })}
+                  placeholder={providerPreset.apiKeyPlaceholder ?? '请输入 API Key'}
                   className="field-input"
                 />
                 <button
@@ -102,49 +210,54 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
                   {showApiKey ? <EyeOff size={16} /> : <Eye size={16} />}
                 </button>
               </div>
-              <p className="field-help">留空时将使用环境变量 OPENAI_API_KEY。</p>
+              <p className="field-help">可留空，留空时将读取上面的环境变量。</p>
             </section>
-          ) : (
-            <>
-              <section className="field-group">
-                <label className="field-label" htmlFor="glm-key">
-                  GLM API Key
-                </label>
-                <div className="password-wrap">
-                  <input
-                    id="glm-key"
-                    type={showApiKey ? 'text' : 'password'}
-                    value={localConfig.glmApiKey || ''}
-                    onChange={(event) => setLocalConfig({ ...localConfig, glmApiKey: event.target.value })}
-                    placeholder="请输入 GLM API Key"
-                    className="field-input"
-                  />
-                  <button
-                    type="button"
-                    className="toggle-visibility"
-                    onClick={() => setShowApiKey((prev) => !prev)}
-                    aria-label="切换密钥显示"
-                  >
-                    {showApiKey ? <EyeOff size={16} /> : <Eye size={16} />}
-                  </button>
-                </div>
-              </section>
+          )}
 
-              <section className="field-group">
-                <label className="field-label" htmlFor="glm-url">
-                  GLM Base URL
-                </label>
-                <input
-                  id="glm-url"
-                  type="text"
-                  value={localConfig.glmUrl || ''}
-                  onChange={(event) => setLocalConfig({ ...localConfig, glmUrl: event.target.value })}
-                  placeholder="https://open.bigmodel.cn/api/coding/paas/v4"
-                  className="field-input"
-                />
-                <p className="field-help">留空时将使用环境变量中的 URL 配置。</p>
-              </section>
-            </>
+          {providerPreset.supportsBaseUrl && (
+            <section className="field-group">
+              <label className="field-label" htmlFor="base-url-input">
+                {providerPreset.baseUrlLabel ?? 'Base URL'}
+              </label>
+              <input
+                id="base-url-input"
+                type="text"
+                value={localConfig.baseUrl || ''}
+                onChange={(event) => setLocalConfig({ ...localConfig, baseUrl: event.target.value })}
+                placeholder={providerPreset.baseUrlPlaceholder ?? 'https://example.com/v1'}
+                className="field-input"
+              />
+              <p className="field-help">留空时将使用 provider 的默认地址。</p>
+            </section>
+          )}
+
+          {providerPreset.supportsMaxTokens && (
+            <section className="field-group">
+              <label className="field-label" htmlFor="max-tokens-input">
+                最大输出 Token
+              </label>
+              <input
+                id="max-tokens-input"
+                type="number"
+                min={1}
+                step={1}
+                value={localConfig.maxTokens ?? ''}
+                onChange={(event) => {
+                  const raw = event.target.value.trim();
+                  if (!raw) {
+                    setLocalConfig({ ...localConfig, maxTokens: undefined });
+                    return;
+                  }
+                  const parsed = Number.parseInt(raw, 10);
+                  setLocalConfig({
+                    ...localConfig,
+                    maxTokens: Number.isFinite(parsed) && parsed > 0 ? parsed : localConfig.maxTokens,
+                  });
+                }}
+                className="field-input"
+              />
+              <p className="field-help">仅 Anthropic 生效，留空则使用默认值。</p>
+            </section>
           )}
 
           <section className="field-group">
@@ -158,17 +271,38 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
               placeholder="你是一个高效、严谨的桌面编码助手..."
               className="field-textarea"
             />
-            <p className="field-help">用于定义助手的默认行为与输出风格。</p>
+            <p className="field-help">{providerPreset.promptHint}</p>
           </section>
+
+          {testFeedback && (
+            <p className={`field-status ${testFeedback.type === 'success' ? 'success' : 'error'}`}>
+              {testFeedback.message}
+            </p>
+          )}
+          {saveError && <p className="field-error">{saveError}</p>}
         </div>
 
         <div className="modal-footer">
-          <button type="button" onClick={onClose} className="btn-ghost">
+          <button type="button" onClick={onClose} className="btn-ghost" disabled={isSaving || isTesting}>
             取消
           </button>
-          <button type="button" onClick={handleSave} className="btn-primary">
+          <button
+            type="button"
+            onClick={handleTestConnection}
+            className="btn-ghost"
+            disabled={isSaving || isTesting || Boolean(streamingTaskId)}
+          >
+            <PlugZap size={16} />
+            {isTesting ? '测试中...' : '测试连接'}
+          </button>
+          <button
+            type="button"
+            onClick={handleSave}
+            className="btn-primary"
+            disabled={isSaving || isTesting || Boolean(streamingTaskId)}
+          >
             <Save size={16} />
-            保存设置
+            {isSaving ? '保存中...' : '保存设置'}
           </button>
         </div>
       </div>

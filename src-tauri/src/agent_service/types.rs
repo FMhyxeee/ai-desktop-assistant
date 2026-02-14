@@ -6,13 +6,20 @@ use thiserror::Error;
 pub enum AgentProvider {
     OpenAi,
     Glm,
+    GlmCoding,
+    Anthropic,
+    Local,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentRuntimeConfig {
     pub provider: AgentProvider,
     pub model: String,
     pub api_key_env: String,
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
+    pub max_tokens: Option<u32>,
     pub system_prompt: String,
 }
 
@@ -22,6 +29,9 @@ impl Default for AgentRuntimeConfig {
             provider: AgentProvider::OpenAi,
             model: "gpt-4o-mini".to_string(),
             api_key_env: "OPENAI_API_KEY".to_string(),
+            api_key: None,
+            base_url: None,
+            max_tokens: None,
             system_prompt: "You are a desktop AI assistant.".to_string(),
         }
     }
@@ -52,6 +62,8 @@ pub enum AgentEvent {
 pub enum AppError {
     #[error("missing environment variable: {0}")]
     MissingEnv(String),
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
     #[error("agent error: {0}")]
     Agent(String),
     #[error("task not found: {0}")]

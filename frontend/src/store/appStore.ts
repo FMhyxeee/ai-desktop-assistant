@@ -1,9 +1,9 @@
-﻿import { v4 as uuidv4 } from 'uuid';
+import { v4 as uuidv4 } from 'uuid';
 import { create } from 'zustand';
+import { createDefaultConfig, normalizeStoredConfig } from '../config/providers';
 import { logger } from '../lib/logger';
 import { TauriAPI } from '../lib/tauri';
 import type { AppConfig, Conversation, Message } from '../types';
-import { AgentProvider } from '../types';
 
 type NewMessage = Omit<Message, 'id' | 'timestamp'>;
 
@@ -43,12 +43,7 @@ interface AppState {
   exportConversation: (conversationId: string) => void;
 }
 
-const defaultConfig: AppConfig = {
-  provider: AgentProvider.OpenAi,
-  model: 'gpt-4o-mini',
-  apiKeyEnv: 'OPENAI_API_KEY',
-  systemPrompt: 'You are a helpful AI assistant.',
-};
+const defaultConfig: AppConfig = createDefaultConfig();
 
 const DEFAULT_CONVERSATION_TITLE = '新对话';
 const MAX_TITLE_LENGTH = 50;
@@ -402,12 +397,18 @@ export const useAppStore = create<AppState>((set, get) => ({
         ? storedConversations.map(normalizeConversation)
         : [];
 
+      const normalizedStoredConfig = normalizeStoredConfig(storedConfig);
+      const hydratedConfig: AppConfig = {
+        ...createDefaultConfig(normalizedStoredConfig.provider ?? defaultConfig.provider),
+        ...normalizedStoredConfig,
+      };
+
       const hasCurrentConversation = conversations.some(
         (conversation) => conversation.id === storedCurrentConversationId
       );
 
       set({
-        config: { ...defaultConfig, ...storedConfig },
+        config: hydratedConfig,
         conversations,
         currentConversationId: hasCurrentConversation
           ? storedCurrentConversationId

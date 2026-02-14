@@ -1,4 +1,4 @@
-﻿@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Sora:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Sora:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
 @import "tailwindcss";
 
 :root {
@@ -716,6 +716,25 @@ select {
   color: var(--ink-500);
 }
 
+.field-error {
+  margin: 0;
+  font-size: 0.78rem;
+  color: var(--danger);
+}
+
+.field-status {
+  margin: 0;
+  font-size: 0.78rem;
+}
+
+.field-status.success {
+  color: var(--mint);
+}
+
+.field-status.error {
+  color: var(--danger);
+}
+
 .field-input,
 .field-select,
 .field-textarea {
@@ -790,6 +809,13 @@ select {
 .btn-ghost {
   color: var(--ink-700);
   background: rgba(43, 64, 98, 0.08);
+}
+
+.btn-primary:disabled,
+.btn-ghost:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  box-shadow: none;
 }
 
 .markdown-content {

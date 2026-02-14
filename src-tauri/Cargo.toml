@@ -26,7 +26,7 @@ tauri-plugin-log = "2.0.0-rc"
 tauri-plugin-store = "2.0.0"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
-agent-lib = { path = "../../agent-lib" }
+agent-lib = { path = "../../agent-lib", features = ["anthropic", "local-llm"] }
 async-trait = "0.1"
 
 [dev-dependencies]

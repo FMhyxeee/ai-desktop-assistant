@@ -1,4 +1,3 @@
-// 消息类型
 export interface Message {
   id: string;
   role: 'user' | 'assistant' | 'system';
@@ -7,7 +6,6 @@ export interface Message {
   isStreaming?: boolean;
 }
 
-// 对话会话类型
 export interface Conversation {
   id: string;
   title: string;
@@ -16,24 +14,24 @@ export interface Conversation {
   updatedAt: number;
 }
 
-// AI 提供商
 export const enum AgentProvider {
-  OpenAi = 'OpenAi',
-  Glm = 'Glm',
+  OpenAi = 'open_ai',
+  Glm = 'glm',
+  GlmCoding = 'glm_coding',
+  Anthropic = 'anthropic',
+  Local = 'local',
 }
 
-// 配置类型
 export interface AppConfig {
   provider: AgentProvider;
   model: string;
   apiKeyEnv: string;
+  apiKey?: string;
+  baseUrl?: string;
+  maxTokens?: number;
   systemPrompt: string;
-  openAiApiKey?: string;
-  glmApiKey?: string;
-  glmUrl?: string;
 }
 
-// Agent 事件类型
 export const enum AgentEventType {
   Started = 'started',
   Delta = 'delta',
@@ -50,8 +48,7 @@ export interface AgentEvent {
   message?: string;
 }
 
-// Tauri 命令响应
-export interface TauriResponse<T = any> {
+export interface TauriResponse<T = unknown> {
   success?: boolean;
   data?: T;
   error?: string;
