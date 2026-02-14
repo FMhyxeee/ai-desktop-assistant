@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +38,92 @@ impl Default for AgentRuntimeConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamInputKind {
+    Text,
+    Command,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentStreamInput {
+    pub kind: StreamInputKind,
+    pub content: String,
+}
+
+impl AgentStreamInput {
+    pub fn text(content: impl Into<String>) -> Self {
+        Self {
+            kind: StreamInputKind::Text,
+            content: content.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProtocolOpPayload {
+    UserTurn {
+        model: String,
+        cwd: String,
+        approval_policy: String,
+        sandbox_policy: String,
+        text: String,
+    },
+    RunUserShellCommand {
+        command: String,
+    },
+    Interrupt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ProtocolTokenUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProtocolEventPayload {
+    TurnStarted {
+        turn_id: String,
+    },
+    ModelStreaming {
+        chunk: String,
+    },
+    ModelComplete {
+        content: String,
+        usage: ProtocolTokenUsage,
+    },
+    ToolCallRequested {
+        tool: String,
+        args: Value,
+    },
+    ToolCallResult {
+        tool: String,
+        result: Value,
+    },
+    RunUserShellCommand {
+        command: String,
+    },
+    Warning {
+        message: String,
+    },
+    Error {
+        code: String,
+        message: String,
+    },
+    TurnAborted {
+        reason: String,
+    },
+    TurnComplete {
+        result: Value,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
@@ -55,6 +142,16 @@ pub enum AgentEvent {
         task_id: String,
         code: String,
         message: String,
+    },
+    OpSubmitted {
+        task_id: String,
+        seq: u64,
+        payload: ProtocolOpPayload,
+    },
+    ProtocolEvent {
+        task_id: String,
+        seq: u64,
+        payload: ProtocolEventPayload,
     },
 }
 

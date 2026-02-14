@@ -3,7 +3,7 @@ pub mod agent_service;
 use std::sync::Arc;
 use std::time::Instant;
 
-use agent_service::types::{AgentEvent, AgentRuntimeConfig};
+use agent_service::types::{AgentEvent, AgentRuntimeConfig, AgentStreamInput};
 use agent_service::AgentService;
 use serde::Serialize;
 use tauri::async_runtime::Mutex;
@@ -32,18 +32,27 @@ async fn ask_agent(state: tauri::State<'_, AppState>, input: String) -> Result<S
 async fn start_agent_stream(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    input: String,
+    input: serde_json::Value,
     task_id: Option<String>,
 ) -> Result<String, String> {
     let task_id = task_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let stream_input = parse_stream_input(input)?;
     let service = { state.agent_service.lock().await.clone() };
     service
-        .chat_stream(task_id.clone(), input, move |event: AgentEvent| {
+        .chat_stream(task_id.clone(), stream_input, move |event: AgentEvent| {
             let _ = app.emit("agent://event", &event);
         })
         .await
         .map_err(|err| err.to_string())?;
     Ok(task_id)
+}
+
+fn parse_stream_input(input: serde_json::Value) -> Result<AgentStreamInput, String> {
+    match input {
+        serde_json::Value::String(text) => Ok(AgentStreamInput::text(text)),
+        value => serde_json::from_value::<AgentStreamInput>(value)
+            .map_err(|err| format!("invalid stream input: {err}")),
+    }
 }
 
 #[tauri::command]

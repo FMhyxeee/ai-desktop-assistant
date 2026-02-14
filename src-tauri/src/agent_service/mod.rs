@@ -1,20 +1,36 @@
 pub mod types;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_lib::model::provider::{
     AnthropicProvider, GlmCodingPlanProvider, GlmProvider, LocalProvider, OpenAiProvider,
 };
-use agent_lib::{AgentBuilder, AgentResult};
+use agent_lib::model::{ModelClient, TokenUsage};
+use agent_lib::protocol::{ApprovalPolicy, Op, ReasoningSummary, SandboxPolicy, UserInputItem};
+use agent_lib::session::{Session, SessionConfig, SessionHandle};
+use agent_lib::{AgentBuilder, AgentError, AgentResult, Event, TurnAbortReason};
+use serde_json::Value;
 use tauri::async_runtime::{JoinHandle, Mutex};
+use tokio::time::timeout;
 
-use self::types::{AgentEvent, AgentProvider, AgentRuntimeConfig, AppError};
+use self::types::{
+    AgentEvent, AgentProvider, AgentRuntimeConfig, AgentStreamInput, AppError, ProtocolEventPayload,
+    ProtocolOpPayload, ProtocolTokenUsage, StreamInputKind,
+};
+
+struct ActiveTask {
+    join_handle: JoinHandle<()>,
+    session_handle: Option<SessionHandle>,
+}
 
 #[derive(Clone)]
 pub struct AgentService {
     runner: Arc<dyn Runner>,
-    tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    runtime_config: Option<AgentRuntimeConfig>,
+    tasks: Arc<Mutex<HashMap<String, ActiveTask>>>,
 }
 
 impl AgentService {
@@ -29,9 +45,10 @@ impl AgentService {
     }
 
     pub fn new_with_config(config: AgentRuntimeConfig) -> Result<Self, AppError> {
-        let runner = AgentLibRunner::new(config)?;
+        let runner = AgentLibRunner::new(config.clone())?;
         Ok(Self {
             runner: Arc::new(runner),
+            runtime_config: Some(config),
             tasks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -39,6 +56,7 @@ impl AgentService {
     pub fn with_runner(runner: Arc<dyn Runner>) -> Self {
         Self {
             runner,
+            runtime_config: None,
             tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -50,7 +68,7 @@ impl AgentService {
     pub async fn chat_stream<F>(
         &self,
         task_id: String,
-        input: String,
+        input: AgentStreamInput,
         mut emit: F,
     ) -> Result<(), AppError>
     where
@@ -60,13 +78,210 @@ impl AgentService {
             task_id: task_id.clone(),
         });
 
+        if let Some(config) = self.runtime_config.clone() {
+            self.chat_stream_protocol(task_id, input, config, emit).await
+        } else {
+            self.chat_stream_legacy(task_id, input, emit).await
+        }
+    }
+
+    async fn chat_stream_protocol<F>(
+        &self,
+        task_id: String,
+        input: AgentStreamInput,
+        config: AgentRuntimeConfig,
+        mut emit: F,
+    ) -> Result<(), AppError>
+    where
+        F: FnMut(AgentEvent) + Send + 'static,
+    {
+        let model = build_model_client(&config)?;
+
+        let session_config = SessionConfig {
+            model: Some(model),
+            default_model: config.model.clone(),
+            default_cwd: Some(".".to_string()),
+            default_approval_policy: Some(ApprovalPolicy::NeverAsk),
+            ..Default::default()
+        };
+
+        let (_session, handle) = Session::with_config(64, session_config);
+        let control_handle = handle.clone();
+        let (op, op_payload, is_command_input) = build_stream_op(&input, &config);
+
+        emit(AgentEvent::OpSubmitted {
+            task_id: task_id.clone(),
+            seq: 1,
+            payload: op_payload,
+        });
+
+        handle.submit(op).await?;
+
+        let tasks = Arc::clone(&self.tasks);
+        let task_key = task_id.clone();
+        let task_id_for_worker = task_id.clone();
+        let worker_handle = handle;
+
+        let join_handle = tauri::async_runtime::spawn(async move {
+            let mut seq = 1_u64;
+            let mut completed_sent = false;
+            let mut aggregated_output = String::new();
+
+            loop {
+                let next_event = timeout(Duration::from_secs(120), worker_handle.next_event()).await;
+                let event = match next_event {
+                    Ok(Some(event)) => event,
+                    Ok(None) => {
+                        seq += 1;
+                        emit(AgentEvent::ProtocolEvent {
+                            task_id: task_id_for_worker.clone(),
+                            seq,
+                            payload: ProtocolEventPayload::Error {
+                                code: "event_stream_closed".to_string(),
+                                message: "Event stream closed".to_string(),
+                            },
+                        });
+                        emit(AgentEvent::Error {
+                            task_id: task_id_for_worker.clone(),
+                            code: "event_stream_closed".to_string(),
+                            message: "Event stream closed".to_string(),
+                        });
+                        break;
+                    }
+                    Err(_) => {
+                        seq += 1;
+                        emit(AgentEvent::ProtocolEvent {
+                            task_id: task_id_for_worker.clone(),
+                            seq,
+                            payload: ProtocolEventPayload::Error {
+                                code: "timeout".to_string(),
+                                message: "No events received within 120s".to_string(),
+                            },
+                        });
+                        emit(AgentEvent::Error {
+                            task_id: task_id_for_worker.clone(),
+                            code: "timeout".to_string(),
+                            message: "No events received within 120s".to_string(),
+                        });
+                        break;
+                    }
+                };
+
+                if let Some(payload) = map_protocol_event(&event) {
+                    seq += 1;
+                    emit(AgentEvent::ProtocolEvent {
+                        task_id: task_id_for_worker.clone(),
+                        seq,
+                        payload,
+                    });
+                }
+
+                match event {
+                    Event::ModelStreaming { chunk } => {
+                        if !chunk.is_empty() {
+                            aggregated_output.push_str(&chunk);
+                            emit(AgentEvent::Delta {
+                                task_id: task_id_for_worker.clone(),
+                                chunk,
+                            });
+                        }
+                    }
+                    Event::ModelComplete { content, .. } => {
+                        if !completed_sent {
+                            let output = if content.is_empty() {
+                                aggregated_output.clone()
+                            } else {
+                                aggregated_output = content.clone();
+                                content
+                            };
+                            emit(AgentEvent::Completed {
+                                task_id: task_id_for_worker.clone(),
+                                output,
+                            });
+                            completed_sent = true;
+                        }
+                        if !is_command_input {
+                            break;
+                        }
+                    }
+                    Event::ToolCallResult { tool, result } => {
+                        if is_command_input && tool == "shell" {
+                            if aggregated_output.trim().is_empty() {
+                                aggregated_output = value_to_text(&result.output);
+                            }
+                            if !completed_sent {
+                                emit(AgentEvent::Completed {
+                                    task_id: task_id_for_worker.clone(),
+                                    output: aggregated_output.clone(),
+                                });
+                            }
+                            break;
+                        }
+                    }
+                    Event::TurnComplete { result } => {
+                        if !completed_sent {
+                            let output = if aggregated_output.trim().is_empty() {
+                                value_to_text(&result)
+                            } else {
+                                aggregated_output.clone()
+                            };
+                            emit(AgentEvent::Completed {
+                                task_id: task_id_for_worker.clone(),
+                                output,
+                            });
+                        }
+                        break;
+                    }
+                    Event::TurnAborted { reason } => {
+                        emit(AgentEvent::Error {
+                            task_id: task_id_for_worker.clone(),
+                            code: "turn_aborted".to_string(),
+                            message: format!("Turn aborted: {}", turn_abort_reason_to_text(&reason)),
+                        });
+                        break;
+                    }
+                    Event::Error { error } => {
+                        emit(AgentEvent::Error {
+                            task_id: task_id_for_worker.clone(),
+                            code: error_code(&error),
+                            message: error.to_string(),
+                        });
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+
+            tasks.lock().await.remove(&task_key);
+        });
+
+        self.tasks.lock().await.insert(
+            task_id,
+            ActiveTask {
+                join_handle,
+                session_handle: Some(control_handle),
+            },
+        );
+        Ok(())
+    }
+
+    async fn chat_stream_legacy<F>(
+        &self,
+        task_id: String,
+        input: AgentStreamInput,
+        mut emit: F,
+    ) -> Result<(), AppError>
+    where
+        F: FnMut(AgentEvent) + Send + 'static,
+    {
+        let prompt = input.content;
         let runner = Arc::clone(&self.runner);
         let tasks = Arc::clone(&self.tasks);
         let task_key = task_id.clone();
         let task_id_for_worker = task_id.clone();
 
-        let handle = tauri::async_runtime::spawn(async move {
-            match runner.run(&input).await {
+        let join_handle = tauri::async_runtime::spawn(async move {
+            match runner.run(&prompt).await {
                 Ok(output) => {
                     for chunk in chunk_text(&output, 48) {
                         emit(AgentEvent::Delta {
@@ -90,18 +305,149 @@ impl AgentService {
             tasks.lock().await.remove(&task_key);
         });
 
-        self.tasks.lock().await.insert(task_id, handle);
+        self.tasks.lock().await.insert(
+            task_id,
+            ActiveTask {
+                join_handle,
+                session_handle: None,
+            },
+        );
         Ok(())
     }
 
     pub async fn cancel(&self, task_id: &str) -> Result<(), AppError> {
-        let mut tasks = self.tasks.lock().await;
-        if let Some(handle) = tasks.remove(task_id) {
-            handle.abort();
+        let task = self.tasks.lock().await.remove(task_id);
+        if let Some(task) = task {
+            if let Some(handle) = task.session_handle {
+                let _ = handle.submit(Op::Interrupt).await;
+            }
+            task.join_handle.abort();
             Ok(())
         } else {
             Err(AppError::TaskNotFound(task_id.to_string()))
         }
+    }
+}
+
+fn map_protocol_event(event: &Event) -> Option<ProtocolEventPayload> {
+    match event {
+        Event::TurnStarted { turn_id } => Some(ProtocolEventPayload::TurnStarted {
+            turn_id: turn_id.clone(),
+        }),
+        Event::ModelStreaming { chunk } => Some(ProtocolEventPayload::ModelStreaming {
+            chunk: chunk.clone(),
+        }),
+        Event::ModelComplete { content, usage } => Some(ProtocolEventPayload::ModelComplete {
+            content: content.clone(),
+            usage: protocol_usage(usage),
+        }),
+        Event::ToolCallRequested { tool, args } => Some(ProtocolEventPayload::ToolCallRequested {
+            tool: tool.clone(),
+            args: args.clone(),
+        }),
+        Event::ToolCallResult { tool, result } => Some(ProtocolEventPayload::ToolCallResult {
+            tool: tool.clone(),
+            result: result.output.clone(),
+        }),
+        Event::RunUserShellCommand { command } => Some(ProtocolEventPayload::RunUserShellCommand {
+            command: command.clone(),
+        }),
+        Event::Warning { message } => Some(ProtocolEventPayload::Warning {
+            message: message.clone(),
+        }),
+        Event::Error { error } => Some(ProtocolEventPayload::Error {
+            code: error_code(error),
+            message: error.to_string(),
+        }),
+        Event::TurnAborted { reason } => Some(ProtocolEventPayload::TurnAborted {
+            reason: turn_abort_reason_to_text(reason),
+        }),
+        Event::TurnComplete { result } => Some(ProtocolEventPayload::TurnComplete {
+            result: result.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn protocol_usage(usage: &TokenUsage) -> ProtocolTokenUsage {
+    ProtocolTokenUsage {
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        total_tokens: usage.total_tokens,
+    }
+}
+
+fn build_stream_op(
+    input: &AgentStreamInput,
+    config: &AgentRuntimeConfig,
+) -> (Op, ProtocolOpPayload, bool) {
+    match input.kind {
+        StreamInputKind::Text => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            (
+                Op::UserTurn {
+                    items: vec![UserInputItem::Text {
+                        text: input.content.clone(),
+                    }],
+                    cwd: cwd.clone(),
+                    approval_policy: ApprovalPolicy::NeverAsk,
+                    sandbox_policy: SandboxPolicy::Persistent,
+                    model: config.model.clone(),
+                    effort: None,
+                    summary: ReasoningSummary {
+                        summary: String::new(),
+                        token_count: 0,
+                    },
+                    final_output_json_schema: None,
+                    collaboration_mode: None,
+                },
+                ProtocolOpPayload::UserTurn {
+                    model: config.model.clone(),
+                    cwd: cwd.to_string_lossy().to_string(),
+                    approval_policy: "never_ask".to_string(),
+                    sandbox_policy: "persistent".to_string(),
+                    text: input.content.clone(),
+                },
+                false,
+            )
+        }
+        StreamInputKind::Command => (
+            Op::RunUserShellCommand {
+                command: input.content.clone(),
+            },
+            ProtocolOpPayload::RunUserShellCommand {
+                command: input.content.clone(),
+            },
+            true,
+        ),
+    }
+}
+
+fn turn_abort_reason_to_text(reason: &TurnAbortReason) -> String {
+    match reason {
+        TurnAbortReason::UserCancelled => "user_cancelled".to_string(),
+        TurnAbortReason::Error(message) => format!("error:{message}"),
+        TurnAbortReason::Timeout => "timeout".to_string(),
+        TurnAbortReason::TokenLimitExceeded => "token_limit_exceeded".to_string(),
+    }
+}
+
+fn error_code(error: &AgentError) -> String {
+    match error {
+        AgentError::Model(_) => "model_error",
+        AgentError::Tool(_) => "tool_error",
+        AgentError::Mcp(_) => "mcp_error",
+        AgentError::Session(_) => "session_error",
+        AgentError::NotImplemented(_) => "not_implemented",
+        AgentError::InvalidConfig(_) => "invalid_config",
+    }
+    .to_string()
+}
+
+fn value_to_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        _ => serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
     }
 }
 
@@ -137,6 +483,63 @@ fn load_runtime_config() -> AgentRuntimeConfig {
         config.system_prompt = system_prompt;
     }
     config
+}
+
+fn build_model_client(config: &AgentRuntimeConfig) -> Result<Arc<dyn ModelClient>, AppError> {
+    let model = config.model.clone();
+    let base_url = normalize_optional(config.base_url.clone());
+
+    if matches!(config.max_tokens, Some(0)) {
+        return Err(AppError::InvalidConfig(
+            "max_tokens must be greater than 0".to_string(),
+        ));
+    }
+
+    let provider: Arc<dyn ModelClient> = match config.provider {
+        AgentProvider::OpenAi => {
+            let api_key = resolve_api_key(config)?;
+            Arc::new(OpenAiProvider::new(model).with_api_key(api_key))
+        }
+        AgentProvider::Glm => {
+            let api_key = resolve_api_key(config)?;
+            let provider = if let Some(url) = base_url.clone() {
+                GlmProvider::new(model, api_key).with_base_url(url)
+            } else {
+                GlmProvider::new(model, api_key)
+            };
+            Arc::new(provider)
+        }
+        AgentProvider::GlmCoding => {
+            let api_key = resolve_api_key(config)?;
+            let provider = if let Some(url) = base_url.clone() {
+                GlmCodingPlanProvider::new(model, api_key).with_base_url(url)
+            } else {
+                GlmCodingPlanProvider::new(model, api_key)
+            };
+            Arc::new(provider)
+        }
+        AgentProvider::Anthropic => {
+            let api_key = resolve_api_key(config)?;
+            let mut provider = AnthropicProvider::new(model).with_api_key(api_key);
+            if let Some(url) = base_url {
+                provider = provider.with_base_url(url);
+            }
+            if let Some(max_tokens) = config.max_tokens {
+                provider = provider.with_max_tokens(max_tokens);
+            }
+            Arc::new(provider)
+        }
+        AgentProvider::Local => {
+            let provider = if let Some(url) = base_url {
+                LocalProvider::new(model).with_base_url(url)
+            } else {
+                LocalProvider::new(model)
+            };
+            Arc::new(provider)
+        }
+    };
+
+    Ok(provider)
 }
 
 fn chunk_text(text: &str, max_chars: usize) -> Vec<String> {
@@ -241,7 +644,7 @@ struct FailingRunner {
 #[async_trait::async_trait]
 impl Runner for FailingRunner {
     async fn run(&self, _prompt: &str) -> AgentResult<String> {
-        Err(agent_lib::AgentError::InvalidConfig(self.message.clone()))
+        Err(AgentError::InvalidConfig(self.message.clone()))
     }
 }
 

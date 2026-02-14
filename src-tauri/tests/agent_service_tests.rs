@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ai_desktop_assistant_lib::agent_service::types::AgentEvent;
+use ai_desktop_assistant_lib::agent_service::types::{AgentEvent, AgentStreamInput};
 use ai_desktop_assistant_lib::agent_service::{AgentService, Runner};
 
 struct MockRunner {
@@ -42,9 +42,13 @@ async fn chat_stream_emits_lifecycle_events() {
     let events_ref = Arc::clone(&events);
 
     service
-        .chat_stream("task-1".to_string(), "hi".to_string(), move |event| {
+        .chat_stream(
+            "task-1".to_string(),
+            AgentStreamInput::text("hi"),
+            move |event| {
             events_ref.lock().unwrap().push(event);
-        })
+            },
+        )
         .await
         .unwrap();
 
@@ -66,7 +70,11 @@ async fn cancel_existing_task_succeeds() {
     let service = AgentService::with_runner(runner);
 
     service
-        .chat_stream("task-2".to_string(), "hi".to_string(), |_event| {})
+        .chat_stream(
+            "task-2".to_string(),
+            AgentStreamInput::text("hi"),
+            |_event| {},
+        )
         .await
         .unwrap();
 

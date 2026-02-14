@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type { AgentEvent, AppConfig } from '../types';
+import type { AgentEvent, AppConfig, InputCard } from '../types';
 
 interface RuntimeConfigPayload {
   provider: string;
@@ -48,7 +48,7 @@ export class TauriAPI {
     }
   }
 
-  static async startAgentStream(input: string, taskId?: string): Promise<string> {
+  static async startAgentStream(input: string | InputCard, taskId?: string): Promise<string> {
     try {
       return await invoke<string>('start_agent_stream', {
         input,
