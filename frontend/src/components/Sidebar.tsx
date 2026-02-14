@@ -1,5 +1,5 @@
-﻿import React from 'react';
-import { Download, MessageSquare, Plus, Trash2, X } from 'lucide-react';
+import React, { useMemo, useState } from 'react';
+import { Check, Download, MessageSquare, Pencil, Pin, PinOff, Plus, Search, Trash2, X } from 'lucide-react';
 import type { Conversation } from '../types';
 
 interface SidebarProps {
@@ -7,6 +7,8 @@ interface SidebarProps {
   currentConversationId: string | null;
   onNewConversation: () => void;
   onSelectConversation: (id: string) => void;
+  onRenameConversation: (id: string, title: string) => void;
+  onToggleConversationPinned: (id: string) => void;
   onDeleteConversation: (id: string) => void;
   onExportConversation: (id: string) => void;
   onClose?: () => void;
@@ -17,10 +19,16 @@ const Sidebar: React.FC<SidebarProps> = ({
   currentConversationId,
   onNewConversation,
   onSelectConversation,
+  onRenameConversation,
+  onToggleConversationPinned,
   onDeleteConversation,
   onExportConversation,
   onClose,
 }) => {
+  const [query, setQuery] = useState('');
+  const [editingConversationId, setEditingConversationId] = useState<string | null>(null);
+  const [editingTitle, setEditingTitle] = useState('');
+
   const formatDate = (timestamp: number) => {
     const date = new Date(timestamp);
     const now = new Date();
@@ -39,6 +47,42 @@ const Sidebar: React.FC<SidebarProps> = ({
     return date.toLocaleDateString('zh-CN');
   };
 
+  const filteredConversations = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase();
+    return [...conversations]
+      .sort((a, b) => {
+        if (Boolean(a.pinned) !== Boolean(b.pinned)) {
+          return a.pinned ? -1 : 1;
+        }
+        return b.updatedAt - a.updatedAt;
+      })
+      .filter((conversation) => {
+        if (!normalizedQuery) {
+          return true;
+        }
+        return (conversation.title || '').toLowerCase().includes(normalizedQuery);
+      });
+  }, [conversations, query]);
+
+  const startRenaming = (conversation: Conversation) => {
+    setEditingConversationId(conversation.id);
+    setEditingTitle(conversation.title || '');
+  };
+
+  const saveRename = () => {
+    if (!editingConversationId) {
+      return;
+    }
+    onRenameConversation(editingConversationId, editingTitle);
+    setEditingConversationId(null);
+    setEditingTitle('');
+  };
+
+  const cancelRename = () => {
+    setEditingConversationId(null);
+    setEditingTitle('');
+  };
+
   return (
     <div className="sidebar">
       <div className="sidebar-head">
@@ -54,16 +98,28 @@ const Sidebar: React.FC<SidebarProps> = ({
           <Plus size={17} />
           新建对话
         </button>
+
+        <label className="sidebar-search-wrap">
+          <Search size={14} className="sidebar-search-icon" />
+          <input
+            type="text"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="搜索对话标题..."
+            className="sidebar-search-input"
+            aria-label="搜索对话"
+          />
+        </label>
       </div>
 
       <div className="sidebar-list">
-        {conversations.length === 0 ? (
+        {filteredConversations.length === 0 ? (
           <div className="sidebar-empty">
             <MessageSquare size={40} />
-            <p>暂无对话</p>
+            <p>{query.trim() ? '没有匹配的对话' : '暂无对话'}</p>
           </div>
         ) : (
-          conversations.map((conversation, index) => (
+          filteredConversations.map((conversation, index) => (
             <article
               key={conversation.id}
               className={`conversation-card ${
@@ -71,18 +127,74 @@ const Sidebar: React.FC<SidebarProps> = ({
               }`}
               style={{ animationDelay: `${index * 45}ms` }}
             >
-              <button
-                type="button"
-                onClick={() => onSelectConversation(conversation.id)}
-                className="conversation-main"
-              >
-                <p className="conversation-title">{conversation.title || '未命名对话'}</p>
-                <p className="conversation-meta">
-                  {conversation.messages.length} 条消息 · {formatDate(conversation.updatedAt)}
-                </p>
-              </button>
+              {editingConversationId === conversation.id ? (
+                <div className="conversation-rename-wrap">
+                  <input
+                    value={editingTitle}
+                    onChange={(event) => setEditingTitle(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault();
+                        saveRename();
+                      } else if (event.key === 'Escape') {
+                        event.preventDefault();
+                        cancelRename();
+                      }
+                    }}
+                    autoFocus
+                    className="conversation-rename-input"
+                    aria-label="重命名对话"
+                  />
+                  <div className="conversation-rename-actions">
+                    <button type="button" className="icon-action" title="保存" onClick={saveRename}>
+                      <Check size={14} />
+                    </button>
+                    <button type="button" className="icon-action danger" title="取消" onClick={cancelRename}>
+                      <X size={14} />
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => onSelectConversation(conversation.id)}
+                  className="conversation-main"
+                >
+                  <p className="conversation-title">
+                    {conversation.pinned ? '置顶 · ' : ''}
+                    {conversation.title || '未命名对话'}
+                  </p>
+                  <p className="conversation-meta">
+                    {conversation.messages.length} 条消息 · {formatDate(conversation.updatedAt)}
+                  </p>
+                </button>
+              )}
 
               <div className="conversation-actions">
+                <button
+                  type="button"
+                  className={`icon-action ${conversation.pinned ? 'active' : ''}`}
+                  title={conversation.pinned ? '取消置顶' : '置顶'}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onToggleConversationPinned(conversation.id);
+                  }}
+                >
+                  {conversation.pinned ? <PinOff size={14} /> : <Pin size={14} />}
+                </button>
+
+                <button
+                  type="button"
+                  className="icon-action"
+                  title="重命名"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    startRenaming(conversation);
+                  }}
+                >
+                  <Pencil size={14} />
+                </button>
+
                 <button
                   type="button"
                   className="icon-action"

@@ -6,7 +6,7 @@ import ProtocolPanel from './ProtocolPanel';
 import Sidebar from './Sidebar';
 import SettingsModal from './SettingsModal';
 import type { AgentEvent, InputCard, ProtocolEventPayload, ProtocolOpPayload } from '../types';
-import { AgentEventType } from '../types';
+import { AgentEventType, InputCardKind } from '../types';
 import { TauriAPI } from '../lib/tauri';
 import { logger } from '../lib/logger';
 import { useAppStore } from '../store/appStore';
@@ -34,6 +34,8 @@ const ChatView: React.FC = () => {
     currentConversationId,
     createConversation,
     ensureConversation,
+    renameConversation,
+    toggleConversationPinned,
     addMessage,
     addOpCard,
     addProtocolEventCard,
@@ -55,6 +57,7 @@ const ChatView: React.FC = () => {
   const [sidebarOpen, setSidebarOpen] = useState(() => !detectCompactLayout());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [protocolOpen, setProtocolOpen] = useState(() => !detectCompactLayout());
+  const [draftInput, setDraftInput] = useState<InputCard | null>(null);
   const unlistenRef = useRef<(() => void) | null>(null);
 
   const currentConversation = conversations.find(
@@ -107,6 +110,60 @@ const ChatView: React.FC = () => {
     setSidebarOpen(false);
     setProtocolOpen(false);
   }, [isCompactLayout]);
+
+  useEffect(() => {
+    const handleKeydown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const isTyping =
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        Boolean(target?.isContentEditable);
+
+      if (event.key === 'Escape') {
+        let handled = false;
+        if (settingsOpen) {
+          setSettingsOpen(false);
+          handled = true;
+        }
+        if (sidebarOpen) {
+          setSidebarOpen(false);
+          handled = true;
+        }
+        if (protocolOpen) {
+          setProtocolOpen(false);
+          handled = true;
+        }
+        if (handled) {
+          event.preventDefault();
+        }
+        return;
+      }
+
+      if (isTyping) {
+        return;
+      }
+
+      const withModifier = event.ctrlKey || event.metaKey;
+      if (!withModifier || event.shiftKey || event.altKey) {
+        return;
+      }
+
+      if (event.key.toLowerCase() === 'b') {
+        event.preventDefault();
+        setSidebarOpen((value) => !value);
+        return;
+      }
+
+      if (event.key === '\\') {
+        event.preventDefault();
+        setProtocolOpen((value) => !value);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeydown);
+    return () => window.removeEventListener('keydown', handleKeydown);
+  }, [protocolOpen, settingsOpen, sidebarOpen]);
 
   const handleAgentEvent = useCallback(
     (event: AgentEvent) => {
@@ -246,6 +303,62 @@ const ChatView: React.FC = () => {
     ]
   );
 
+  const toInputCardFromUserMessage = useCallback((content: string): InputCard => {
+    if (content.startsWith('$ ')) {
+      return {
+        kind: InputCardKind.Command,
+        content: content.slice(2).trimStart(),
+      };
+    }
+    return {
+      kind: InputCardKind.Text,
+      content,
+    };
+  }, []);
+
+  const handleContinueFromMessage = useCallback(
+    (messageId: string) => {
+      const message = currentConversation?.messages.find((item) => item.id === messageId);
+      if (!message) {
+        return;
+      }
+
+      const prefix = message.role === 'assistant' ? '基于这段助手回复继续追问：\n' : '基于这条消息继续：\n';
+      setDraftInput({
+        kind: InputCardKind.Text,
+        content: `${prefix}${message.content}\n`,
+      });
+    },
+    [currentConversation]
+  );
+
+  const handleRegenerateMessage = useCallback(
+    (assistantMessageId: string) => {
+      if (!currentConversation || streamingTaskId) {
+        return;
+      }
+
+      const assistantIndex = currentConversation.messages.findIndex(
+        (message) => message.id === assistantMessageId && message.role === 'assistant'
+      );
+
+      if (assistantIndex <= 0) {
+        return;
+      }
+
+      const previousUserMessage = [...currentConversation.messages.slice(0, assistantIndex)]
+        .reverse()
+        .find((message) => message.role === 'user');
+
+      if (!previousUserMessage) {
+        return;
+      }
+
+      void handleSendMessage(toInputCardFromUserMessage(previousUserMessage.content));
+    },
+    [currentConversation, handleSendMessage, streamingTaskId, toInputCardFromUserMessage]
+  );
+
   const handleRetryCard = useCallback(
     (cardId: string) => {
       if (!currentConversationId || streamingTaskId) {
@@ -315,6 +428,8 @@ const ChatView: React.FC = () => {
                 setSidebarOpen(false);
               }
             }}
+            onRenameConversation={renameConversation}
+            onToggleConversationPinned={toggleConversationPinned}
             onDeleteConversation={deleteConversation}
             onExportConversation={exportConversation}
             onClose={() => setSidebarOpen(false)}
@@ -373,12 +488,18 @@ const ChatView: React.FC = () => {
 
           <div className="workspace">
             <section className="chat-column">
-              <MessageList messages={currentConversation?.messages || []} />
+              <MessageList
+                messages={currentConversation?.messages || []}
+                onRegenerateMessage={handleRegenerateMessage}
+                onContinueFromMessage={handleContinueFromMessage}
+              />
               <ChatInput
                 onSend={handleSendMessage}
                 disabled={!isHydrated || isStreaming}
                 isStreaming={isStreaming}
                 onCancel={handleCancelStream}
+                draftInput={draftInput}
+                onDraftConsumed={() => setDraftInput(null)}
               />
             </section>
 

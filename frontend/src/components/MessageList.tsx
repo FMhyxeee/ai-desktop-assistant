@@ -1,5 +1,5 @@
-﻿import React, { Suspense, lazy, useEffect, useMemo, useRef } from 'react';
-import { Bot, Sparkles, User } from 'lucide-react';
+import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
+import { Bot, Copy, CornerDownRight, RotateCcw, Sparkles, User } from 'lucide-react';
 import type { Message } from '../types';
 
 const MarkdownMessage = lazy(() => import('./MarkdownMessage'));
@@ -7,10 +7,18 @@ const MarkdownMessage = lazy(() => import('./MarkdownMessage'));
 interface MessageListProps {
   messages: Message[];
   streamingMessage?: Message;
+  onRegenerateMessage?: (messageId: string) => void;
+  onContinueFromMessage?: (messageId: string) => void;
 }
 
-const MessageList: React.FC<MessageListProps> = ({ messages, streamingMessage }) => {
+const MessageList: React.FC<MessageListProps> = ({
+  messages,
+  streamingMessage,
+  onRegenerateMessage,
+  onContinueFromMessage,
+}) => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
 
   const allMessages = useMemo(
     () => [...messages, ...(streamingMessage ? [streamingMessage] : [])],
@@ -20,6 +28,15 @@ const MessageList: React.FC<MessageListProps> = ({ messages, streamingMessage })
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [allMessages]);
+
+  const copyMessage = (messageId: string, content: string) => {
+    void navigator.clipboard.writeText(content).then(() => {
+      setCopiedMessageId(messageId);
+      window.setTimeout(() => {
+        setCopiedMessageId((value) => (value === messageId ? null : value));
+      }, 1000);
+    });
+  };
 
   return (
     <div className="message-viewport">
@@ -74,6 +91,39 @@ const MessageList: React.FC<MessageListProps> = ({ messages, streamingMessage })
                     {message.isStreaming && <span className="stream-cursor" />}
                   </div>
                 )}
+
+                <div className="message-tools">
+                  <button
+                    type="button"
+                    className="message-tool-btn"
+                    onClick={() => copyMessage(message.id, message.content)}
+                  >
+                    <Copy size={13} />
+                    {copiedMessageId === message.id ? '已复制' : '复制'}
+                  </button>
+
+                  {onContinueFromMessage && (
+                    <button
+                      type="button"
+                      className="message-tool-btn"
+                      onClick={() => onContinueFromMessage(message.id)}
+                    >
+                      <CornerDownRight size={13} />
+                      继续追问
+                    </button>
+                  )}
+
+                  {isAssistant && onRegenerateMessage && !message.isStreaming && (
+                    <button
+                      type="button"
+                      className="message-tool-btn"
+                      onClick={() => onRegenerateMessage(message.id)}
+                    >
+                      <RotateCcw size={13} />
+                      重新生成
+                    </button>
+                  )}
+                </div>
               </div>
 
               {isUser && (
