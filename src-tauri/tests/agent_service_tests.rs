@@ -1,8 +1,12 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ai_desktop_assistant_lib::agent_service::types::{AgentEvent, AgentStreamInput};
-use ai_desktop_assistant_lib::agent_service::{AgentService, Runner};
+use ai_desktop_assistant_lib::agent_service::types::{
+    AgentEvent, AgentStreamInput, McpRuntimeConfig, McpServerRuntimeConfig, SkillsRuntimeConfig,
+};
+use ai_desktop_assistant_lib::agent_service::{
+    AgentService, Runner, scan_skills_runtime_config, test_mcp_runtime_config,
+};
 
 struct MockRunner {
     output: String,
@@ -80,4 +84,62 @@ async fn cancel_existing_task_succeeds() {
 
     tokio::time::sleep(Duration::from_millis(30)).await;
     service.cancel("task-2").await.unwrap();
+}
+
+#[tokio::test]
+async fn test_mcp_runtime_config_disabled_returns_success() {
+    let result = test_mcp_runtime_config(McpRuntimeConfig::default()).await;
+    assert!(result.success);
+    assert!(result.server_results.is_empty());
+}
+
+#[tokio::test]
+async fn test_mcp_runtime_config_invalid_server_returns_error() {
+    let config = McpRuntimeConfig {
+        enabled: true,
+        default_timeout_secs: Some(1),
+        max_retries: Some(0),
+        servers: vec![McpServerRuntimeConfig {
+            name: "bad-stdio".to_string(),
+            enabled: true,
+            command: None,
+            endpoint: None,
+            ..Default::default()
+        }],
+    };
+
+    let result = test_mcp_runtime_config(config).await;
+    assert!(!result.success);
+    assert_eq!(result.server_results.len(), 1);
+    assert!(!result.server_results[0].success);
+    assert!(result.server_results[0].error.is_some());
+}
+
+#[tokio::test]
+async fn scan_skills_runtime_config_reads_custom_personal_dir() {
+    let root = std::env::temp_dir().join(format!("assistant_skill_scan_{}", uuid::Uuid::new_v4()));
+    let skill_dir = root.join("demo-skill");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        r#"---
+name: demo-skill
+description: demo skill description
+---
+
+Skill body
+"#,
+    )
+    .unwrap();
+
+    let result = scan_skills_runtime_config(SkillsRuntimeConfig {
+        enabled: true,
+        personal_dir: Some(root.to_string_lossy().to_string()),
+        project_dirs: vec![],
+        auto_apply: false,
+    })
+    .await;
+
+    assert!(result.success);
+    assert!(result.skills.iter().any(|skill| skill.name == "demo-skill"));
 }

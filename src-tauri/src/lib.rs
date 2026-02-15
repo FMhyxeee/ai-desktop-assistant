@@ -3,7 +3,10 @@ pub mod agent_service;
 use std::sync::Arc;
 use std::time::Instant;
 
-use agent_service::types::{AgentEvent, AgentRuntimeConfig, AgentStreamInput};
+use agent_service::types::{
+    AgentEvent, AgentRuntimeConfig, AgentStreamInput, McpConfigTestResult, McpRuntimeConfig,
+    SkillScanResult, SkillsRuntimeConfig,
+};
 use agent_service::AgentService;
 use serde::Serialize;
 use tauri::async_runtime::Mutex;
@@ -72,7 +75,9 @@ async fn update_runtime_config(
     state: tauri::State<'_, AppState>,
     config: AgentRuntimeConfig,
 ) -> Result<(), String> {
-    let service = AgentService::new_with_config(config).map_err(|err| err.to_string())?;
+    let service = AgentService::new_with_config(config)
+        .await
+        .map_err(|err| err.to_string())?;
     let mut guard = state.agent_service.lock().await;
     *guard = service;
     Ok(())
@@ -81,7 +86,7 @@ async fn update_runtime_config(
 #[tauri::command]
 async fn test_runtime_config(config: AgentRuntimeConfig) -> Result<ConnectionTestResult, String> {
     let started = Instant::now();
-    let service = match AgentService::new_with_config(config) {
+    let service = match AgentService::new_with_config(config).await {
         Ok(service) => service,
         Err(err) => {
             return Ok(ConnectionTestResult {
@@ -107,6 +112,16 @@ async fn test_runtime_config(config: AgentRuntimeConfig) -> Result<ConnectionTes
             latency_ms,
         }),
     }
+}
+
+#[tauri::command]
+async fn test_mcp_config(config: McpRuntimeConfig) -> Result<McpConfigTestResult, String> {
+    Ok(agent_service::test_mcp_runtime_config(config).await)
+}
+
+#[tauri::command]
+async fn scan_skills_config(config: SkillsRuntimeConfig) -> Result<SkillScanResult, String> {
+    Ok(agent_service::scan_skills_runtime_config(config).await)
 }
 
 fn summarize_text(input: &str, max_chars: usize) -> String {
@@ -146,7 +161,8 @@ fn frontend_log(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let agent_service = AgentService::from_env().expect("agent service bootstrap failed");
+    let agent_service = tauri::async_runtime::block_on(AgentService::from_env())
+        .expect("agent service bootstrap failed");
 
     tauri::Builder::default()
         .manage(AppState {
@@ -158,6 +174,8 @@ pub fn run() {
             cancel_agent_task,
             update_runtime_config,
             test_runtime_config,
+            test_mcp_config,
+            scan_skills_config,
             frontend_log
         ])
         .plugin(tauri_plugin_store::Builder::new().build())

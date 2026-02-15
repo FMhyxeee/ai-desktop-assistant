@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +23,8 @@ pub struct AgentRuntimeConfig {
     pub base_url: Option<String>,
     pub max_tokens: Option<u32>,
     pub system_prompt: String,
+    pub mcp: McpRuntimeConfig,
+    pub skills: SkillsRuntimeConfig,
 }
 
 impl Default for AgentRuntimeConfig {
@@ -34,8 +37,109 @@ impl Default for AgentRuntimeConfig {
             base_url: None,
             max_tokens: None,
             system_prompt: "You are a desktop AI assistant.".to_string(),
+            mcp: McpRuntimeConfig::default(),
+            skills: SkillsRuntimeConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransportKind {
+    #[default]
+    Stdio,
+    Tcp,
+    Http,
+    Https,
+    Websocket,
+    Wss,
+    Sse,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum McpAuthType {
+    #[default]
+    None,
+    Bearer,
+    Basic,
+    ApiKey,
+    #[serde(rename = "oauth2")]
+    OAuth2,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct McpAuthRuntimeConfig {
+    #[serde(rename = "type")]
+    pub auth_type: McpAuthType,
+    pub token_env: Option<String>,
+    pub username_env: Option<String>,
+    pub password_env: Option<String>,
+    pub api_key_env: Option<String>,
+    pub api_key_header: Option<String>,
+    pub query_param: Option<String>,
+    pub token_url: Option<String>,
+    pub client_id_env: Option<String>,
+    pub client_secret_env: Option<String>,
+    pub scope: Option<String>,
+    pub audience: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct McpTlsRuntimeConfig {
+    pub ca_cert_path: Option<String>,
+    pub client_cert_path: Option<String>,
+    pub client_key_path: Option<String>,
+    #[serde(default)]
+    pub danger_accept_invalid_certs: bool,
+    #[serde(default)]
+    pub danger_accept_invalid_hostnames: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerRuntimeConfig {
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub transport: McpTransportKind,
+    pub endpoint: Option<String>,
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    pub auth: Option<McpAuthRuntimeConfig>,
+    pub tls: Option<McpTlsRuntimeConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct McpRuntimeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub default_timeout_secs: Option<u64>,
+    pub max_retries: Option<usize>,
+    #[serde(default)]
+    pub servers: Vec<McpServerRuntimeConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillsRuntimeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub personal_dir: Option<String>,
+    #[serde(default)]
+    pub project_dirs: Vec<String>,
+    #[serde(default)]
+    pub auto_apply: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,6 +226,100 @@ pub enum ProtocolEventPayload {
     TurnComplete {
         result: Value,
     },
+    McpListToolsResponse {
+        tools: Vec<ProtocolMcpToolInfo>,
+    },
+    McpListResourcesResponse {
+        resources: Vec<ProtocolMcpResourceInfo>,
+    },
+    McpResourceContent {
+        uri: String,
+        content: String,
+    },
+    McpListPromptsResponse {
+        prompts: Vec<ProtocolMcpPromptInfo>,
+    },
+    McpPromptResult {
+        messages: Vec<ProtocolPromptMessage>,
+    },
+    ListSkillsResponse {
+        skills: Vec<ProtocolSkillEntry>,
+    },
+    SkillContent {
+        name: String,
+        content: String,
+        auxiliary_files: Vec<String>,
+    },
+    SkillApplied {
+        name: String,
+    },
+    SkillFileContent {
+        skill_name: String,
+        file_path: String,
+        content: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolMcpToolInfo {
+    pub name: String,
+    pub description: String,
+    pub server: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolMcpResourceInfo {
+    pub uri: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolPromptArgumentInfo {
+    pub name: String,
+    pub description: Option<String>,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolMcpPromptInfo {
+    pub name: String,
+    pub description: Option<String>,
+    pub arguments: Option<Vec<ProtocolPromptArgumentInfo>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProtocolPromptContent {
+    Text {
+        text: String,
+    },
+    Image {
+        data: String,
+        mime_type: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolPromptMessage {
+    pub role: String,
+    pub content: ProtocolPromptContent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolSkillEntry {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+    pub source: String,
+    pub has_auxiliary_files: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +353,45 @@ pub enum AgentEvent {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerTestResult {
+    pub name: String,
+    pub enabled: bool,
+    pub success: bool,
+    pub latency_ms: u128,
+    pub tool_count: usize,
+    pub tools: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpConfigTestResult {
+    pub success: bool,
+    pub message: String,
+    pub server_results: Vec<McpServerTestResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillScanEntry {
+    pub name: String,
+    pub description: String,
+    pub path: String,
+    pub source: String,
+    pub has_auxiliary_files: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillScanResult {
+    pub success: bool,
+    pub message: String,
+    pub warnings: Vec<String>,
+    pub skills: Vec<SkillScanEntry>,
+}
+
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("missing environment variable: {0}")]
@@ -171,4 +408,8 @@ impl From<agent_lib::AgentError> for AppError {
     fn from(value: agent_lib::AgentError) -> Self {
         Self::Agent(value.to_string())
     }
+}
+
+fn default_true() -> bool {
+    true
 }

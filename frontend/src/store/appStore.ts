@@ -138,6 +138,24 @@ const summarizeEventPayload = (payload: ProtocolEventPayload): string => {
       return `TurnAborted · ${payload.reason}`;
     case 'turn_complete':
       return 'TurnComplete';
+    case 'mcp_list_tools_response':
+      return `McpListToolsResponse · ${payload.tools.length} tools`;
+    case 'mcp_list_resources_response':
+      return `McpListResourcesResponse · ${payload.resources.length} resources`;
+    case 'mcp_resource_content':
+      return `McpResourceContent · ${payload.uri}`;
+    case 'mcp_list_prompts_response':
+      return `McpListPromptsResponse · ${payload.prompts.length} prompts`;
+    case 'mcp_prompt_result':
+      return `McpPromptResult · ${payload.messages.length} messages`;
+    case 'list_skills_response':
+      return `ListSkillsResponse · ${payload.skills.length} skills`;
+    case 'skill_content':
+      return `SkillContent · ${payload.name}`;
+    case 'skill_applied':
+      return `SkillApplied · ${payload.name}`;
+    case 'skill_file_content':
+      return `SkillFileContent · ${payload.skill_name}/${payload.file_path}`;
   }
   return 'UnknownEvent';
 };
@@ -152,6 +170,15 @@ const levelFromEventPayload = (payload: ProtocolEventPayload): ProtocolCardLevel
     case 'model_complete':
     case 'turn_complete':
     case 'tool_call_result':
+    case 'mcp_list_tools_response':
+    case 'mcp_list_resources_response':
+    case 'mcp_resource_content':
+    case 'mcp_list_prompts_response':
+    case 'mcp_prompt_result':
+    case 'list_skills_response':
+    case 'skill_content':
+    case 'skill_applied':
+    case 'skill_file_content':
       return 'success';
     default:
       return 'info';

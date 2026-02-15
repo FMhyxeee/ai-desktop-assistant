@@ -1,4 +1,13 @@
-import { AgentProvider, type AppConfig } from '../types';
+import {
+  AgentProvider,
+  McpAuthType,
+  McpTransportKind,
+  type AppConfig,
+  type McpAuthConfig,
+  type McpRuntimeConfig,
+  type McpServerConfig,
+  type SkillsRuntimeConfig,
+} from '../types';
 
 export interface ProviderPreset {
   value: AgentProvider;
@@ -103,6 +112,35 @@ const PRESET_MAP = new Map(PROVIDER_PRESETS.map((preset) => [preset.value, prese
 export const getProviderPreset = (provider: AgentProvider): ProviderPreset =>
   PRESET_MAP.get(provider) ?? PRESET_MAP.get(AgentProvider.OpenAi)!;
 
+export const createDefaultMcpServer = (): McpServerConfig => ({
+  name: '',
+  enabled: true,
+  transport: McpTransportKind.Stdio,
+  endpoint: '',
+  command: '',
+  args: [],
+  timeoutSecs: 30,
+  env: {},
+  headers: {},
+  auth: {
+    type: McpAuthType.None,
+  },
+});
+
+export const createDefaultMcpConfig = (): McpRuntimeConfig => ({
+  enabled: false,
+  defaultTimeoutSecs: 30,
+  maxRetries: 3,
+  servers: [],
+});
+
+export const createDefaultSkillsConfig = (): SkillsRuntimeConfig => ({
+  enabled: false,
+  personalDir: '',
+  projectDirs: [],
+  autoApply: false,
+});
+
 export const createDefaultConfig = (provider: AgentProvider = AgentProvider.OpenAi): AppConfig => {
   const preset = getProviderPreset(provider);
   return {
@@ -113,6 +151,8 @@ export const createDefaultConfig = (provider: AgentProvider = AgentProvider.Open
     baseUrl: preset.supportsBaseUrl ? '' : undefined,
     maxTokens: preset.supportsMaxTokens ? 1024 : undefined,
     systemPrompt: preset.defaultSystemPrompt,
+    mcp: createDefaultMcpConfig(),
+    skills: createDefaultSkillsConfig(),
   };
 };
 
@@ -127,6 +167,8 @@ export const applyProviderDefaults = (config: AppConfig, provider: AgentProvider
     baseUrl: preset.supportsBaseUrl ? '' : undefined,
     maxTokens: preset.supportsMaxTokens ? (config.maxTokens ?? 1024) : undefined,
     systemPrompt: preset.defaultSystemPrompt,
+    mcp: config.mcp,
+    skills: config.skills,
   };
 };
 
@@ -183,6 +225,197 @@ const normalizeMaxTokens = (value: unknown): number | undefined => {
   return undefined;
 };
 
+const normalizeBoolean = (value: unknown, fallback = false): boolean => {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === 'true') {
+      return true;
+    }
+    if (normalized === 'false') {
+      return false;
+    }
+  }
+  return fallback;
+};
+
+const normalizePositiveInt = (value: unknown, fallback?: number): number | undefined => {
+  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+    return Math.floor(value);
+  }
+  if (typeof value === 'string') {
+    const parsed = Number.parseInt(value.trim(), 10);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return parsed;
+    }
+  }
+  return fallback;
+};
+
+const normalizeStringArray = (value: unknown): string[] => {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((item) => (typeof item === 'string' ? item.trim() : ''))
+    .filter((item) => item.length > 0);
+};
+
+const normalizeStringMap = (value: unknown): Record<string, string> => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  const source = value as Record<string, unknown>;
+  const output: Record<string, string> = {};
+  Object.entries(source).forEach(([key, rawValue]) => {
+    const normalizedKey = key.trim();
+    const normalizedValue = typeof rawValue === 'string' ? rawValue.trim() : '';
+    if (normalizedKey && normalizedValue) {
+      output[normalizedKey] = normalizedValue;
+    }
+  });
+  return output;
+};
+
+const normalizeMcpTransport = (value: unknown): McpTransportKind => {
+  if (typeof value !== 'string') {
+    return McpTransportKind.Stdio;
+  }
+  const normalized = value.trim().toLowerCase();
+  switch (normalized) {
+    case McpTransportKind.Stdio:
+      return McpTransportKind.Stdio;
+    case McpTransportKind.Tcp:
+      return McpTransportKind.Tcp;
+    case McpTransportKind.Http:
+      return McpTransportKind.Http;
+    case McpTransportKind.Https:
+      return McpTransportKind.Https;
+    case McpTransportKind.Websocket:
+      return McpTransportKind.Websocket;
+    case McpTransportKind.Wss:
+      return McpTransportKind.Wss;
+    case McpTransportKind.Sse:
+      return McpTransportKind.Sse;
+    default:
+      return McpTransportKind.Stdio;
+  }
+};
+
+const normalizeMcpAuthType = (value: unknown): McpAuthType => {
+  if (typeof value !== 'string') {
+    return McpAuthType.None;
+  }
+  const normalized = value.trim().toLowerCase();
+  switch (normalized) {
+    case McpAuthType.Bearer:
+      return McpAuthType.Bearer;
+    case McpAuthType.Basic:
+      return McpAuthType.Basic;
+    case McpAuthType.ApiKey:
+    case 'apikey':
+      return McpAuthType.ApiKey;
+    case McpAuthType.OAuth2:
+      return McpAuthType.OAuth2;
+    default:
+      return McpAuthType.None;
+  }
+};
+
+const normalizeMcpAuthConfig = (value: unknown): McpAuthConfig | undefined => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+
+  const source = value as Record<string, unknown>;
+  const type = normalizeMcpAuthType(source.type);
+  return {
+    type,
+    tokenEnv: normalizeOptionalText(source.tokenEnv),
+    usernameEnv: normalizeOptionalText(source.usernameEnv),
+    passwordEnv: normalizeOptionalText(source.passwordEnv),
+    apiKeyEnv: normalizeOptionalText(source.apiKeyEnv),
+    apiKeyHeader: normalizeOptionalText(source.apiKeyHeader),
+    queryParam: normalizeOptionalText(source.queryParam),
+    tokenUrl: normalizeOptionalText(source.tokenUrl),
+    clientIdEnv: normalizeOptionalText(source.clientIdEnv),
+    clientSecretEnv: normalizeOptionalText(source.clientSecretEnv),
+    scope: normalizeOptionalText(source.scope),
+    audience: normalizeOptionalText(source.audience),
+  };
+};
+
+const normalizeMcpServerConfig = (value: unknown): McpServerConfig | null => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  const source = value as Record<string, unknown>;
+  return {
+    name: normalizeOptionalText(source.name) ?? '',
+    enabled: normalizeBoolean(source.enabled, true),
+    transport: normalizeMcpTransport(source.transport),
+    endpoint: normalizeOptionalText(source.endpoint) ?? '',
+    command: normalizeOptionalText(source.command) ?? '',
+    args: normalizeStringArray(source.args),
+    timeoutSecs: normalizePositiveInt(source.timeoutSecs, 30),
+    env: normalizeStringMap(source.env),
+    headers: normalizeStringMap(source.headers),
+    auth: normalizeMcpAuthConfig(source.auth),
+    tls:
+      source.tls && typeof source.tls === 'object' && !Array.isArray(source.tls)
+        ? {
+            caCertPath: normalizeOptionalText((source.tls as Record<string, unknown>).caCertPath),
+            clientCertPath: normalizeOptionalText((source.tls as Record<string, unknown>).clientCertPath),
+            clientKeyPath: normalizeOptionalText((source.tls as Record<string, unknown>).clientKeyPath),
+            dangerAcceptInvalidCerts: normalizeBoolean(
+              (source.tls as Record<string, unknown>).dangerAcceptInvalidCerts,
+              false
+            ),
+            dangerAcceptInvalidHostnames: normalizeBoolean(
+              (source.tls as Record<string, unknown>).dangerAcceptInvalidHostnames,
+              false
+            ),
+          }
+        : undefined,
+  };
+};
+
+export const normalizeMcpRuntimeConfig = (value: unknown): McpRuntimeConfig => {
+  const defaults = createDefaultMcpConfig();
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return defaults;
+  }
+  const source = value as Record<string, unknown>;
+  const servers = Array.isArray(source.servers)
+    ? source.servers
+        .map((server) => normalizeMcpServerConfig(server))
+        .filter((server): server is McpServerConfig => server !== null)
+    : [];
+
+  return {
+    enabled: normalizeBoolean(source.enabled, defaults.enabled),
+    defaultTimeoutSecs: normalizePositiveInt(source.defaultTimeoutSecs, defaults.defaultTimeoutSecs),
+    maxRetries: normalizePositiveInt(source.maxRetries, defaults.maxRetries),
+    servers,
+  };
+};
+
+const normalizeSkillsRuntimeConfig = (value: unknown): SkillsRuntimeConfig => {
+  const defaults = createDefaultSkillsConfig();
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return defaults;
+  }
+  const source = value as Record<string, unknown>;
+  return {
+    enabled: normalizeBoolean(source.enabled, defaults.enabled),
+    personalDir: normalizeOptionalText(source.personalDir) ?? '',
+    projectDirs: normalizeStringArray(source.projectDirs),
+    autoApply: normalizeBoolean(source.autoApply, defaults.autoApply),
+  };
+};
+
 export const normalizeStoredConfig = (raw: unknown): Partial<AppConfig> => {
   if (!raw || typeof raw !== 'object') {
     return {};
@@ -213,6 +446,8 @@ export const normalizeStoredConfig = (raw: unknown): Partial<AppConfig> => {
     apiKeyEnv,
     apiKey,
     systemPrompt,
+    mcp: normalizeMcpRuntimeConfig(source.mcp),
+    skills: normalizeSkillsRuntimeConfig(source.skills),
   };
 
   if (preset.supportsBaseUrl) {
