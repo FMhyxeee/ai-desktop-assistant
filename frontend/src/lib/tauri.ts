@@ -1,11 +1,12 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import type {
-  AgentEvent,
-  AppConfig,
-  InputCard,
-  McpConfigTestResult,
-  SkillScanResult,
+import {
+  McpTransportKind,
+  type AgentEvent,
+  type AppConfig,
+  type InputCard,
+  type McpConfigTestResult,
+  type SkillScanResult,
 } from '../types';
 
 interface RuntimeMcpAuthPayload {
@@ -104,6 +105,24 @@ const normalizeStringMap = (source: Record<string, string> | undefined): Record<
   return output;
 };
 
+const normalizeTransportForRuntime = (transport: string): string => {
+  const normalized = transport.trim().toLowerCase();
+  switch (normalized) {
+    case McpTransportKind.Stdio:
+      return McpTransportKind.Stdio;
+    case McpTransportKind.StreamableHttp:
+    case 'streamable-http':
+    case 'streamablehttp':
+    case 'http':
+    case 'https':
+      return McpTransportKind.StreamableHttp;
+    case 'ws':
+      return McpTransportKind.Websocket;
+    default:
+      return normalized || McpTransportKind.Stdio;
+  }
+};
+
 const toRuntimeMcpPayload = (config: AppConfig): RuntimeMcpPayload => ({
   enabled: Boolean(config.mcp.enabled),
   defaultTimeoutSecs: normalizePositiveInt(config.mcp.defaultTimeoutSecs),
@@ -111,7 +130,7 @@ const toRuntimeMcpPayload = (config: AppConfig): RuntimeMcpPayload => ({
   servers: config.mcp.servers.map((server) => ({
     name: server.name.trim(),
     enabled: Boolean(server.enabled),
-    transport: server.transport,
+    transport: normalizeTransportForRuntime(server.transport),
     endpoint: normalizeOptionalText(server.endpoint),
     command: normalizeOptionalText(server.command),
     args: (server.args ?? [])

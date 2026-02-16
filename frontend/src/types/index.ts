@@ -213,6 +213,8 @@ export const enum AgentProvider {
 
 export const enum McpTransportKind {
   Stdio = 'stdio',
+  StreamableHttp = 'streamable_http',
+  // Legacy values kept for migration warnings and old config parsing.
   Tcp = 'tcp',
   Http = 'http',
   Https = 'https',

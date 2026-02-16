@@ -48,6 +48,8 @@ impl Default for AgentRuntimeConfig {
 pub enum McpTransportKind {
     #[default]
     Stdio,
+    StreamableHttp,
+    // Legacy values kept only for reading older configs.
     Tcp,
     Http,
     Https,

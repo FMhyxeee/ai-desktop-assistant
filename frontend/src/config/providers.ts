@@ -289,11 +289,14 @@ const normalizeMcpTransport = (value: unknown): McpTransportKind => {
       return McpTransportKind.Stdio;
     case McpTransportKind.Tcp:
       return McpTransportKind.Tcp;
+    case McpTransportKind.StreamableHttp:
+    case 'streamable-http':
+    case 'streamablehttp':
     case McpTransportKind.Http:
-      return McpTransportKind.Http;
     case McpTransportKind.Https:
-      return McpTransportKind.Https;
+      return McpTransportKind.StreamableHttp;
     case McpTransportKind.Websocket:
+    case 'ws':
       return McpTransportKind.Websocket;
     case McpTransportKind.Wss:
       return McpTransportKind.Wss;

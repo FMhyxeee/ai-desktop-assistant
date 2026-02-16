@@ -2,7 +2,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ai_desktop_assistant_lib::agent_service::types::{
-    AgentEvent, AgentStreamInput, McpRuntimeConfig, McpServerRuntimeConfig, SkillsRuntimeConfig,
+    AgentEvent, AgentStreamInput, McpRuntimeConfig, McpServerRuntimeConfig, McpTransportKind,
+    SkillsRuntimeConfig,
 };
 use ai_desktop_assistant_lib::agent_service::{
     AgentService, Runner, scan_skills_runtime_config, test_mcp_runtime_config,
@@ -113,6 +114,59 @@ async fn test_mcp_runtime_config_invalid_server_returns_error() {
     assert_eq!(result.server_results.len(), 1);
     assert!(!result.server_results[0].success);
     assert!(result.server_results[0].error.is_some());
+}
+
+#[tokio::test]
+async fn test_mcp_runtime_config_legacy_transport_returns_migration_error() {
+    let config = McpRuntimeConfig {
+        enabled: true,
+        default_timeout_secs: Some(1),
+        max_retries: Some(0),
+        servers: vec![McpServerRuntimeConfig {
+            name: "legacy-tcp".to_string(),
+            enabled: true,
+            transport: McpTransportKind::Tcp,
+            endpoint: Some("tcp://localhost:9000".to_string()),
+            ..Default::default()
+        }],
+    };
+
+    let result = test_mcp_runtime_config(config).await;
+    assert!(!result.success);
+    assert_eq!(result.server_results.len(), 1);
+    let error_text = result.server_results[0]
+        .error
+        .clone()
+        .unwrap_or_default();
+    assert!(error_text.contains("Unsupported transport 'tcp'"));
+    assert!(error_text.contains("Supported: stdio, streamable_http"));
+    assert!(error_text.contains("http/https -> streamable_http"));
+    assert!(error_text.contains("tcp/ws/wss/sse are removed in strict official mode"));
+}
+
+#[tokio::test]
+async fn test_mcp_runtime_config_http_alias_is_not_unsupported_transport() {
+    let config = McpRuntimeConfig {
+        enabled: true,
+        default_timeout_secs: Some(1),
+        max_retries: Some(0),
+        servers: vec![McpServerRuntimeConfig {
+            name: "http-alias".to_string(),
+            enabled: true,
+            transport: McpTransportKind::Http,
+            endpoint: Some("http://127.0.0.1:1/mcp".to_string()),
+            ..Default::default()
+        }],
+    };
+
+    let result = test_mcp_runtime_config(config).await;
+    assert!(!result.success);
+    assert_eq!(result.server_results.len(), 1);
+    let error_text = result.server_results[0]
+        .error
+        .clone()
+        .unwrap_or_default();
+    assert!(!error_text.contains("Unsupported transport"));
 }
 
 #[tokio::test]

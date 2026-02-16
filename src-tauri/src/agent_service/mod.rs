@@ -7,8 +7,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use agent_lib::mcp::{
-    AuthConfig as AgentMcpAuthConfig, AuthType as AgentMcpAuthType, McpClient, McpManager,
-    McpToolCall, ServerConfig as AgentMcpServerConfig, TlsConfig as AgentMcpTlsConfig,
+    AuthConfig as AgentMcpAuthConfig, AuthType as AgentMcpAuthType, CallToolRequestParams,
+    McpClient, McpManager, ServerConfig as AgentMcpServerConfig, TlsConfig as AgentMcpTlsConfig,
     TransportType as AgentMcpTransportType,
 };
 use agent_lib::model::provider::{
@@ -410,7 +410,10 @@ pub async fn test_mcp_runtime_config(config: McpRuntimeConfig) -> McpConfigTestR
         );
         match manager.add_server_with_config(server_config).await {
             Ok(tools) => {
-                let tool_names = tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>();
+                let tool_names = tools
+                    .iter()
+                    .map(|tool| tool.name.to_string())
+                    .collect::<Vec<_>>();
                 server_results.push(McpServerTestResult {
                     name: server.name.clone(),
                     enabled: true,
@@ -568,7 +571,17 @@ async fn build_runtime_resources(config: &AgentRuntimeConfig) -> Result<RuntimeR
     let mut registry = ToolRegistry::new();
     let tools = manager.get_all_tools().await;
     for (server_name, tool_def, client) in tools {
-        let tool = PrefixedMcpTool::new(server_name, tool_def.name, tool_def.description, tool_def.schema, client);
+        let tool = PrefixedMcpTool::new(
+            server_name,
+            tool_def.name.to_string(),
+            tool_def
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .to_string(),
+            Value::Object((*tool_def.input_schema).clone()),
+            client,
+        );
         registry.register(Arc::new(tool));
     }
 
@@ -608,6 +621,7 @@ fn map_runtime_mcp_server_config(
 ) -> Result<AgentMcpServerConfig, AppError> {
     let name = normalize_optional(Some(server.name.clone()))
         .ok_or_else(|| AppError::InvalidConfig("MCP server name cannot be empty".to_string()))?;
+    let transport = map_runtime_transport(server.transport)?;
     let endpoint = normalize_optional(server.endpoint.clone()).unwrap_or_default();
     let command = normalize_optional(server.command.clone());
     let args = server
@@ -627,8 +641,8 @@ fn map_runtime_mcp_server_config(
 
     Ok(AgentMcpServerConfig {
         name,
-        transport: map_runtime_transport(server.transport),
-        transport_config: agent_lib::mcp::TransportConfig { endpoint },
+        transport,
+        endpoint,
         command,
         args,
         auth,
@@ -640,15 +654,25 @@ fn map_runtime_mcp_server_config(
     })
 }
 
-fn map_runtime_transport(kind: McpTransportKind) -> AgentMcpTransportType {
+fn unsupported_transport_message(value: &str) -> String {
+    format!(
+        "Unsupported transport '{}'. Supported: stdio, streamable_http. http/https -> streamable_http; tcp/ws/wss/sse are removed in strict official mode.",
+        value
+    )
+}
+
+fn map_runtime_transport(kind: McpTransportKind) -> Result<AgentMcpTransportType, AppError> {
     match kind {
-        McpTransportKind::Stdio => AgentMcpTransportType::Stdio,
-        McpTransportKind::Tcp => AgentMcpTransportType::Tcp,
-        McpTransportKind::Http => AgentMcpTransportType::Http,
-        McpTransportKind::Https => AgentMcpTransportType::Https,
-        McpTransportKind::Websocket => AgentMcpTransportType::WebSocket,
-        McpTransportKind::Wss => AgentMcpTransportType::Wss,
-        McpTransportKind::Sse => AgentMcpTransportType::Sse,
+        McpTransportKind::Stdio => Ok(AgentMcpTransportType::Stdio),
+        McpTransportKind::StreamableHttp | McpTransportKind::Http | McpTransportKind::Https => {
+            Ok(AgentMcpTransportType::StreamableHttp)
+        }
+        McpTransportKind::Tcp => Err(AppError::InvalidConfig(unsupported_transport_message("tcp"))),
+        McpTransportKind::Websocket => Err(AppError::InvalidConfig(
+            unsupported_transport_message("websocket"),
+        )),
+        McpTransportKind::Wss => Err(AppError::InvalidConfig(unsupported_transport_message("wss"))),
+        McpTransportKind::Sse => Err(AppError::InvalidConfig(unsupported_transport_message("sse"))),
     }
 }
 
@@ -826,16 +850,30 @@ impl Tool for PrefixedMcpTool {
     }
 
     async fn execute(&self, args: Value, _ctx: &ToolContext) -> AgentResult<ToolResult> {
+        let arguments = match args {
+            Value::Object(arguments) => arguments,
+            _ => {
+                return Err(AgentError::Tool(
+                    "MCP tool arguments must be a JSON object".to_string(),
+                ));
+            }
+        };
+
         let result = self
             .client
-            .call_tool(McpToolCall {
-                name: self.call_name.clone(),
-                args,
+            .call_tool(CallToolRequestParams {
+                meta: None,
+                name: self.call_name.clone().into(),
+                arguments: Some(arguments),
+                task: None,
             })
             .await
             .map_err(|err| AgentError::Tool(format!("MCP tool call failed: {}", err)))?;
 
-        Ok(ToolResult { output: result })
+        let output = serde_json::to_value(result)
+            .map_err(|err| AgentError::Tool(format!("Failed to encode MCP tool result: {}", err)))?;
+
+        Ok(ToolResult { output })
     }
 }
 

@@ -33,13 +33,18 @@ type Feedback = {
 
 const TRANSPORT_OPTIONS: Array<{ value: McpTransportKind; label: string }> = [
   { value: McpTransportKind.Stdio, label: 'stdio' },
-  { value: McpTransportKind.Tcp, label: 'tcp' },
-  { value: McpTransportKind.Http, label: 'http' },
-  { value: McpTransportKind.Https, label: 'https' },
-  { value: McpTransportKind.Websocket, label: 'websocket' },
-  { value: McpTransportKind.Wss, label: 'wss' },
-  { value: McpTransportKind.Sse, label: 'sse' },
+  { value: McpTransportKind.StreamableHttp, label: 'streamable_http' },
 ];
+
+const LEGACY_UNSUPPORTED_TRANSPORTS: McpTransportKind[] = [
+  McpTransportKind.Tcp,
+  McpTransportKind.Websocket,
+  McpTransportKind.Wss,
+  McpTransportKind.Sse,
+];
+
+const isLegacyUnsupportedTransport = (value: McpTransportKind): boolean =>
+  LEGACY_UNSUPPORTED_TRANSPORTS.includes(value);
 
 const AUTH_OPTIONS: Array<{ value: McpAuthType; label: string }> = [
   { value: McpAuthType.None, label: 'none' },
@@ -130,12 +135,14 @@ const normalizeTransportFromUnknown = (value: unknown): McpTransportKind => {
   switch (normalized) {
     case 'stdio':
       return McpTransportKind.Stdio;
+    case 'streamable_http':
+    case 'streamable-http':
+    case 'streamablehttp':
+    case 'http':
+    case 'https':
+      return McpTransportKind.StreamableHttp;
     case 'tcp':
       return McpTransportKind.Tcp;
-    case 'http':
-      return McpTransportKind.Http;
-    case 'https':
-      return McpTransportKind.Https;
     case 'websocket':
     case 'ws':
       return McpTransportKind.Websocket;
@@ -375,7 +382,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
 
         if (importedServers.length === 0) {
           throw new Error(
-            '未识别到 MCP server 定义。可粘贴 {\"server-name\": {...}} 或完整 mcp 对象。'
+            '未识别到 MCP server 定义。可粘贴 {"server-name": {...}} 或完整 mcp 对象。'
           );
         }
 
@@ -646,6 +653,16 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
                 <div className="settings-stack">
                   {localConfig.mcp.servers.map((server, index) => {
                     const auth = server.auth ?? { type: McpAuthType.None };
+                    const legacyTransport = isLegacyUnsupportedTransport(server.transport);
+                    const transportOptions = legacyTransport
+                      ? [
+                          ...TRANSPORT_OPTIONS,
+                          {
+                            value: server.transport,
+                            label: `${server.transport} (legacy)`,
+                          },
+                        ]
+                      : TRANSPORT_OPTIONS;
                     return (
                       <article key={`server-${index}`} className="mcp-server-card">
                         <div className="mcp-server-head">
@@ -669,8 +686,14 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
                           <div>
                             <label className="field-label" htmlFor={`transport-${index}`}>Transport</label>
                             <select id={`transport-${index}`} className="field-select" value={server.transport} onChange={(event) => updateServer(index, (item) => ({ ...item, transport: event.target.value as McpTransportKind }))}>
-                              {TRANSPORT_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                              {transportOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
                             </select>
+                            {legacyTransport && (
+                              <p className="field-error">
+                                Legacy transport "{server.transport}" is unsupported. Supported: stdio, streamable_http.
+                                Migrate http/https to streamable_http; tcp/ws/wss/sse are removed.
+                              </p>
+                            )}
                           </div>
                         </div>
 
