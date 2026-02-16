@@ -2,18 +2,22 @@ export interface Message {
   id: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
+  images?: InputImageAttachment[];
   timestamp: number;
   isStreaming?: boolean;
 }
 
-export const enum InputCardKind {
-  Text = 'text',
-  Command = 'command',
+export interface InputImageAttachment {
+  id: string;
+  name: string;
+  mimeType: string;
+  dataUrl: string;
+  sizeBytes: number;
 }
 
 export interface InputCard {
-  kind: InputCardKind;
   content: string;
+  images?: InputImageAttachment[];
 }
 
 export type ProtocolCardDirection = 'op' | 'event';
@@ -82,6 +86,10 @@ export type ProtocolOpPayload =
       approval_policy: string;
       sandbox_policy: string;
       text: string;
+      images?: Array<{
+        name: string;
+        mime_type: string;
+      }>;
     }
   | {
       type: 'run_user_shell_command';

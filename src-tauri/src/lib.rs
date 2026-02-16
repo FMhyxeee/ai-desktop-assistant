@@ -53,8 +53,43 @@ async fn start_agent_stream(
 fn parse_stream_input(input: serde_json::Value) -> Result<AgentStreamInput, String> {
     match input {
         serde_json::Value::String(text) => Ok(AgentStreamInput::text(text)),
-        value => serde_json::from_value::<AgentStreamInput>(value)
-            .map_err(|err| format!("invalid stream input: {err}")),
+        value => {
+            if let Ok(parsed) = serde_json::from_value::<AgentStreamInput>(value.clone()) {
+                return Ok(parsed);
+            }
+
+            #[derive(serde::Deserialize)]
+            struct LegacyStreamInput {
+                kind: Option<String>,
+                content: String,
+            }
+
+            let legacy = serde_json::from_value::<LegacyStreamInput>(value)
+                .map_err(|err| format!("invalid stream input: {err}"))?;
+
+            let normalized_content = match legacy
+                .kind
+                .as_deref()
+                .map(|kind| kind.trim().to_ascii_lowercase())
+            {
+                Some(kind) if kind == "command" => {
+                    let trimmed = legacy.content.trim();
+                    if trimmed.starts_with('/') {
+                        trimmed.to_string()
+                    } else if trimmed.is_empty() {
+                        "/".to_string()
+                    } else {
+                        format!("/{trimmed}")
+                    }
+                }
+                _ => legacy.content,
+            };
+
+            Ok(AgentStreamInput {
+                content: normalized_content,
+                images: Vec::new(),
+            })
+        }
     }
 }
 

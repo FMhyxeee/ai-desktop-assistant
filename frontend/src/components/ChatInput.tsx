@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Send, Square } from 'lucide-react';
-import type { InputCard } from '../types';
-import { InputCardKind } from '../types';
+import { ImagePlus, Send, Square, X } from 'lucide-react';
+import { parseSlashInput } from '../lib/input';
+import type { InputCard, InputImageAttachment } from '../types';
 
 interface ChatInputProps {
   onSend: (input: InputCard) => void;
@@ -20,9 +20,12 @@ const ChatInput: React.FC<ChatInputProps> = ({
   draftInput,
   onDraftConsumed,
 }) => {
-  const [input, setInput] = useState('');
-  const [inputMode, setInputMode] = useState<InputCardKind>(InputCardKind.Text);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const [input, setInput] = useState('');
+  const [images, setImages] = useState<InputImageAttachment[]>([]);
+  const [isReadingImages, setIsReadingImages] = useState(false);
 
   useEffect(() => {
     if (!textareaRef.current) {
@@ -36,9 +39,11 @@ const ChatInput: React.FC<ChatInputProps> = ({
     if (!draftInput) {
       return;
     }
-    setInputMode(draftInput.kind);
+
     setInput(draftInput.content);
+    setImages(draftInput.images ?? []);
     onDraftConsumed?.();
+
     requestAnimationFrame(() => {
       textareaRef.current?.focus();
       const textarea = textareaRef.current;
@@ -50,24 +55,98 @@ const ChatInput: React.FC<ChatInputProps> = ({
     });
   }, [draftInput, onDraftConsumed]);
 
-  const handleSend = () => {
-    const trimmed = input.trim();
-    if (!trimmed || disabled) {
+  const handlePickImage = () => {
+    fileInputRef.current?.click();
+  };
+
+  const handleImagesSelected = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    event.target.value = '';
+    if (files.length === 0) {
       return;
     }
 
-    if (inputMode === InputCardKind.Command) {
-      const confirmed = window.confirm(`确认执行命令？\n\n${trimmed}`);
+    setIsReadingImages(true);
+    const nextAttachments: InputImageAttachment[] = [];
+
+    for (const file of files) {
+      if (!file.type.startsWith('image/')) {
+        continue;
+      }
+
+      try {
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            if (typeof reader.result === 'string') {
+              resolve(reader.result);
+              return;
+            }
+            reject(new Error('Failed to read image file'));
+          };
+          reader.onerror = () => reject(reader.error ?? new Error('Failed to read image file'));
+          reader.readAsDataURL(file);
+        });
+
+        const attachmentId =
+          typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID()
+            : `img-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+        nextAttachments.push({
+          id: attachmentId,
+          name: file.name,
+          mimeType: file.type || 'application/octet-stream',
+          dataUrl,
+          sizeBytes: file.size,
+        });
+      } catch {
+        // Skip unreadable image files and keep processing the rest.
+      }
+    }
+
+    if (nextAttachments.length > 0) {
+      setImages((current) => [...current, ...nextAttachments]);
+    }
+
+    setIsReadingImages(false);
+  };
+
+  const removeImage = (imageId: string) => {
+    setImages((current) => current.filter((item) => item.id !== imageId));
+  };
+
+  const handleSend = () => {
+    const parsedInput = parseSlashInput(input);
+    const normalizedContent = parsedInput.normalizedContent;
+    const hasText = normalizedContent.length > 0;
+    const hasImages = images.length > 0;
+
+    if ((!hasText && !hasImages) || disabled || isReadingImages) {
+      return;
+    }
+
+    if (parsedInput.isCommand && hasImages) {
+      window.alert('Command input cannot include image attachments.');
+      return;
+    }
+
+    if (parsedInput.isCommand) {
+      const confirmed = window.confirm(
+        `Confirm shell command execution?\n\n${parsedInput.command ?? ''}`
+      );
       if (!confirmed) {
         return;
       }
     }
 
     onSend({
-      kind: inputMode,
-      content: trimmed,
+      content: normalizedContent,
+      images: parsedInput.isCommand ? undefined : images,
     });
+
     setInput('');
+    setImages([]);
 
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
@@ -81,38 +160,65 @@ const ChatInput: React.FC<ChatInputProps> = ({
     }
   };
 
+  const parsedInput = parseSlashInput(input);
+  const hasSendableInput = parsedInput.normalizedContent.length > 0 || images.length > 0;
+
   return (
     <div className="composer-wrap">
       <div className="composer-panel">
-        <div className="composer-mode">
+        <div className="composer-media-row">
           <button
             type="button"
-            className={`mode-chip ${inputMode === InputCardKind.Text ? 'active' : ''}`}
-            onClick={() => setInputMode(InputCardKind.Text)}
+            className="composer-image-btn"
+            onClick={handlePickImage}
             disabled={disabled || isStreaming}
           >
-            Text
+            <ImagePlus size={14} />
+            Add image
           </button>
-          <button
-            type="button"
-            className={`mode-chip ${inputMode === InputCardKind.Command ? 'active' : ''}`}
-            onClick={() => setInputMode(InputCardKind.Command)}
-            disabled={disabled || isStreaming}
-          >
-            Command
-          </button>
+          <span className="composer-media-note">
+            {isReadingImages ? 'Reading images...' : `${images.length} image(s) attached`}
+          </span>
         </div>
+
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept="image/*"
+          multiple
+          onChange={handleImagesSelected}
+          className="composer-file-input"
+          tabIndex={-1}
+        />
+
+        {images.length > 0 && (
+          <div className="composer-attachments">
+            {images.map((image) => (
+              <div key={image.id} className="composer-attachment">
+                <img src={image.dataUrl} alt={image.name} className="composer-attachment-preview" />
+                <div className="composer-attachment-meta">
+                  <span className="composer-attachment-name">{image.name}</span>
+                  <span className="composer-attachment-size">{(image.sizeBytes / 1024).toFixed(1)} KB</span>
+                </div>
+                <button
+                  type="button"
+                  className="composer-attachment-remove"
+                  onClick={() => removeImage(image.id)}
+                  aria-label={`Remove ${image.name}`}
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
 
         <textarea
           ref={textareaRef}
           value={input}
           onChange={(event) => setInput(event.target.value)}
           onKeyDown={handleKeyDown}
-          placeholder={
-            inputMode === InputCardKind.Command
-              ? '输入命令...（发送前会二次确认）'
-              : '请输入你的问题...（Enter 发送，Shift+Enter 换行）'
-          }
+          placeholder="Type a message... (/command to run shell, // to send text starting with /)"
           disabled={disabled}
           rows={1}
           className="composer-input"
@@ -122,10 +228,10 @@ const ChatInput: React.FC<ChatInputProps> = ({
           <div className="composer-hint">
             <span>
               {isStreaming
-                ? '正在流式回复中...'
-                : inputMode === InputCardKind.Command
-                  ? '命令模式：将发送 RunUserShellCommand'
-                  : '文本模式：将发送 UserTurn'}
+                ? 'Streaming response in progress...'
+                : parsedInput.isCommand
+                  ? 'Command mode: will trigger run_user_shell_command'
+                  : 'Message mode: will trigger user_turn'}
             </span>
             <span className="composer-count">{input.length}</span>
           </div>
@@ -138,17 +244,17 @@ const ChatInput: React.FC<ChatInputProps> = ({
               disabled={!onCancel}
             >
               <Square size={16} />
-              停止
+              Stop
             </button>
           ) : (
             <button
               type="button"
               onClick={handleSend}
               className="composer-button primary"
-              disabled={disabled || input.trim().length === 0}
+              disabled={disabled || !hasSendableInput || isReadingImages}
             >
               <Send size={16} />
-              发送
+              Send
             </button>
           )}
         </div>
@@ -158,3 +264,4 @@ const ChatInput: React.FC<ChatInputProps> = ({
 };
 
 export default ChatInput;
+

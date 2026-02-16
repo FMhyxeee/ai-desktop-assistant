@@ -17,7 +17,9 @@ const MessageList: React.FC<MessageListProps> = ({
   onRegenerateMessage,
   onContinueFromMessage,
 }) => {
+  const viewportRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const shouldAutoScrollRef = useRef(true);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
 
   const allMessages = useMemo(
@@ -26,8 +28,24 @@ const MessageList: React.FC<MessageListProps> = ({
   );
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    const viewport = viewportRef.current;
+    if (!viewport || !shouldAutoScrollRef.current) {
+      return;
+    }
+
+    const isStreaming = allMessages[allMessages.length - 1]?.isStreaming === true;
+    messagesEndRef.current?.scrollIntoView({ behavior: isStreaming ? 'auto' : 'smooth' });
   }, [allMessages]);
+
+  const handleViewportScroll = () => {
+    const viewport = viewportRef.current;
+    if (!viewport) {
+      return;
+    }
+
+    const distanceToBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+    shouldAutoScrollRef.current = distanceToBottom <= 120;
+  };
 
   const copyMessage = (messageId: string, content: string) => {
     void navigator.clipboard.writeText(content).then(() => {
@@ -39,7 +57,7 @@ const MessageList: React.FC<MessageListProps> = ({
   };
 
   return (
-    <div className="message-viewport">
+    <div className="message-viewport" ref={viewportRef} onScroll={handleViewportScroll}>
       {allMessages.length === 0 && (
         <section className="empty-state">
           <div className="empty-icon">
@@ -67,6 +85,7 @@ const MessageList: React.FC<MessageListProps> = ({
         {allMessages.map((message, index) => {
           const isUser = message.role === 'user';
           const isAssistant = message.role === 'assistant';
+          const messageImages = message.images ?? [];
 
           return (
             <article
@@ -82,12 +101,42 @@ const MessageList: React.FC<MessageListProps> = ({
 
               <div className={`message-bubble ${isUser ? 'user' : 'assistant'}`}>
                 {isUser ? (
-                  <p className="message-content">{message.content}</p>
+                  <div>
+                    {messageImages.length > 0 && (
+                      <div className="message-images">
+                        {messageImages.map((image) => (
+                          <img
+                            key={image.id}
+                            src={image.dataUrl}
+                            alt={image.name}
+                            className="message-image"
+                          />
+                        ))}
+                      </div>
+                    )}
+                    {message.content.length > 0 && <p className="message-content">{message.content}</p>}
+                  </div>
                 ) : (
                   <div>
-                    <Suspense fallback={<p className="message-content">{message.content}</p>}>
-                      <MarkdownMessage content={message.content} />
-                    </Suspense>
+                    {messageImages.length > 0 && (
+                      <div className="message-images">
+                        {messageImages.map((image) => (
+                          <img
+                            key={image.id}
+                            src={image.dataUrl}
+                            alt={image.name}
+                            className="message-image"
+                          />
+                        ))}
+                      </div>
+                    )}
+                    {message.isStreaming ? (
+                      <p className="message-content">{message.content}</p>
+                    ) : (
+                      <Suspense fallback={<p className="message-content">{message.content}</p>}>
+                        <MarkdownMessage content={message.content} />
+                      </Suspense>
+                    )}
                     {message.isStreaming && <span className="stream-cursor" />}
                   </div>
                 )}

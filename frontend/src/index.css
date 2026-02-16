@@ -1012,6 +1012,26 @@ select {
   margin: 0;
 }
 
+.message-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.message-image {
+  width: min(220px, 100%);
+  max-height: 220px;
+  border-radius: 10px;
+  border: 1px solid rgba(190, 205, 228, 0.88);
+  object-fit: cover;
+  background: rgba(249, 252, 255, 0.9);
+}
+
+.message-bubble.user .message-image {
+  border-color: rgba(255, 215, 188, 0.5);
+}
+
 .message-tools {
   margin-top: 10px;
   display: flex;
@@ -1073,27 +1093,107 @@ select {
   box-shadow: 0 14px 34px rgba(19, 36, 60, 0.08);
 }
 
-.composer-mode {
-  display: inline-flex;
+.composer-media-row {
+  display: flex;
   align-items: center;
-  gap: 6px;
+  justify-content: space-between;
+  gap: 8px;
   padding: 2px 6px 8px;
 }
 
-.mode-chip {
+.composer-image-btn {
   border: 1px solid rgba(185, 200, 223, 0.92);
   border-radius: 999px;
-  padding: 3px 10px;
+  padding: 5px 10px;
   font-size: 0.73rem;
   color: var(--ink-700);
   background: rgba(243, 248, 255, 0.9);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   cursor: pointer;
 }
 
-.mode-chip.active {
-  color: white;
-  border-color: transparent;
-  background: linear-gradient(145deg, #ff8a34 0%, #f15e00 100%);
+.composer-image-btn:hover {
+  border-color: rgba(156, 179, 213, 0.9);
+  background: rgba(237, 245, 255, 0.95);
+}
+
+.composer-image-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.composer-media-note {
+  font-size: 0.74rem;
+  color: var(--ink-500);
+}
+
+.composer-file-input {
+  display: none;
+}
+
+.composer-attachments {
+  display: grid;
+  gap: 7px;
+  padding: 2px 6px 8px;
+}
+
+.composer-attachment {
+  border: 1px solid rgba(184, 201, 225, 0.86);
+  border-radius: 12px;
+  background: rgba(246, 250, 255, 0.95);
+  padding: 7px 8px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.composer-attachment-preview {
+  width: 52px;
+  height: 52px;
+  border-radius: 8px;
+  border: 1px solid rgba(186, 203, 228, 0.88);
+  object-fit: cover;
+  background: white;
+  flex-shrink: 0;
+}
+
+.composer-attachment-meta {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.composer-attachment-name {
+  font-size: 0.75rem;
+  color: var(--ink-800);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.composer-attachment-size {
+  font-size: 0.69rem;
+  color: var(--ink-500);
+}
+
+.composer-attachment-remove {
+  width: 28px;
+  height: 28px;
+  border: 1px solid rgba(186, 203, 226, 0.9);
+  border-radius: 8px;
+  background: rgba(253, 255, 255, 0.95);
+  color: var(--ink-700);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.composer-attachment-remove:hover {
+  border-color: rgba(165, 184, 213, 0.9);
 }
 
 .composer-input {
@@ -1755,6 +1855,11 @@ select {
   .composer-controls {
     flex-direction: column;
     align-items: flex-start;
+  }
+
+  .composer-media-row {
+    flex-wrap: wrap;
+    justify-content: flex-start;
   }
 
   .composer-button {

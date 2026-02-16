@@ -5,8 +5,9 @@ import ChatInput from './ChatInput';
 import ProtocolPanel from './ProtocolPanel';
 import Sidebar from './Sidebar';
 import SettingsModal from './SettingsModal';
-import type { AgentEvent, InputCard, ProtocolEventPayload, ProtocolOpPayload } from '../types';
-import { AgentEventType, InputCardKind } from '../types';
+import type { AgentEvent, InputCard, Message, ProtocolEventPayload, ProtocolOpPayload } from '../types';
+import { AgentEventType } from '../types';
+import { parseSlashInput } from '../lib/input';
 import { TauriAPI } from '../lib/tauri';
 import { logger } from '../lib/logger';
 import { useAppStore } from '../store/appStore';
@@ -59,9 +60,62 @@ const ChatView: React.FC = () => {
   const [protocolOpen, setProtocolOpen] = useState(() => !detectCompactLayout());
   const [draftInput, setDraftInput] = useState<InputCard | null>(null);
   const unlistenRef = useRef<(() => void) | null>(null);
+  const pendingDeltaByTaskRef = useRef<Map<string, string>>(new Map());
+  const deltaFlushRafRef = useRef<number | null>(null);
 
   const currentConversation = conversations.find(
     (conversation) => conversation.id === currentConversationId
+  );
+
+  const flushPendingDeltas = useCallback(() => {
+    deltaFlushRafRef.current = null;
+    const pendingDeltas = pendingDeltaByTaskRef.current;
+    if (pendingDeltas.size === 0) {
+      return;
+    }
+
+    pendingDeltas.forEach((pendingChunk, taskId) => {
+      if (pendingChunk.length > 0) {
+        appendStreamDelta(taskId, pendingChunk);
+      }
+    });
+
+    pendingDeltas.clear();
+  }, [appendStreamDelta]);
+
+  const flushPendingDeltaForTask = useCallback(
+    (taskId: string) => {
+      const pendingDeltas = pendingDeltaByTaskRef.current;
+      const pendingChunk = pendingDeltas.get(taskId);
+      if (!pendingChunk || pendingChunk.length === 0) {
+        pendingDeltas.delete(taskId);
+        return;
+      }
+      appendStreamDelta(taskId, pendingChunk);
+      pendingDeltas.delete(taskId);
+    },
+    [appendStreamDelta]
+  );
+
+  const queueDeltaChunk = useCallback(
+    (taskId: string, chunk: string) => {
+      if (!chunk) {
+        return;
+      }
+
+      const pendingDeltas = pendingDeltaByTaskRef.current;
+      pendingDeltas.set(taskId, `${pendingDeltas.get(taskId) ?? ''}${chunk}`);
+
+      if (typeof window === 'undefined') {
+        flushPendingDeltas();
+        return;
+      }
+
+      if (deltaFlushRafRef.current === null) {
+        deltaFlushRafRef.current = window.requestAnimationFrame(flushPendingDeltas);
+      }
+    },
+    [flushPendingDeltas]
   );
 
   useEffect(() => {
@@ -174,15 +228,17 @@ const ChatView: React.FC = () => {
         }
         case AgentEventType.Delta: {
           if (typeof event.chunk === 'string' && event.chunk.length > 0) {
-            appendStreamDelta(event.task_id, event.chunk);
+            queueDeltaChunk(event.task_id, event.chunk);
           }
           break;
         }
         case AgentEventType.Completed: {
+          flushPendingDeltaForTask(event.task_id);
           completeStream(event.task_id, event.output ?? '');
           break;
         }
         case AgentEventType.Error: {
+          flushPendingDeltaForTask(event.task_id);
           const errorMessage = event.message ?? 'Unknown streaming error';
           failStream(event.task_id, errorMessage);
           logger.error('Agent stream error event', {
@@ -209,7 +265,7 @@ const ChatView: React.FC = () => {
         }
       }
     },
-    [addOpCard, addProtocolEventCard, appendStreamDelta, completeStream, failStream]
+    [addOpCard, addProtocolEventCard, completeStream, failStream, flushPendingDeltaForTask, queueDeltaChunk]
   );
 
   useEffect(() => {
@@ -241,6 +297,16 @@ const ChatView: React.FC = () => {
     };
   }, [handleAgentEvent]);
 
+  useEffect(() => {
+    return () => {
+      if (typeof window !== 'undefined' && deltaFlushRafRef.current !== null) {
+        window.cancelAnimationFrame(deltaFlushRafRef.current);
+      }
+      deltaFlushRafRef.current = null;
+      pendingDeltaByTaskRef.current.clear();
+    };
+  }, []);
+
   const handleSendMessage = useCallback(
     async (input: InputCard) => {
       if (!isHydrated || streamingTaskId) {
@@ -252,10 +318,23 @@ const ChatView: React.FC = () => {
         setCurrentConversation(conversationId);
       }
 
-      const userContent = input.kind === 'command' ? `$ ${input.content}` : input.content;
+      const parsedInput = parseSlashInput(input.content);
+      const outboundInput: InputCard = parsedInput.isCommand
+        ? {
+            content: parsedInput.normalizedContent,
+          }
+        : {
+            content: parsedInput.normalizedContent,
+            images: input.images,
+          };
+
+      const userContent = parsedInput.isCommand
+        ? `$ ${parsedInput.command ?? ''}`
+        : parsedInput.normalizedContent;
       const userMessageId = addMessage(conversationId, {
         role: 'user',
         content: userContent,
+        images: outboundInput.images,
       });
 
       if (!userMessageId) {
@@ -264,7 +343,7 @@ const ChatView: React.FC = () => {
       }
 
       const taskId = createTaskId();
-      const assistantMessageId = beginStream(conversationId, taskId, input);
+      const assistantMessageId = beginStream(conversationId, taskId, outboundInput);
       if (!assistantMessageId) {
         logger.error('Failed to create stream placeholder message', {
           conversationId,
@@ -274,12 +353,13 @@ const ChatView: React.FC = () => {
       }
 
       try {
-        await TauriAPI.startAgentStream(input, taskId);
+        await TauriAPI.startAgentStream(outboundInput, taskId);
         logger.info('Agent stream request sent', {
           taskId,
           conversationId,
           assistantMessageId,
-          inputKind: input.kind,
+          inputMode: parsedInput.isCommand ? 'command' : 'message',
+          imageCount: outboundInput.images?.length ?? 0,
         });
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : 'Unknown error';
@@ -303,16 +383,15 @@ const ChatView: React.FC = () => {
     ]
   );
 
-  const toInputCardFromUserMessage = useCallback((content: string): InputCard => {
-    if (content.startsWith('$ ')) {
+  const toInputCardFromUserMessage = useCallback((message: Message): InputCard => {
+    if (message.content.startsWith('$ ')) {
       return {
-        kind: InputCardKind.Command,
-        content: content.slice(2).trimStart(),
+        content: `/${message.content.slice(2).trimStart()}`,
       };
     }
     return {
-      kind: InputCardKind.Text,
-      content,
+      content: message.content,
+      images: message.images,
     };
   }, []);
 
@@ -323,9 +402,11 @@ const ChatView: React.FC = () => {
         return;
       }
 
-      const prefix = message.role === 'assistant' ? '基于这段助手回复继续追问：\n' : '基于这条消息继续：\n';
+      const prefix =
+        message.role === 'assistant'
+          ? 'Continue based on this assistant reply:\n'
+          : 'Continue based on this message:\n';
       setDraftInput({
-        kind: InputCardKind.Text,
         content: `${prefix}${message.content}\n`,
       });
     },
@@ -354,7 +435,7 @@ const ChatView: React.FC = () => {
         return;
       }
 
-      void handleSendMessage(toInputCardFromUserMessage(previousUserMessage.content));
+      void handleSendMessage(toInputCardFromUserMessage(previousUserMessage));
     },
     [currentConversation, handleSendMessage, streamingTaskId, toInputCardFromUserMessage]
   );
@@ -397,7 +478,7 @@ const ChatView: React.FC = () => {
         {isCompactLayout && sidebarOpen && (
           <button
             type="button"
-            aria-label="关闭侧边栏"
+            aria-label="Close sidebar"
             className="app-overlay"
             onClick={() => setSidebarOpen(false)}
           />
@@ -406,7 +487,7 @@ const ChatView: React.FC = () => {
         {isCompactLayout && protocolOpen && (
           <button
             type="button"
-            aria-label="关闭协议面板"
+            aria-label="Close protocol panel"
             className="protocol-overlay"
             onClick={() => setProtocolOpen(false)}
           />
@@ -443,33 +524,33 @@ const ChatView: React.FC = () => {
                 type="button"
                 onClick={() => setSidebarOpen((value) => !value)}
                 className={`icon-btn ${sidebarOpen ? 'is-active' : ''}`}
-                title={sidebarOpen ? '隐藏侧边栏' : '显示侧边栏'}
-                aria-label={sidebarOpen ? '隐藏侧边栏' : '显示侧边栏'}
+                title={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
+                aria-label={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
               >
                 <Menu size={20} />
               </button>
 
               <div>
-                <h1 className="topbar-title">{currentConversation?.title || 'AI 桌面助手'}</h1>
+                <h1 className="topbar-title">{currentConversation?.title || 'AI Desktop Assistant'}</h1>
                 <p className="topbar-subtitle">
                   {isStreaming
-                    ? '正在实时生成回复与协议事件...'
-                    : '左侧对话 + 右侧 Op/Event 协议卡片时间线'}
+                    ? 'Streaming response with protocol events...'
+                    : 'Chat on the left, protocol timeline on the right'}
                 </p>
               </div>
             </div>
 
             <div className="topbar-actions">
               <span className={`status-pill ${isStreaming ? 'live' : ''}`}>
-                {isStreaming ? '进行中' : '就绪'}
+                {isStreaming ? 'Running' : 'Ready'}
               </span>
 
               <button
                 type="button"
                 onClick={() => setProtocolOpen((value) => !value)}
                 className={`icon-btn ${protocolOpen ? 'is-active' : ''}`}
-                title={protocolOpen ? '隐藏协议面板' : '显示协议面板'}
-                aria-label={protocolOpen ? '隐藏协议面板' : '显示协议面板'}
+                title={protocolOpen ? 'Hide protocol panel' : 'Show protocol panel'}
+                aria-label={protocolOpen ? 'Hide protocol panel' : 'Show protocol panel'}
               >
                 <PanelRight size={20} />
               </button>
@@ -478,8 +559,8 @@ const ChatView: React.FC = () => {
                 type="button"
                 onClick={() => setSettingsOpen(true)}
                 className="icon-btn"
-                title="设置"
-                aria-label="打开设置"
+                title="Settings"
+                aria-label="Open settings"
               >
                 <Settings size={20} />
               </button>

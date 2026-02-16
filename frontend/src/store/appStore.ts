@@ -13,7 +13,6 @@ import type {
   ProtocolEventPayload,
   ProtocolOpPayload,
 } from '../types';
-import { InputCardKind } from '../types';
 
 type NewMessage = Omit<Message, 'id' | 'timestamp'>;
 
@@ -91,14 +90,12 @@ const findConversation = (conversations: Conversation[], id: string | null) =>
 const toInputCardFromOpPayload = (payload: ProtocolOpPayload): InputCard | undefined => {
   if (payload.type === 'user_turn') {
     return {
-      kind: InputCardKind.Text,
       content: payload.text,
     };
   }
   if (payload.type === 'run_user_shell_command') {
     return {
-      kind: InputCardKind.Command,
-      content: payload.command,
+      content: `/${payload.command}`,
     };
   }
   return undefined;
@@ -800,9 +797,49 @@ export const saveToTauriStore = (config: AppConfig, conversations: Conversation[
   }
 };
 
+const PERSIST_DEBOUNCE_MS = 250;
+const PERSIST_STREAMING_DEBOUNCE_MS = 1200;
+
+interface PersistSnapshot {
+  config: AppConfig;
+  conversations: Conversation[];
+  currentConversationId: string | null;
+}
+
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingPersistSnapshot: PersistSnapshot | null = null;
+
+const schedulePersistToTauriStore = (snapshot: PersistSnapshot, delayMs: number) => {
+  pendingPersistSnapshot = snapshot;
+
+  if (persistTimer !== null) {
+    clearTimeout(persistTimer);
+  }
+
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    const nextSnapshot = pendingPersistSnapshot;
+    if (!nextSnapshot) {
+      return;
+    }
+    pendingPersistSnapshot = null;
+    saveToTauriStore(nextSnapshot.config, nextSnapshot.conversations, nextSnapshot.currentConversationId);
+  }, delayMs);
+};
+
 useAppStore.subscribe((state) => {
   if (!state.isHydrated) {
     return;
   }
-  saveToTauriStore(state.config, state.conversations, state.currentConversationId);
+
+  const delayMs = state.streamingTaskId ? PERSIST_STREAMING_DEBOUNCE_MS : PERSIST_DEBOUNCE_MS;
+  schedulePersistToTauriStore(
+    {
+      config: state.config,
+      conversations: state.conversations,
+      currentConversationId: state.currentConversationId,
+    },
+    delayMs
+  );
 });
+

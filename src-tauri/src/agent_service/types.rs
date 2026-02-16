@@ -144,27 +144,37 @@ pub struct SkillsRuntimeConfig {
     pub auto_apply: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum StreamInputKind {
-    Text,
-    Command,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentInputImage {
+    pub name: String,
+    pub mime_type: String,
+    pub data_url: String,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentStreamInput {
-    pub kind: StreamInputKind,
     pub content: String,
+    #[serde(default)]
+    pub images: Vec<AgentInputImage>,
 }
 
 impl AgentStreamInput {
     pub fn text(content: impl Into<String>) -> Self {
         Self {
-            kind: StreamInputKind::Text,
             content: content.into(),
+            images: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ProtocolInputImage {
+    pub name: String,
+    pub mime_type: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -176,6 +186,8 @@ pub enum ProtocolOpPayload {
         approval_policy: String,
         sandbox_policy: String,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ProtocolInputImage>,
     },
     RunUserShellCommand {
         command: String,

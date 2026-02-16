@@ -163,28 +163,28 @@ const ProtocolPanel: React.FC<ProtocolPanelProps> = ({ cards, onRetry }) => {
   const [levelFilter, setLevelFilter] = useState<LevelFilter>('all');
   const [typeFilter, setTypeFilter] = useState<string>('all');
 
-  const sortedCards = useMemo(
+  const chronologicalCards = useMemo(
     () => [...cards].sort((a, b) => (a.timestamp === b.timestamp ? a.seq - b.seq : a.timestamp - b.timestamp)),
     [cards]
   );
 
   const previousCardById = useMemo(() => {
     const mapping: Record<string, ProtocolCard | null> = {};
-    sortedCards.forEach((card, index) => {
-      mapping[card.id] = index === 0 ? null : sortedCards[index - 1];
+    chronologicalCards.forEach((card, index) => {
+      mapping[card.id] = index === 0 ? null : chronologicalCards[index - 1];
     });
     return mapping;
-  }, [sortedCards]);
+  }, [chronologicalCards]);
 
   const typeOptions = useMemo(() => {
     const uniqueTypes = new Set<string>();
-    sortedCards.forEach((card) => uniqueTypes.add(card.type));
+    chronologicalCards.forEach((card) => uniqueTypes.add(card.type));
     return Array.from(uniqueTypes).sort((a, b) => a.localeCompare(b));
-  }, [sortedCards]);
+  }, [chronologicalCards]);
 
   const filteredCards = useMemo(
     () =>
-      sortedCards.filter((card) => {
+      chronologicalCards.filter((card) => {
         if (directionFilter !== 'all' && card.direction !== directionFilter) {
           return false;
         }
@@ -196,8 +196,10 @@ const ProtocolPanel: React.FC<ProtocolPanelProps> = ({ cards, onRetry }) => {
         }
         return true;
       }),
-    [directionFilter, levelFilter, sortedCards, typeFilter]
+    [chronologicalCards, directionFilter, levelFilter, typeFilter]
   );
+
+  const displayCards = useMemo(() => [...filteredCards].reverse(), [filteredCards]);
 
   const toggleExpanded = (cardId: string) => {
     setExpanded((state) => ({
@@ -218,12 +220,12 @@ const ProtocolPanel: React.FC<ProtocolPanelProps> = ({ cards, onRetry }) => {
           <button
             type="button"
             className="protocol-action"
-            onClick={() => downloadJson(`protocol-timeline-${Date.now()}.json`, sortedCards)}
+            onClick={() => downloadJson(`protocol-timeline-${Date.now()}.json`, displayCards)}
           >
             <Download size={14} />
             导出全部
           </button>
-          <span className="protocol-count">{filteredCards.length}/{sortedCards.length}</span>
+          <span className="protocol-count">{displayCards.length}/{chronologicalCards.length}</span>
         </div>
       </header>
 
@@ -275,14 +277,14 @@ const ProtocolPanel: React.FC<ProtocolPanelProps> = ({ cards, onRetry }) => {
       </div>
 
       <div className="protocol-list">
-        {filteredCards.length === 0 && (
+        {displayCards.length === 0 && (
           <div className="protocol-empty">
             <AlertCircle size={16} />
-            <span>{sortedCards.length === 0 ? '等待 Op/Event 卡片...' : '当前筛选条件下没有卡片'}</span>
+            <span>{chronologicalCards.length === 0 ? '等待 Op/Event 卡片...' : '当前筛选条件下没有卡片'}</span>
           </div>
         )}
 
-        {filteredCards.map((card) => {
+        {displayCards.map((card) => {
           const isExpanded = expanded[card.id] ?? false;
           const mode = detailMode[card.id] ?? 'tree';
           const previousCard = previousCardById[card.id];

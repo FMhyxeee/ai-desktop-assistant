@@ -25,12 +25,13 @@ use tauri::async_runtime::{JoinHandle, Mutex};
 use tokio::time::timeout;
 
 use self::types::{
-    AgentEvent, AgentProvider, AgentRuntimeConfig, AgentStreamInput, AppError, McpAuthRuntimeConfig,
-    McpAuthType, McpConfigTestResult, McpRuntimeConfig, McpServerRuntimeConfig,
-    McpServerTestResult, McpTlsRuntimeConfig, McpTransportKind, ProtocolEventPayload,
-    ProtocolMcpPromptInfo, ProtocolMcpResourceInfo, ProtocolMcpToolInfo, ProtocolOpPayload,
-    ProtocolPromptArgumentInfo, ProtocolPromptContent, ProtocolPromptMessage, ProtocolSkillEntry,
-    ProtocolTokenUsage, SkillScanEntry, SkillScanResult, SkillsRuntimeConfig, StreamInputKind,
+    AgentEvent, AgentInputImage, AgentProvider, AgentRuntimeConfig, AgentStreamInput, AppError,
+    McpAuthRuntimeConfig, McpAuthType, McpConfigTestResult, McpRuntimeConfig,
+    McpServerRuntimeConfig, McpServerTestResult, McpTlsRuntimeConfig, McpTransportKind,
+    ProtocolEventPayload, ProtocolInputImage, ProtocolMcpPromptInfo, ProtocolMcpResourceInfo,
+    ProtocolMcpToolInfo, ProtocolOpPayload, ProtocolPromptArgumentInfo, ProtocolPromptContent,
+    ProtocolPromptMessage, ProtocolSkillEntry, ProtocolTokenUsage, SkillScanEntry, SkillScanResult,
+    SkillsRuntimeConfig,
 };
 
 struct ActiveTask {
@@ -1026,13 +1027,37 @@ fn build_stream_op(
     input: &AgentStreamInput,
     config: &AgentRuntimeConfig,
 ) -> (Op, ProtocolOpPayload, bool) {
-    match input.kind {
-        StreamInputKind::Text => {
+    match parse_slash_input(&input.content) {
+        ParsedStreamInput::Command(command) => (
+            Op::RunUserShellCommand {
+                command: command.clone(),
+            },
+            ProtocolOpPayload::RunUserShellCommand { command },
+            true,
+        ),
+        ParsedStreamInput::Text(text) => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let protocol_images = input
+                .images
+                .iter()
+                .map(|image| ProtocolInputImage {
+                    name: image.name.clone(),
+                    mime_type: image.mime_type.clone(),
+                })
+                .collect::<Vec<_>>();
+
+            let model_payload_text = if input.images.is_empty() {
+                text.clone()
+            } else if matches!(config.provider, AgentProvider::OpenAi) {
+                encode_multimodal_text(&text, &input.images)
+            } else {
+                append_image_note(&text, &input.images)
+            };
+
             (
                 Op::UserTurn {
                     items: vec![UserInputItem::Text {
-                        text: input.content.clone(),
+                        text: model_payload_text,
                     }],
                     cwd: cwd.clone(),
                     approval_policy: ApprovalPolicy::NeverAsk,
@@ -1051,20 +1076,145 @@ fn build_stream_op(
                     cwd: cwd.to_string_lossy().to_string(),
                     approval_policy: "never_ask".to_string(),
                     sandbox_policy: "persistent".to_string(),
-                    text: input.content.clone(),
+                    text,
+                    images: protocol_images,
                 },
                 false,
             )
         }
-        StreamInputKind::Command => (
-            Op::RunUserShellCommand {
-                command: input.content.clone(),
-            },
-            ProtocolOpPayload::RunUserShellCommand {
-                command: input.content.clone(),
-            },
-            true,
-        ),
+    }
+}
+
+#[derive(Debug)]
+enum ParsedStreamInput {
+    Text(String),
+    Command(String),
+}
+
+const MULTIMODAL_MARKER: &str = "__AI_HELPER_MM_V1__";
+
+fn parse_slash_input(raw_content: &str) -> ParsedStreamInput {
+    let trimmed = raw_content.trim();
+    if trimmed.is_empty() || !trimmed.starts_with('/') {
+        return ParsedStreamInput::Text(trimmed.to_string());
+    }
+
+    if let Some(escaped) = trimmed.strip_prefix("//") {
+        return ParsedStreamInput::Text(format!("/{escaped}"));
+    }
+
+    let command = trimmed.trim_start_matches('/').trim();
+    if command.is_empty() {
+        ParsedStreamInput::Text(trimmed.to_string())
+    } else {
+        ParsedStreamInput::Command(command.to_string())
+    }
+}
+
+fn encode_multimodal_text(text: &str, images: &[AgentInputImage]) -> String {
+    let payload = serde_json::json!({
+        "text": text,
+        "images": images
+            .iter()
+            .map(|image| {
+                serde_json::json!({
+                    "name": image.name,
+                    "mime_type": image.mime_type,
+                    "data_url": image.data_url,
+                })
+            })
+            .collect::<Vec<_>>(),
+    });
+
+    format!("{MULTIMODAL_MARKER}{payload}")
+}
+
+fn append_image_note(text: &str, images: &[AgentInputImage]) -> String {
+    let mut lines = Vec::new();
+    if !text.is_empty() {
+        lines.push(text.to_string());
+        lines.push(String::new());
+    }
+    lines.push("User attached image files:".to_string());
+    for image in images {
+        lines.push(format!("- {} ({})", image.name, image.mime_type));
+    }
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slash_prefixed_text_becomes_command() {
+        let parsed = parse_slash_input("/pwd");
+        assert!(matches!(parsed, ParsedStreamInput::Command(command) if command == "pwd"));
+    }
+
+    #[test]
+    fn double_slash_is_escaped_text() {
+        let parsed = parse_slash_input("//pwd");
+        assert!(matches!(parsed, ParsedStreamInput::Text(text) if text == "/pwd"));
+    }
+
+    #[test]
+    fn build_stream_op_creates_shell_command_from_slash_input() {
+        let input = AgentStreamInput {
+            content: "/echo hello".to_string(),
+            images: Vec::new(),
+        };
+        let config = AgentRuntimeConfig::default();
+        let (op, payload, is_command) = build_stream_op(&input, &config);
+
+        assert!(is_command);
+        assert!(matches!(
+            op,
+            Op::RunUserShellCommand { command } if command == "echo hello"
+        ));
+        assert!(matches!(
+            payload,
+            ProtocolOpPayload::RunUserShellCommand { command } if command == "echo hello"
+        ));
+    }
+
+    #[test]
+    fn build_stream_op_encodes_images_for_model_payload() {
+        let input = AgentStreamInput {
+            content: "describe this".to_string(),
+            images: vec![AgentInputImage {
+                name: "example.png".to_string(),
+                mime_type: "image/png".to_string(),
+                data_url: "data:image/png;base64,AAAA".to_string(),
+                size_bytes: 4,
+            }],
+        };
+        let config = AgentRuntimeConfig::default();
+        let (op, payload, is_command) = build_stream_op(&input, &config);
+
+        assert!(!is_command);
+        match op {
+            Op::UserTurn { items, .. } => {
+                assert_eq!(items.len(), 1);
+                match &items[0] {
+                    UserInputItem::Text { text } => {
+                        assert!(text.starts_with(MULTIMODAL_MARKER));
+                    }
+                    _ => panic!("expected text item"),
+                }
+            }
+            _ => panic!("expected user turn op"),
+        }
+
+        match payload {
+            ProtocolOpPayload::UserTurn { text, images, .. } => {
+                assert_eq!(text, "describe this");
+                assert_eq!(images.len(), 1);
+                assert_eq!(images[0].name, "example.png");
+                assert_eq!(images[0].mime_type, "image/png");
+            }
+            _ => panic!("expected user turn payload"),
+        }
     }
 }
 
