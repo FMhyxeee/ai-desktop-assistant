@@ -219,61 +219,12 @@ export const enum AgentProvider {
   Local = 'local',
 }
 
-export const enum McpTransportKind {
-  Stdio = 'stdio',
-  StreamableHttp = 'streamable_http',
-  // Legacy values kept for migration warnings and old config parsing.
-  Tcp = 'tcp',
-  Http = 'http',
-  Https = 'https',
-  Websocket = 'websocket',
-  Wss = 'wss',
-  Sse = 'sse',
-}
-
-export const enum McpAuthType {
-  None = 'none',
-  Bearer = 'bearer',
-  Basic = 'basic',
-  ApiKey = 'api_key',
-  OAuth2 = 'oauth2',
-}
-
-export interface McpAuthConfig {
-  type: McpAuthType;
-  tokenEnv?: string;
-  usernameEnv?: string;
-  passwordEnv?: string;
-  apiKeyEnv?: string;
-  apiKeyHeader?: string;
-  queryParam?: string;
-  tokenUrl?: string;
-  clientIdEnv?: string;
-  clientSecretEnv?: string;
-  scope?: string;
-  audience?: string;
-}
-
-export interface McpTlsConfig {
-  caCertPath?: string;
-  clientCertPath?: string;
-  clientKeyPath?: string;
-  dangerAcceptInvalidCerts?: boolean;
-  dangerAcceptInvalidHostnames?: boolean;
-}
-
 export interface McpServerConfig {
   name: string;
   enabled: boolean;
-  transport: McpTransportKind;
-  endpoint?: string;
   command?: string;
   args: string[];
-  timeoutSecs?: number;
   env: Record<string, string>;
-  headers: Record<string, string>;
-  auth?: McpAuthConfig;
-  tls?: McpTlsConfig;
 }
 
 export interface McpRuntimeConfig {

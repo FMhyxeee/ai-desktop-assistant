@@ -11,8 +11,6 @@ import { TauriAPI } from '../lib/tauri';
 import { useAppStore } from '../store/appStore';
 import {
   AgentProvider,
-  McpAuthType,
-  McpTransportKind,
   type AppConfig,
   type McpConfigTestResult,
   type McpServerConfig,
@@ -30,29 +28,6 @@ type Feedback = {
   type: 'success' | 'error';
   message: string;
 };
-
-const TRANSPORT_OPTIONS: Array<{ value: McpTransportKind; label: string }> = [
-  { value: McpTransportKind.Stdio, label: 'stdio' },
-  { value: McpTransportKind.StreamableHttp, label: 'streamable_http' },
-];
-
-const LEGACY_UNSUPPORTED_TRANSPORTS: McpTransportKind[] = [
-  McpTransportKind.Tcp,
-  McpTransportKind.Websocket,
-  McpTransportKind.Wss,
-  McpTransportKind.Sse,
-];
-
-const isLegacyUnsupportedTransport = (value: McpTransportKind): boolean =>
-  LEGACY_UNSUPPORTED_TRANSPORTS.includes(value);
-
-const AUTH_OPTIONS: Array<{ value: McpAuthType; label: string }> = [
-  { value: McpAuthType.None, label: 'none' },
-  { value: McpAuthType.Bearer, label: 'bearer' },
-  { value: McpAuthType.Basic, label: 'basic' },
-  { value: McpAuthType.ApiKey, label: 'api_key' },
-  { value: McpAuthType.OAuth2, label: 'oauth2' },
-];
 
 const getErrorMessage = (error: unknown): string => {
   if (error instanceof Error && error.message) return error.message;
@@ -129,32 +104,6 @@ const normalizeBooleanFromUnknown = (value: unknown, fallback: boolean): boolean
   return fallback;
 };
 
-const normalizeTransportFromUnknown = (value: unknown): McpTransportKind => {
-  if (typeof value !== 'string') return McpTransportKind.Stdio;
-  const normalized = value.trim().toLowerCase();
-  switch (normalized) {
-    case 'stdio':
-      return McpTransportKind.Stdio;
-    case 'streamable_http':
-    case 'streamable-http':
-    case 'streamablehttp':
-    case 'http':
-    case 'https':
-      return McpTransportKind.StreamableHttp;
-    case 'tcp':
-      return McpTransportKind.Tcp;
-    case 'websocket':
-    case 'ws':
-      return McpTransportKind.Websocket;
-    case 'wss':
-      return McpTransportKind.Wss;
-    case 'sse':
-      return McpTransportKind.Sse;
-    default:
-      return McpTransportKind.Stdio;
-  }
-};
-
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 
@@ -164,35 +113,18 @@ const isLegacyServerShape = (value: unknown): value is Record<string, unknown> =
     'type' in value ||
     'transport' in value ||
     'command' in value ||
-    'endpoint' in value ||
     'args' in value ||
-    'env' in value ||
-    'headers' in value
+    'env' in value
   );
 };
 
 const toServerFromLegacyShape = (name: string, value: Record<string, unknown>): McpServerConfig => {
-  const timeoutRaw = value.timeoutSecs ?? value.timeout;
-  const timeoutSecs =
-    typeof timeoutRaw === 'number'
-      ? normalizePositiveInt(timeoutRaw)
-      : typeof timeoutRaw === 'string'
-      ? normalizePositiveInt(Number.parseInt(timeoutRaw, 10))
-      : undefined;
-
   return {
     name: name.trim(),
     enabled: normalizeBooleanFromUnknown(value.enabled, true),
-    transport: normalizeTransportFromUnknown(value.transport ?? value.type),
-    endpoint: normalizeText(typeof value.endpoint === 'string' ? value.endpoint : '') ?? '',
     command: normalizeText(typeof value.command === 'string' ? value.command : '') ?? '',
     args: normalizeStringArrayFromUnknown(value.args),
-    timeoutSecs,
     env: normalizeStringMapFromUnknown(value.env),
-    headers: normalizeStringMapFromUnknown(value.headers),
-    auth: {
-      type: McpAuthType.None,
-    },
   };
 };
 
@@ -209,30 +141,11 @@ const normalizeConfigForSave = (config: AppConfig): AppConfig => ({
     defaultTimeoutSecs: normalizePositiveInt(config.mcp.defaultTimeoutSecs),
     maxRetries: normalizePositiveInt(config.mcp.maxRetries),
     servers: config.mcp.servers.map((server) => ({
-      ...server,
       name: server.name.trim(),
-      endpoint: normalizeText(server.endpoint) ?? '',
+      enabled: Boolean(server.enabled),
       command: normalizeText(server.command) ?? '',
       args: server.args.map((item) => item.trim()).filter((item) => item.length > 0),
-      timeoutSecs: normalizePositiveInt(server.timeoutSecs),
       env: textToMap(mapToText(server.env)),
-      headers: textToMap(mapToText(server.headers)),
-      auth: server.auth
-        ? {
-            ...server.auth,
-            tokenEnv: normalizeText(server.auth.tokenEnv),
-            usernameEnv: normalizeText(server.auth.usernameEnv),
-            passwordEnv: normalizeText(server.auth.passwordEnv),
-            apiKeyEnv: normalizeText(server.auth.apiKeyEnv),
-            apiKeyHeader: normalizeText(server.auth.apiKeyHeader),
-            queryParam: normalizeText(server.auth.queryParam),
-            tokenUrl: normalizeText(server.auth.tokenUrl),
-            clientIdEnv: normalizeText(server.auth.clientIdEnv),
-            clientSecretEnv: normalizeText(server.auth.clientSecretEnv),
-            scope: normalizeText(server.auth.scope),
-            audience: normalizeText(server.auth.audience),
-          }
-        : { type: McpAuthType.None },
     })),
   },
   skills: {
@@ -587,37 +500,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
                   <span className="field-label">启用 MCP</span>
                   <input type="checkbox" checked={localConfig.mcp.enabled} onChange={(event) => setLocalConfig((prev) => ({ ...prev, mcp: { ...prev.mcp, enabled: event.target.checked } }))} />
                 </label>
-                <div className="settings-grid-2">
-                  <div>
-                    <label className="field-label" htmlFor="mcp-timeout">默认超时（秒）</label>
-                    <input
-                      id="mcp-timeout"
-                      className="field-input"
-                      type="number"
-                      min={1}
-                      value={localConfig.mcp.defaultTimeoutSecs ?? ''}
-                      onChange={(event) => {
-                        const raw = event.target.value.trim();
-                        setLocalConfig((prev) => ({ ...prev, mcp: { ...prev.mcp, defaultTimeoutSecs: raw ? Number.parseInt(raw, 10) : undefined } }));
-                      }}
-                    />
-                  </div>
-                  <div>
-                    <label className="field-label" htmlFor="mcp-retries">最大重试次数</label>
-                    <input
-                      id="mcp-retries"
-                      className="field-input"
-                      type="number"
-                      min={1}
-                      value={localConfig.mcp.maxRetries ?? ''}
-                      onChange={(event) => {
-                        const raw = event.target.value.trim();
-                        setLocalConfig((prev) => ({ ...prev, mcp: { ...prev.mcp, maxRetries: raw ? Number.parseInt(raw, 10) : undefined } }));
-                      }}
-                    />
-                  </div>
-                </div>
-                <p className="field-help">敏感信息只保存环境变量名，运行时从系统环境读取。</p>
+                <p className="field-help">MCP Server 配置已简化为 command、args、env 三项核心字段。</p>
               </section>
 
               <section className="field-group">
@@ -636,7 +519,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
                   className="field-textarea json-config-textarea"
                   value={mcpJsonDraft}
                   onChange={(event) => setMcpJsonDraft(event.target.value)}
-                  placeholder={'支持：{"zai-mcp-server":{"type":"stdio","command":"npx","args":["-y","@z_ai/mcp-server"],"env":{"Z_AI_API_KEY":"***"}}}'}
+                  placeholder={'支持：{"zai-mcp-server":{"command":"npx","args":["-y","@z_ai/mcp-server"],"env":{"Z_AI_API_KEY":"***"}}}'}
                 />
                 <p className="field-help">支持单个/多个 server map，导入时会追加到现有列表（同名覆盖）。</p>
                 {mcpJsonError && <p className="field-error">{mcpJsonError}</p>}
@@ -652,17 +535,6 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
 
                 <div className="settings-stack">
                   {localConfig.mcp.servers.map((server, index) => {
-                    const auth = server.auth ?? { type: McpAuthType.None };
-                    const legacyTransport = isLegacyUnsupportedTransport(server.transport);
-                    const transportOptions = legacyTransport
-                      ? [
-                          ...TRANSPORT_OPTIONS,
-                          {
-                            value: server.transport,
-                            label: `${server.transport} (legacy)`,
-                          },
-                        ]
-                      : TRANSPORT_OPTIONS;
                     return (
                       <article key={`server-${index}`} className="mcp-server-card">
                         <div className="mcp-server-head">
@@ -684,100 +556,16 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
                             <input id={`name-${index}`} className="field-input" value={server.name} onChange={(event) => updateServer(index, (item) => ({ ...item, name: event.target.value }))} />
                           </div>
                           <div>
-                            <label className="field-label" htmlFor={`transport-${index}`}>Transport</label>
-                            <select id={`transport-${index}`} className="field-select" value={server.transport} onChange={(event) => updateServer(index, (item) => ({ ...item, transport: event.target.value as McpTransportKind }))}>
-                              {transportOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-                            </select>
-                            {legacyTransport && (
-                              <p className="field-error">
-                                Legacy transport "{server.transport}" is unsupported. Supported: stdio, streamable_http.
-                                Migrate http/https to streamable_http; tcp/ws/wss/sse are removed.
-                              </p>
-                            )}
-                          </div>
-                        </div>
-
-                        <div className="settings-grid-2">
-                          <div>
-                            <label className="field-label" htmlFor={`endpoint-${index}`}>Endpoint</label>
-                            <input id={`endpoint-${index}`} className="field-input" value={server.endpoint ?? ''} onChange={(event) => updateServer(index, (item) => ({ ...item, endpoint: event.target.value }))} />
-                          </div>
-                          <div>
-                            <label className="field-label" htmlFor={`timeout-${index}`}>超时（秒）</label>
-                            <input
-                              id={`timeout-${index}`}
-                              className="field-input"
-                              type="number"
-                              min={1}
-                              value={server.timeoutSecs ?? ''}
-                              onChange={(event) => {
-                                const raw = event.target.value.trim();
-                                updateServer(index, (item) => ({ ...item, timeoutSecs: raw ? Number.parseInt(raw, 10) : undefined }));
-                              }}
-                            />
-                          </div>
-                        </div>
-
-                        {server.transport === McpTransportKind.Stdio && (
-                          <>
                             <label className="field-label" htmlFor={`command-${index}`}>Command</label>
                             <input id={`command-${index}`} className="field-input" value={server.command ?? ''} onChange={(event) => updateServer(index, (item) => ({ ...item, command: event.target.value }))} />
-
-                            <label className="field-label" htmlFor={`args-${index}`}>Args（每行一个）</label>
-                            <textarea id={`args-${index}`} className="field-textarea compact" value={listToText(server.args)} onChange={(event) => updateServer(index, (item) => ({ ...item, args: parseLineList(event.target.value) }))} />
-                          </>
-                        )}
-
-                        <div className="settings-grid-2">
-                          <div>
-                            <label className="field-label" htmlFor={`env-${index}`}>环境变量（每行 KEY=VALUE）</label>
-                            <textarea id={`env-${index}`} className="field-textarea compact" value={mapToText(server.env)} onChange={(event) => updateServer(index, (item) => ({ ...item, env: textToMap(event.target.value) }))} />
-                          </div>
-                          <div>
-                            <label className="field-label" htmlFor={`headers-${index}`}>Headers（每行 KEY=VALUE）</label>
-                            <textarea id={`headers-${index}`} className="field-textarea compact" value={mapToText(server.headers)} onChange={(event) => updateServer(index, (item) => ({ ...item, headers: textToMap(event.target.value) }))} />
                           </div>
                         </div>
 
-                        <label className="field-label" htmlFor={`auth-type-${index}`}>认证方式</label>
-                        <select id={`auth-type-${index}`} className="field-select" value={auth.type} onChange={(event) => updateServer(index, (item) => ({ ...item, auth: { ...(item.auth ?? { type: McpAuthType.None }), type: event.target.value as McpAuthType } }))}>
-                          {AUTH_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-                        </select>
+                        <label className="field-label" htmlFor={`args-${index}`}>Args（每行一个）</label>
+                        <textarea id={`args-${index}`} className="field-textarea compact" value={listToText(server.args)} onChange={(event) => updateServer(index, (item) => ({ ...item, args: parseLineList(event.target.value) }))} />
 
-                        <div className="settings-grid-2">
-                          <div>
-                            <label className="field-label" htmlFor={`token-env-${index}`}>tokenEnv</label>
-                            <input id={`token-env-${index}`} className="field-input" value={auth.tokenEnv ?? ''} onChange={(event) => updateServer(index, (item) => ({ ...item, auth: { ...(item.auth ?? { type: auth.type }), ...auth, tokenEnv: event.target.value } }))} />
-                          </div>
-                          <div>
-                            <label className="field-label" htmlFor={`api-key-env-${index}`}>apiKeyEnv</label>
-                            <input id={`api-key-env-${index}`} className="field-input" value={auth.apiKeyEnv ?? ''} onChange={(event) => updateServer(index, (item) => ({ ...item, auth: { ...(item.auth ?? { type: auth.type }), ...auth, apiKeyEnv: event.target.value } }))} />
-                          </div>
-                          <div>
-                            <label className="field-label" htmlFor={`username-env-${index}`}>usernameEnv</label>
-                            <input id={`username-env-${index}`} className="field-input" value={auth.usernameEnv ?? ''} onChange={(event) => updateServer(index, (item) => ({ ...item, auth: { ...(item.auth ?? { type: auth.type }), ...auth, usernameEnv: event.target.value } }))} />
-                          </div>
-                          <div>
-                            <label className="field-label" htmlFor={`password-env-${index}`}>passwordEnv</label>
-                            <input id={`password-env-${index}`} className="field-input" value={auth.passwordEnv ?? ''} onChange={(event) => updateServer(index, (item) => ({ ...item, auth: { ...(item.auth ?? { type: auth.type }), ...auth, passwordEnv: event.target.value } }))} />
-                          </div>
-                          <div>
-                            <label className="field-label" htmlFor={`client-id-env-${index}`}>clientIdEnv</label>
-                            <input id={`client-id-env-${index}`} className="field-input" value={auth.clientIdEnv ?? ''} onChange={(event) => updateServer(index, (item) => ({ ...item, auth: { ...(item.auth ?? { type: auth.type }), ...auth, clientIdEnv: event.target.value } }))} />
-                          </div>
-                          <div>
-                            <label className="field-label" htmlFor={`client-secret-env-${index}`}>clientSecretEnv</label>
-                            <input id={`client-secret-env-${index}`} className="field-input" value={auth.clientSecretEnv ?? ''} onChange={(event) => updateServer(index, (item) => ({ ...item, auth: { ...(item.auth ?? { type: auth.type }), ...auth, clientSecretEnv: event.target.value } }))} />
-                          </div>
-                          <div>
-                            <label className="field-label" htmlFor={`token-url-${index}`}>tokenUrl</label>
-                            <input id={`token-url-${index}`} className="field-input" value={auth.tokenUrl ?? ''} onChange={(event) => updateServer(index, (item) => ({ ...item, auth: { ...(item.auth ?? { type: auth.type }), ...auth, tokenUrl: event.target.value } }))} />
-                          </div>
-                          <div>
-                            <label className="field-label" htmlFor={`api-key-header-${index}`}>apiKeyHeader</label>
-                            <input id={`api-key-header-${index}`} className="field-input" value={auth.apiKeyHeader ?? ''} onChange={(event) => updateServer(index, (item) => ({ ...item, auth: { ...(item.auth ?? { type: auth.type }), ...auth, apiKeyHeader: event.target.value } }))} />
-                          </div>
-                        </div>
+                        <label className="field-label" htmlFor={`env-${index}`}>环境变量（每行 KEY=VALUE）</label>
+                        <textarea id={`env-${index}`} className="field-textarea compact" value={mapToText(server.env)} onChange={(event) => updateServer(index, (item) => ({ ...item, env: textToMap(event.target.value) }))} />
                       </article>
                     );
                   })}

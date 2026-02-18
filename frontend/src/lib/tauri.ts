@@ -1,7 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import {
-  McpTransportKind,
   type AgentEvent,
   type AppConfig,
   type InputCard,
@@ -9,41 +8,12 @@ import {
   type SkillScanResult,
 } from '../types';
 
-interface RuntimeMcpAuthPayload {
-  type: string;
-  tokenEnv: string | null;
-  usernameEnv: string | null;
-  passwordEnv: string | null;
-  apiKeyEnv: string | null;
-  apiKeyHeader: string | null;
-  queryParam: string | null;
-  tokenUrl: string | null;
-  clientIdEnv: string | null;
-  clientSecretEnv: string | null;
-  scope: string | null;
-  audience: string | null;
-}
-
-interface RuntimeMcpTlsPayload {
-  caCertPath: string | null;
-  clientCertPath: string | null;
-  clientKeyPath: string | null;
-  dangerAcceptInvalidCerts: boolean;
-  dangerAcceptInvalidHostnames: boolean;
-}
-
 interface RuntimeMcpServerPayload {
   name: string;
   enabled: boolean;
-  transport: string;
-  endpoint: string | null;
   command: string | null;
   args: string[];
-  timeoutSecs: number | null;
   env: Record<string, string>;
-  headers: Record<string, string>;
-  auth: RuntimeMcpAuthPayload | null;
-  tls: RuntimeMcpTlsPayload | null;
 }
 
 interface RuntimeMcpPayload {
@@ -105,24 +75,6 @@ const normalizeStringMap = (source: Record<string, string> | undefined): Record<
   return output;
 };
 
-const normalizeTransportForRuntime = (transport: string): string => {
-  const normalized = transport.trim().toLowerCase();
-  switch (normalized) {
-    case McpTransportKind.Stdio:
-      return McpTransportKind.Stdio;
-    case McpTransportKind.StreamableHttp:
-    case 'streamable-http':
-    case 'streamablehttp':
-    case 'http':
-    case 'https':
-      return McpTransportKind.StreamableHttp;
-    case 'ws':
-      return McpTransportKind.Websocket;
-    default:
-      return normalized || McpTransportKind.Stdio;
-  }
-};
-
 const toRuntimeMcpPayload = (config: AppConfig): RuntimeMcpPayload => ({
   enabled: Boolean(config.mcp.enabled),
   defaultTimeoutSecs: normalizePositiveInt(config.mcp.defaultTimeoutSecs),
@@ -130,40 +82,11 @@ const toRuntimeMcpPayload = (config: AppConfig): RuntimeMcpPayload => ({
   servers: config.mcp.servers.map((server) => ({
     name: server.name.trim(),
     enabled: Boolean(server.enabled),
-    transport: normalizeTransportForRuntime(server.transport),
-    endpoint: normalizeOptionalText(server.endpoint),
     command: normalizeOptionalText(server.command),
     args: (server.args ?? [])
       .map((arg) => arg.trim())
       .filter((arg) => arg.length > 0),
-    timeoutSecs: normalizePositiveInt(server.timeoutSecs),
     env: normalizeStringMap(server.env),
-    headers: normalizeStringMap(server.headers),
-    auth: server.auth
-      ? {
-          type: server.auth.type,
-          tokenEnv: normalizeOptionalText(server.auth.tokenEnv),
-          usernameEnv: normalizeOptionalText(server.auth.usernameEnv),
-          passwordEnv: normalizeOptionalText(server.auth.passwordEnv),
-          apiKeyEnv: normalizeOptionalText(server.auth.apiKeyEnv),
-          apiKeyHeader: normalizeOptionalText(server.auth.apiKeyHeader),
-          queryParam: normalizeOptionalText(server.auth.queryParam),
-          tokenUrl: normalizeOptionalText(server.auth.tokenUrl),
-          clientIdEnv: normalizeOptionalText(server.auth.clientIdEnv),
-          clientSecretEnv: normalizeOptionalText(server.auth.clientSecretEnv),
-          scope: normalizeOptionalText(server.auth.scope),
-          audience: normalizeOptionalText(server.auth.audience),
-        }
-      : null,
-    tls: server.tls
-      ? {
-          caCertPath: normalizeOptionalText(server.tls.caCertPath),
-          clientCertPath: normalizeOptionalText(server.tls.clientCertPath),
-          clientKeyPath: normalizeOptionalText(server.tls.clientKeyPath),
-          dangerAcceptInvalidCerts: Boolean(server.tls.dangerAcceptInvalidCerts),
-          dangerAcceptInvalidHostnames: Boolean(server.tls.dangerAcceptInvalidHostnames),
-        }
-      : null,
   })),
 });
 

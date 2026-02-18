@@ -1,9 +1,6 @@
 import {
   AgentProvider,
-  McpAuthType,
-  McpTransportKind,
   type AppConfig,
-  type McpAuthConfig,
   type McpRuntimeConfig,
   type McpServerConfig,
   type SkillsRuntimeConfig,
@@ -115,16 +112,9 @@ export const getProviderPreset = (provider: AgentProvider): ProviderPreset =>
 export const createDefaultMcpServer = (): McpServerConfig => ({
   name: '',
   enabled: true,
-  transport: McpTransportKind.Stdio,
-  endpoint: '',
   command: '',
   args: [],
-  timeoutSecs: 30,
   env: {},
-  headers: {},
-  auth: {
-    type: McpAuthType.None,
-  },
 });
 
 export const createDefaultMcpConfig = (): McpRuntimeConfig => ({
@@ -279,77 +269,6 @@ const normalizeStringMap = (value: unknown): Record<string, string> => {
   return output;
 };
 
-const normalizeMcpTransport = (value: unknown): McpTransportKind => {
-  if (typeof value !== 'string') {
-    return McpTransportKind.Stdio;
-  }
-  const normalized = value.trim().toLowerCase();
-  switch (normalized) {
-    case McpTransportKind.Stdio:
-      return McpTransportKind.Stdio;
-    case McpTransportKind.Tcp:
-      return McpTransportKind.Tcp;
-    case McpTransportKind.StreamableHttp:
-    case 'streamable-http':
-    case 'streamablehttp':
-    case McpTransportKind.Http:
-    case McpTransportKind.Https:
-      return McpTransportKind.StreamableHttp;
-    case McpTransportKind.Websocket:
-    case 'ws':
-      return McpTransportKind.Websocket;
-    case McpTransportKind.Wss:
-      return McpTransportKind.Wss;
-    case McpTransportKind.Sse:
-      return McpTransportKind.Sse;
-    default:
-      return McpTransportKind.Stdio;
-  }
-};
-
-const normalizeMcpAuthType = (value: unknown): McpAuthType => {
-  if (typeof value !== 'string') {
-    return McpAuthType.None;
-  }
-  const normalized = value.trim().toLowerCase();
-  switch (normalized) {
-    case McpAuthType.Bearer:
-      return McpAuthType.Bearer;
-    case McpAuthType.Basic:
-      return McpAuthType.Basic;
-    case McpAuthType.ApiKey:
-    case 'apikey':
-      return McpAuthType.ApiKey;
-    case McpAuthType.OAuth2:
-      return McpAuthType.OAuth2;
-    default:
-      return McpAuthType.None;
-  }
-};
-
-const normalizeMcpAuthConfig = (value: unknown): McpAuthConfig | undefined => {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    return undefined;
-  }
-
-  const source = value as Record<string, unknown>;
-  const type = normalizeMcpAuthType(source.type);
-  return {
-    type,
-    tokenEnv: normalizeOptionalText(source.tokenEnv),
-    usernameEnv: normalizeOptionalText(source.usernameEnv),
-    passwordEnv: normalizeOptionalText(source.passwordEnv),
-    apiKeyEnv: normalizeOptionalText(source.apiKeyEnv),
-    apiKeyHeader: normalizeOptionalText(source.apiKeyHeader),
-    queryParam: normalizeOptionalText(source.queryParam),
-    tokenUrl: normalizeOptionalText(source.tokenUrl),
-    clientIdEnv: normalizeOptionalText(source.clientIdEnv),
-    clientSecretEnv: normalizeOptionalText(source.clientSecretEnv),
-    scope: normalizeOptionalText(source.scope),
-    audience: normalizeOptionalText(source.audience),
-  };
-};
-
 const normalizeMcpServerConfig = (value: unknown): McpServerConfig | null => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return null;
@@ -358,30 +277,9 @@ const normalizeMcpServerConfig = (value: unknown): McpServerConfig | null => {
   return {
     name: normalizeOptionalText(source.name) ?? '',
     enabled: normalizeBoolean(source.enabled, true),
-    transport: normalizeMcpTransport(source.transport),
-    endpoint: normalizeOptionalText(source.endpoint) ?? '',
     command: normalizeOptionalText(source.command) ?? '',
     args: normalizeStringArray(source.args),
-    timeoutSecs: normalizePositiveInt(source.timeoutSecs, 30),
     env: normalizeStringMap(source.env),
-    headers: normalizeStringMap(source.headers),
-    auth: normalizeMcpAuthConfig(source.auth),
-    tls:
-      source.tls && typeof source.tls === 'object' && !Array.isArray(source.tls)
-        ? {
-            caCertPath: normalizeOptionalText((source.tls as Record<string, unknown>).caCertPath),
-            clientCertPath: normalizeOptionalText((source.tls as Record<string, unknown>).clientCertPath),
-            clientKeyPath: normalizeOptionalText((source.tls as Record<string, unknown>).clientKeyPath),
-            dangerAcceptInvalidCerts: normalizeBoolean(
-              (source.tls as Record<string, unknown>).dangerAcceptInvalidCerts,
-              false
-            ),
-            dangerAcceptInvalidHostnames: normalizeBoolean(
-              (source.tls as Record<string, unknown>).dangerAcceptInvalidHostnames,
-              false
-            ),
-          }
-        : undefined,
   };
 };
 
