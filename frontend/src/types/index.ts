@@ -232,6 +232,14 @@ export interface McpRuntimeConfig {
   defaultTimeoutSecs?: number;
   maxRetries?: number;
   servers: McpServerConfig[];
+  imageRecognition: McpImageRecognitionConfig;
+}
+
+export interface McpImageRecognitionConfig {
+  enabled: boolean;
+  serverName: string;
+  toolName: string;
+  argsTemplate: Record<string, unknown>;
 }
 
 export interface SkillsRuntimeConfig {
@@ -244,6 +252,7 @@ export interface SkillsRuntimeConfig {
 export interface AppConfig {
   provider: AgentProvider;
   model: string;
+  modelSupportsImageInput: boolean;
   apiKeyEnv: string;
   apiKey?: string;
   baseUrl?: string;

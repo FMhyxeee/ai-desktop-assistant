@@ -18,6 +18,8 @@ pub enum AgentProvider {
 pub struct AgentRuntimeConfig {
     pub provider: AgentProvider,
     pub model: String,
+    #[serde(default = "default_true")]
+    pub model_supports_image_input: bool,
     pub api_key_env: String,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
@@ -32,6 +34,7 @@ impl Default for AgentRuntimeConfig {
         Self {
             provider: AgentProvider::OpenAi,
             model: "gpt-4o-mini".to_string(),
+            model_supports_image_input: true,
             api_key_env: "OPENAI_API_KEY".to_string(),
             api_key: None,
             base_url: None,
@@ -130,6 +133,32 @@ pub struct McpRuntimeConfig {
     pub max_retries: Option<usize>,
     #[serde(default)]
     pub servers: Vec<McpServerRuntimeConfig>,
+    #[serde(default)]
+    pub image_recognition: McpImageRecognitionRuntimeConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpImageRecognitionRuntimeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub server_name: String,
+    #[serde(default)]
+    pub tool_name: String,
+    #[serde(default = "default_image_recognition_args_template")]
+    pub args_template: Value,
+}
+
+impl Default for McpImageRecognitionRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_name: String::new(),
+            tool_name: String::new(),
+            args_template: default_image_recognition_args_template(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -426,4 +455,10 @@ impl From<agent_lib::AgentError> for AppError {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_image_recognition_args_template() -> Value {
+    serde_json::json!({
+        "image": "{{data_url}}",
+    })
 }

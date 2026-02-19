@@ -16,11 +16,19 @@ interface RuntimeMcpServerPayload {
   env: Record<string, string>;
 }
 
+interface RuntimeMcpImageRecognitionPayload {
+  enabled: boolean;
+  serverName: string;
+  toolName: string;
+  argsTemplate: Record<string, unknown>;
+}
+
 interface RuntimeMcpPayload {
   enabled: boolean;
   defaultTimeoutSecs: number | null;
   maxRetries: number | null;
   servers: RuntimeMcpServerPayload[];
+  imageRecognition: RuntimeMcpImageRecognitionPayload;
 }
 
 interface RuntimeSkillsPayload {
@@ -33,6 +41,7 @@ interface RuntimeSkillsPayload {
 interface RuntimeConfigPayload {
   provider: string;
   model: string;
+  modelSupportsImageInput: boolean;
   apiKeyEnv: string;
   apiKey: string | null;
   baseUrl: string | null;
@@ -75,6 +84,13 @@ const normalizeStringMap = (source: Record<string, string> | undefined): Record<
   return output;
 };
 
+const normalizeJsonObject = (value: unknown): Record<string, unknown> => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  return value as Record<string, unknown>;
+};
+
 const toRuntimeMcpPayload = (config: AppConfig): RuntimeMcpPayload => ({
   enabled: Boolean(config.mcp.enabled),
   defaultTimeoutSecs: normalizePositiveInt(config.mcp.defaultTimeoutSecs),
@@ -88,6 +104,12 @@ const toRuntimeMcpPayload = (config: AppConfig): RuntimeMcpPayload => ({
       .filter((arg) => arg.length > 0),
     env: normalizeStringMap(server.env),
   })),
+  imageRecognition: {
+    enabled: Boolean(config.mcp.imageRecognition.enabled),
+    serverName: config.mcp.imageRecognition.serverName.trim(),
+    toolName: config.mcp.imageRecognition.toolName.trim(),
+    argsTemplate: normalizeJsonObject(config.mcp.imageRecognition.argsTemplate),
+  },
 });
 
 const toRuntimeSkillsPayload = (config: AppConfig): RuntimeSkillsPayload => ({
@@ -106,6 +128,7 @@ const toRuntimeConfigPayload = (config: AppConfig): RuntimeConfigPayload => {
   return {
     provider: config.provider,
     model: config.model.trim(),
+    modelSupportsImageInput: Boolean(config.modelSupportsImageInput),
     apiKeyEnv: config.apiKeyEnv.trim(),
     apiKey,
     baseUrl,

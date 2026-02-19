@@ -29,6 +29,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 agent-lib = { path = "../../agent-lib" }
 async-trait = "0.1"
 tokio = { version = "1", features = ["time"] }
+base64 = "0.22"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

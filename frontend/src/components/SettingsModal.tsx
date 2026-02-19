@@ -73,6 +73,13 @@ const normalizeText = (value: string | undefined): string | undefined => {
   return trimmed.length > 0 ? trimmed : undefined;
 };
 
+const normalizeJsonObject = (value: unknown): Record<string, unknown> => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return {};
+  }
+  return value as Record<string, unknown>;
+};
+
 const normalizeStringArrayFromUnknown = (value: unknown): string[] => {
   if (!Array.isArray(value)) return [];
   return value
@@ -131,6 +138,7 @@ const toServerFromLegacyShape = (name: string, value: Record<string, unknown>): 
 const normalizeConfigForSave = (config: AppConfig): AppConfig => ({
   ...config,
   model: config.model.trim(),
+  modelSupportsImageInput: Boolean(config.modelSupportsImageInput),
   apiKeyEnv: config.apiKeyEnv.trim(),
   apiKey: (config.apiKey ?? '').trim(),
   baseUrl: (config.baseUrl ?? '').trim(),
@@ -147,6 +155,12 @@ const normalizeConfigForSave = (config: AppConfig): AppConfig => ({
       args: server.args.map((item) => item.trim()).filter((item) => item.length > 0),
       env: textToMap(mapToText(server.env)),
     })),
+    imageRecognition: {
+      enabled: Boolean(config.mcp.imageRecognition.enabled),
+      serverName: config.mcp.imageRecognition.serverName.trim(),
+      toolName: config.mcp.imageRecognition.toolName.trim(),
+      argsTemplate: normalizeJsonObject(config.mcp.imageRecognition.argsTemplate),
+    },
   },
   skills: {
     ...config.skills,
@@ -174,6 +188,8 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
   const [mcpError, setMcpError] = React.useState<string | null>(null);
   const [mcpJsonDraft, setMcpJsonDraft] = React.useState('');
   const [mcpJsonError, setMcpJsonError] = React.useState<string | null>(null);
+  const [imageRecognitionArgsTemplateDraft, setImageRecognitionArgsTemplateDraft] = React.useState('');
+  const [imageRecognitionArgsTemplateError, setImageRecognitionArgsTemplateError] = React.useState<string | null>(null);
   const [skillsResult, setSkillsResult] = React.useState<SkillScanResult | null>(null);
   const [skillsError, setSkillsError] = React.useState<string | null>(null);
 
@@ -187,6 +203,10 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
     setMcpError(null);
     setMcpJsonDraft(JSON.stringify(config.mcp, null, 2));
     setMcpJsonError(null);
+    setImageRecognitionArgsTemplateDraft(
+      JSON.stringify(config.mcp.imageRecognition.argsTemplate, null, 2)
+    );
+    setImageRecognitionArgsTemplateError(null);
     setSkillsResult(null);
     setSkillsError(null);
   }, [config, isOpen]);
@@ -205,12 +225,49 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
     });
   };
 
+  const normalizeConfigWithImageRecognitionTemplate = React.useCallback(
+    (sourceConfig: AppConfig): AppConfig => {
+      let parsedTemplate: unknown;
+      try {
+        parsedTemplate = JSON.parse(imageRecognitionArgsTemplateDraft);
+      } catch {
+        throw new Error('图像识别 Args Template 必须是合法 JSON 对象。');
+      }
+
+      if (!parsedTemplate || typeof parsedTemplate !== 'object' || Array.isArray(parsedTemplate)) {
+        throw new Error('图像识别 Args Template 必须是 JSON 对象。');
+      }
+
+      setImageRecognitionArgsTemplateError(null);
+      return {
+        ...sourceConfig,
+        mcp: {
+          ...sourceConfig.mcp,
+          imageRecognition: {
+            ...sourceConfig.mcp.imageRecognition,
+            argsTemplate: parsedTemplate as Record<string, unknown>,
+          },
+        },
+      };
+    },
+    [imageRecognitionArgsTemplateDraft]
+  );
+
   const runModelTest = async () => {
     if (hasStreaming) {
       setModelFeedback({ type: 'error', message: '当前有进行中的会话，请先停止生成再测试连接。' });
       return;
     }
-    const normalized = normalizeConfigForSave(localConfig);
+    let normalized: AppConfig;
+    try {
+      normalized = normalizeConfigForSave(
+        normalizeConfigWithImageRecognitionTemplate(localConfig)
+      );
+    } catch (error) {
+      setImageRecognitionArgsTemplateError(getErrorMessage(error));
+      setModelFeedback({ type: 'error', message: getErrorMessage(error) });
+      return;
+    }
     if (!normalized.model) {
       setModelFeedback({ type: 'error', message: '模型名称不能为空。' });
       return;
@@ -239,9 +296,14 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
     setMcpError(null);
     setMcpResult(null);
     try {
-      setMcpResult(await TauriAPI.testMcpConfig(normalizeConfigForSave(localConfig)));
+      const normalized = normalizeConfigForSave(
+        normalizeConfigWithImageRecognitionTemplate(localConfig)
+      );
+      setMcpResult(await TauriAPI.testMcpConfig(normalized));
     } catch (error) {
-      setMcpError(getErrorMessage(error));
+      const message = getErrorMessage(error);
+      setImageRecognitionArgsTemplateError(message);
+      setMcpError(message);
     } finally {
       setIsTestingMcp(false);
     }
@@ -277,6 +339,10 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
           ...prev,
           mcp: normalizedMcp,
         }));
+        setImageRecognitionArgsTemplateDraft(
+          JSON.stringify(normalizedMcp.imageRecognition.argsTemplate, null, 2)
+        );
+        setImageRecognitionArgsTemplateError(null);
       } else {
         let importedServers: McpServerConfig[] = [];
 
@@ -344,9 +410,14 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
     setSkillsError(null);
     setSkillsResult(null);
     try {
-      setSkillsResult(await TauriAPI.scanSkillsConfig(normalizeConfigForSave(localConfig)));
+      const normalized = normalizeConfigForSave(
+        normalizeConfigWithImageRecognitionTemplate(localConfig)
+      );
+      setSkillsResult(await TauriAPI.scanSkillsConfig(normalized));
     } catch (error) {
-      setSkillsError(getErrorMessage(error));
+      const message = getErrorMessage(error);
+      setImageRecognitionArgsTemplateError(message);
+      setSkillsError(message);
     } finally {
       setIsScanningSkills(false);
     }
@@ -357,7 +428,18 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
       setSaveError('当前有进行中的会话，请先停止生成再保存设置。');
       return;
     }
-    const normalized = normalizeConfigForSave(localConfig);
+    let normalized: AppConfig;
+    try {
+      normalized = normalizeConfigForSave(
+        normalizeConfigWithImageRecognitionTemplate(localConfig)
+      );
+    } catch (error) {
+      const message = getErrorMessage(error);
+      setImageRecognitionArgsTemplateError(message);
+      setSaveError(message);
+      setTab('mcp');
+      return;
+    }
     if (!normalized.model) {
       setSaveError('模型名称不能为空。');
       setTab('model');
@@ -422,6 +504,23 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
                 <label className="field-label" htmlFor="model-input">模型名称</label>
                 <input id="model-input" className="field-input" value={localConfig.model} onChange={(event) => setLocalConfig((prev) => ({ ...prev, model: event.target.value }))} />
                 <p className="field-help">{preset.modelHint}</p>
+              </section>
+
+              <section className="field-group">
+                <label className="switch-row">
+                  <span className="field-label">当前模型支持图像输入</span>
+                  <input
+                    type="checkbox"
+                    checked={localConfig.modelSupportsImageInput}
+                    onChange={(event) =>
+                      setLocalConfig((prev) => ({
+                        ...prev,
+                        modelSupportsImageInput: event.target.checked,
+                      }))
+                    }
+                  />
+                </label>
+                <p className="field-help">开启后图片会直接发送给模型；关闭后可走 MCP 图像识别兜底。</p>
               </section>
 
               <section className="field-group">
@@ -591,6 +690,118 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
                       </div>
                     ))}
                   </div>
+                )}
+              </section>
+
+              <section className="field-group">
+                <div className="settings-inline-head">
+                  <p className="settings-inline-title">图像识别兜底</p>
+                </div>
+                <label className="switch-row compact">
+                  <span>启用 imageRecognition</span>
+                  <input
+                    type="checkbox"
+                    checked={localConfig.mcp.imageRecognition.enabled}
+                    onChange={(event) =>
+                      setLocalConfig((prev) => ({
+                        ...prev,
+                        mcp: {
+                          ...prev.mcp,
+                          imageRecognition: {
+                            ...prev.mcp.imageRecognition,
+                            enabled: event.target.checked,
+                          },
+                        },
+                      }))
+                    }
+                  />
+                </label>
+
+                <div className="settings-grid-2">
+                  <div>
+                    <label className="field-label" htmlFor="image-recognition-server">
+                      serverName
+                    </label>
+                    <input
+                      id="image-recognition-server"
+                      className="field-input"
+                      value={localConfig.mcp.imageRecognition.serverName}
+                      onChange={(event) =>
+                        setLocalConfig((prev) => ({
+                          ...prev,
+                          mcp: {
+                            ...prev.mcp,
+                            imageRecognition: {
+                              ...prev.mcp.imageRecognition,
+                              serverName: event.target.value,
+                            },
+                          },
+                        }))
+                      }
+                    />
+                  </div>
+                  <div>
+                    <label className="field-label" htmlFor="image-recognition-tool">
+                      toolName
+                    </label>
+                    <input
+                      id="image-recognition-tool"
+                      className="field-input"
+                      value={localConfig.mcp.imageRecognition.toolName}
+                      onChange={(event) =>
+                        setLocalConfig((prev) => ({
+                          ...prev,
+                          mcp: {
+                            ...prev.mcp,
+                            imageRecognition: {
+                              ...prev.mcp.imageRecognition,
+                              toolName: event.target.value,
+                            },
+                          },
+                        }))
+                      }
+                    />
+                  </div>
+                </div>
+
+                <label className="field-label" htmlFor="image-recognition-args-template">
+                  argsTemplate (JSON)
+                </label>
+                <textarea
+                  id="image-recognition-args-template"
+                  className="field-textarea compact"
+                  value={imageRecognitionArgsTemplateDraft}
+                  onChange={(event) => {
+                    const next = event.target.value;
+                    setImageRecognitionArgsTemplateDraft(next);
+                    try {
+                      const parsed = JSON.parse(next);
+                      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                        throw new Error('图像识别 Args Template 必须是 JSON 对象。');
+                      }
+                      setImageRecognitionArgsTemplateError(null);
+                      setLocalConfig((prev) => ({
+                        ...prev,
+                        mcp: {
+                          ...prev.mcp,
+                          imageRecognition: {
+                            ...prev.mcp.imageRecognition,
+                            argsTemplate: parsed as Record<string, unknown>,
+                          },
+                        },
+                      }));
+                    } catch {
+                      setImageRecognitionArgsTemplateError(
+                        '图像识别 Args Template 必须是合法 JSON 对象。'
+                      );
+                    }
+                  }}
+                />
+                <p className="field-help">
+                  占位符：{'{{data_url}}'} / {'{{base64}}'} / {'{{mime_type}}'} / {'{{name}}'} / {'{{path}}'}。
+                </p>
+                {imageRecognitionArgsTemplateError && (
+                  <p className="field-error">{imageRecognitionArgsTemplateError}</p>
                 )}
               </section>
             </>

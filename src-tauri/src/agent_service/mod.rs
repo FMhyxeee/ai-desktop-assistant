@@ -1,10 +1,9 @@
 pub mod types;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent_lib::mcp::{
     AuthConfig as AgentMcpAuthConfig, AuthType as AgentMcpAuthType, CallToolRequestParams,
@@ -20,7 +19,8 @@ use agent_lib::skills::{SkillConfig, SkillLoader, SkillSource};
 use agent_lib::session::{Session, SessionConfig, SessionHandle};
 use agent_lib::tools::{Tool, ToolContext, ToolDef, ToolExecutor, ToolRegistry, ToolResult};
 use agent_lib::{AgentBuilder, AgentError, AgentResult, Event, TurnAbortReason};
-use serde_json::Value;
+use base64::Engine;
+use serde_json::{Map, Value};
 use tauri::async_runtime::{JoinHandle, Mutex};
 use tokio::time::timeout;
 
@@ -133,11 +133,32 @@ impl AgentService {
 
         let (_session, handle) = Session::with_config(64, session_config);
         let control_handle = handle.clone();
-        let (op, op_payload, is_command_input) = build_stream_op(&input, &config);
+        let prepared_payload = prepare_image_fallback_payload(
+            &input,
+            &config,
+            self.runtime_mcp_manager.clone(),
+        )
+        .await;
+        let (op, op_payload, is_command_input) = build_stream_op(
+            &input,
+            &config,
+            prepared_payload.model_payload_text,
+        );
 
+        let mut seq = 0_u64;
+        for warning in prepared_payload.warnings {
+            seq += 1;
+            emit(AgentEvent::ProtocolEvent {
+                task_id: task_id.clone(),
+                seq,
+                payload: ProtocolEventPayload::Warning { message: warning },
+            });
+        }
+
+        seq += 1;
         emit(AgentEvent::OpSubmitted {
             task_id: task_id.clone(),
-            seq: 1,
+            seq,
             payload: op_payload,
         });
 
@@ -149,7 +170,7 @@ impl AgentService {
         let worker_handle = handle;
 
         let join_handle = tauri::async_runtime::spawn(async move {
-            let mut seq = 1_u64;
+            let mut seq = seq;
             let mut completed_sent = false;
             let mut aggregated_output = String::new();
 
@@ -1023,9 +1044,481 @@ fn protocol_usage(usage: &TokenUsage) -> ProtocolTokenUsage {
     }
 }
 
+#[derive(Debug, Default)]
+struct PreparedImageFallbackPayload {
+    model_payload_text: Option<String>,
+    warnings: Vec<String>,
+}
+
+async fn prepare_image_fallback_payload(
+    input: &AgentStreamInput,
+    config: &AgentRuntimeConfig,
+    mcp_manager: Option<Arc<McpManager>>,
+) -> PreparedImageFallbackPayload {
+    let mut prepared = PreparedImageFallbackPayload::default();
+
+    let ParsedStreamInput::Text(text) = parse_slash_input(&input.content) else {
+        return prepared;
+    };
+
+    if input.images.is_empty() || config.model_supports_image_input {
+        return prepared;
+    }
+
+    let fallback_note_text = append_image_note(&text, &input.images);
+    let image_recognition = &config.mcp.image_recognition;
+    if !image_recognition.enabled {
+        prepared.warnings.push(
+            "Image recognition fallback is disabled; using image filename note.".to_string(),
+        );
+        prepared.model_payload_text = Some(fallback_note_text);
+        return prepared;
+    }
+
+    let server_name = image_recognition.server_name.trim();
+    let tool_name = image_recognition.tool_name.trim();
+    if server_name.is_empty() || tool_name.is_empty() {
+        prepared.warnings.push(
+            "Image recognition fallback config missing serverName/toolName; using image filename note."
+                .to_string(),
+        );
+        prepared.model_payload_text = Some(fallback_note_text);
+        return prepared;
+    }
+
+    let Some(args_template) = image_recognition.args_template.as_object() else {
+        prepared.warnings.push(
+            "Image recognition argsTemplate must be a JSON object; using image filename note."
+                .to_string(),
+        );
+        prepared.model_payload_text = Some(fallback_note_text);
+        return prepared;
+    };
+
+    let Some(manager) = mcp_manager else {
+        prepared.warnings.push(
+            "MCP manager is unavailable, skipping image recognition fallback.".to_string(),
+        );
+        prepared.model_payload_text = Some(fallback_note_text);
+        return prepared;
+    };
+
+    let Some((client, tools)) = manager.get_server_info(server_name).await else {
+        prepared.warnings.push(format!(
+            "MCP server '{}' not found, skipping image recognition fallback.",
+            server_name
+        ));
+        prepared.model_payload_text = Some(fallback_note_text);
+        return prepared;
+    };
+
+    if !tools.iter().any(|tool| tool.name.to_string() == tool_name) {
+        prepared.warnings.push(format!(
+            "MCP tool '{}:{}' not found, skipping image recognition fallback.",
+            server_name, tool_name
+        ));
+        prepared.model_payload_text = Some(fallback_note_text);
+        return prepared;
+    }
+
+    prepared.warnings.push(format!(
+        "Using MCP image recognition fallback via '{}:{}' for {} image(s).",
+        server_name,
+        tool_name,
+        input.images.len()
+    ));
+
+    let mut recognized_sections = Vec::<(String, String)>::new();
+
+    for image in &input.images {
+        let local_path = match persist_image_for_recognition(image) {
+            Ok(path) => Some(path.to_string_lossy().to_string()),
+            Err(err) => {
+                prepared.warnings.push(format!(
+                    "Failed to persist image '{}' to local path for recognition: {}",
+                    image.name, err
+                ));
+                None
+            }
+        };
+        let rendered_template = render_image_recognition_args_template(
+            &Value::Object(args_template.clone()),
+            image,
+            local_path.as_deref(),
+        );
+        let arguments = match rendered_template {
+            Value::Object(arguments) => arguments,
+            _ => {
+                prepared.warnings.push(format!(
+                    "Failed to render image recognition args template for '{}'.",
+                    image.name
+                ));
+                continue;
+            }
+        };
+        let mut arguments_value = Value::Object(arguments);
+        if let Some(local_path_value) = local_path.as_deref() {
+            let rewritten = rewrite_image_like_arguments_to_local_path(
+                &mut arguments_value,
+                &image.name,
+                local_path_value,
+            );
+            if rewritten > 0 {
+                prepared.warnings.push(format!(
+                    "Rewrote {} image argument field(s) to local path for '{}': {}",
+                    rewritten, image.name, local_path_value
+                ));
+            }
+        }
+        let arguments = match arguments_value {
+            Value::Object(arguments) => arguments,
+            _ => {
+                prepared.warnings.push(format!(
+                    "Image recognition args rendered to non-object for '{}'.",
+                    image.name
+                ));
+                continue;
+            }
+        };
+
+        match client
+            .call_tool(CallToolRequestParams {
+                meta: None,
+                name: tool_name.to_string().into(),
+                arguments: Some(arguments),
+                task: None,
+            })
+            .await
+        {
+            Ok(result) => match serde_json::to_value(result) {
+                Ok(value) => {
+                    if let Some(text) = extract_text_from_call_tool_result(&value) {
+                        recognized_sections.push((image.name.clone(), text));
+                    } else {
+                        prepared.warnings.push(format!(
+                            "Image recognition returned no readable text for '{}'.",
+                            image.name
+                        ));
+                    }
+                }
+                Err(err) => prepared.warnings.push(format!(
+                    "Failed to parse image recognition result for '{}': {}",
+                    image.name, err
+                )),
+            },
+            Err(err) => prepared.warnings.push(format!(
+                "Image recognition tool failed for '{}': {}",
+                image.name, err
+            )),
+        }
+    }
+
+    if recognized_sections.is_empty() {
+        prepared.warnings.push(
+            "All image recognition attempts failed; falling back to image filename note."
+                .to_string(),
+        );
+        prepared.model_payload_text = Some(fallback_note_text);
+    } else {
+        prepared.model_payload_text = Some(append_image_recognition_results(
+            &text,
+            &recognized_sections,
+        ));
+    }
+
+    prepared
+}
+
+fn append_image_recognition_results(text: &str, recognized_sections: &[(String, String)]) -> String {
+    let mut lines = Vec::new();
+    if !text.is_empty() {
+        lines.push(text.to_string());
+        lines.push(String::new());
+    }
+
+    lines.push("Image recognition results (via MCP):".to_string());
+    for (name, recognized_text) in recognized_sections {
+        lines.push(format!("- {}:", name));
+        lines.push(recognized_text.clone());
+    }
+    lines.join("\n")
+}
+
+fn render_image_recognition_args_template(
+    template: &Value,
+    image: &AgentInputImage,
+    local_path: Option<&str>,
+) -> Value {
+    match template {
+        Value::String(value) => Value::String(replace_image_template_placeholders(
+            value,
+            image,
+            local_path,
+        )),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| render_image_recognition_args_template(item, image, local_path))
+                .collect(),
+        ),
+        Value::Object(object) => {
+            let mut next = Map::new();
+            for (key, value) in object {
+                next.insert(
+                    key.clone(),
+                    render_image_recognition_args_template(value, image, local_path),
+                );
+            }
+            Value::Object(next)
+        }
+        _ => template.clone(),
+    }
+}
+
+fn replace_image_template_placeholders(
+    template: &str,
+    image: &AgentInputImage,
+    local_path: Option<&str>,
+) -> String {
+    let base64 = extract_base64_data_from_data_url(&image.data_url).unwrap_or_default();
+    template
+        .replace("{{data_url}}", &image.data_url)
+        .replace("{{base64}}", &base64)
+        .replace("{{mime_type}}", &image.mime_type)
+        .replace("{{name}}", &image.name)
+        .replace("{{path}}", local_path.unwrap_or_default())
+}
+
+fn extract_base64_data_from_data_url(data_url: &str) -> Option<String> {
+    data_url
+        .split_once(',')
+        .map(|(_, payload)| payload.to_string())
+}
+
+fn persist_image_for_recognition(image: &AgentInputImage) -> Result<PathBuf, String> {
+    let base64_payload = extract_base64_data_from_data_url(&image.data_url)
+        .ok_or_else(|| "invalid data url: missing payload".to_string())?;
+    let normalized_payload = base64_payload
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect::<String>();
+    let image_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&normalized_payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&normalized_payload))
+        .map_err(|err| format!("base64 decode failed: {}", err))?;
+
+    let directory = image_fallback_directory();
+    std::fs::create_dir_all(&directory)
+        .map_err(|err| format!("failed to create image fallback directory: {}", err))?;
+
+    let safe_stem = sanitize_image_file_stem(&image.name);
+    let extension = extension_from_mime_type(&image.mime_type);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let filename = format!(
+        "{safe_stem}-{timestamp}-{}.{}",
+        uuid::Uuid::new_v4(),
+        extension
+    );
+
+    let path = directory.join(filename);
+    std::fs::write(&path, image_bytes)
+        .map_err(|err| format!("failed to write image fallback file: {}", err))?;
+    Ok(path)
+}
+
+fn image_fallback_directory() -> PathBuf {
+    std::env::temp_dir()
+        .join("ai-desktop-assistant")
+        .join("image-recognition")
+}
+
+fn sanitize_image_file_stem(name: &str) -> String {
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("image");
+    let sanitized = stem
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+
+    if sanitized.trim_matches('_').is_empty() {
+        "image".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn extension_from_mime_type(mime_type: &str) -> &'static str {
+    match mime_type {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        "image/tiff" => "tiff",
+        _ => "bin",
+    }
+}
+
+fn rewrite_image_like_arguments_to_local_path(
+    value: &mut Value,
+    original_name: &str,
+    local_path: &str,
+) -> usize {
+    match value {
+        Value::Object(map) => {
+            let mut rewritten = 0_usize;
+            for (key, item) in map {
+                if is_image_like_field_name(key) {
+                    if let Value::String(text) = item {
+                        if is_bare_image_filename_value(text, original_name) {
+                            *text = local_path.to_string();
+                            rewritten += 1;
+                            continue;
+                        }
+                    }
+                }
+                rewritten += rewrite_image_like_arguments_to_local_path(item, original_name, local_path);
+            }
+            rewritten
+        }
+        Value::Array(items) => items
+            .iter_mut()
+            .map(|item| rewrite_image_like_arguments_to_local_path(item, original_name, local_path))
+            .sum(),
+        _ => 0,
+    }
+}
+
+fn is_image_like_field_name(key: &str) -> bool {
+    let normalized = key.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "image" | "image_path" | "path" | "file" | "file_path" | "filepath"
+    ) || normalized.contains("image")
+        || normalized.contains("path")
+}
+
+fn is_bare_image_filename_value(value: &str, original_name: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if trimmed.eq_ignore_ascii_case(original_name.trim()) {
+        return true;
+    }
+
+    // Bare filename should not include path separators or a drive prefix.
+    let has_separator = trimmed.contains('/') || trimmed.contains('\\');
+    let has_drive_prefix = trimmed.len() > 1 && trimmed.as_bytes()[1] == b':';
+    if has_separator || has_drive_prefix {
+        return false;
+    }
+
+    let ext = Path::new(trimmed)
+        .extension()
+        .and_then(|item| item.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff" | "tif"
+    )
+}
+
+fn extract_text_from_call_tool_result(result: &Value) -> Option<String> {
+    if let Some(content_items) = result.get("content").and_then(Value::as_array) {
+        let mut content_texts = Vec::new();
+        for item in content_items {
+            match item {
+                Value::String(text) if !text.trim().is_empty() => {
+                    content_texts.push(text.trim().to_string());
+                }
+                Value::Object(map) => {
+                    if let Some(text) = map.get("text").and_then(Value::as_str) {
+                        if !text.trim().is_empty() {
+                            content_texts.push(text.trim().to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !content_texts.is_empty() {
+            return Some(content_texts.join("\n"));
+        }
+    }
+
+    for key in ["structuredContent", "structured_content", "output", "result", "data"] {
+        if let Some(candidate) = result.get(key) {
+            if let Some(text) = extract_text_from_json_value(candidate) {
+                return Some(text);
+            }
+        }
+    }
+
+    extract_text_from_json_value(result)
+}
+
+fn extract_text_from_json_value(value: &Value) -> Option<String> {
+    let mut chunks = Vec::<String>::new();
+    collect_text_chunks(value, &mut chunks);
+    if chunks.is_empty() {
+        None
+    } else {
+        Some(chunks.join("\n"))
+    }
+}
+
+fn collect_text_chunks(value: &Value, chunks: &mut Vec<String>) {
+    match value {
+        Value::String(text) => {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                chunks.push(trimmed.to_string());
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_text_chunks(item, chunks);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(text) = map.get("text").and_then(Value::as_str) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    chunks.push(trimmed.to_string());
+                }
+            }
+
+            for (key, item) in map {
+                if key == "text" {
+                    continue;
+                }
+                collect_text_chunks(item, chunks);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn build_stream_op(
     input: &AgentStreamInput,
     config: &AgentRuntimeConfig,
+    prepared_model_payload_text: Option<String>,
 ) -> (Op, ProtocolOpPayload, bool) {
     match parse_slash_input(&input.content) {
         ParsedStreamInput::Command(command) => (
@@ -1046,9 +1539,13 @@ fn build_stream_op(
                 })
                 .collect::<Vec<_>>();
 
-            let model_payload_text = if input.images.is_empty() {
+            let model_payload_text = if let Some(prepared) = prepared_model_payload_text {
+                prepared
+            } else if input.images.is_empty() {
                 text.clone()
-            } else if matches!(config.provider, AgentProvider::OpenAi) {
+            } else if config.model_supports_image_input
+                && matches!(config.provider, AgentProvider::OpenAi)
+            {
                 encode_multimodal_text(&text, &input.images)
             } else {
                 append_image_note(&text, &input.images)
@@ -1165,7 +1662,7 @@ mod tests {
             images: Vec::new(),
         };
         let config = AgentRuntimeConfig::default();
-        let (op, payload, is_command) = build_stream_op(&input, &config);
+        let (op, payload, is_command) = build_stream_op(&input, &config, None);
 
         assert!(is_command);
         assert!(matches!(
@@ -1190,7 +1687,7 @@ mod tests {
             }],
         };
         let config = AgentRuntimeConfig::default();
-        let (op, payload, is_command) = build_stream_op(&input, &config);
+        let (op, payload, is_command) = build_stream_op(&input, &config, None);
 
         assert!(!is_command);
         match op {
@@ -1215,6 +1712,124 @@ mod tests {
             }
             _ => panic!("expected user turn payload"),
         }
+    }
+
+    #[test]
+    fn build_stream_op_uses_prepared_model_payload_text() {
+        let input = AgentStreamInput {
+            content: "describe this".to_string(),
+            images: vec![AgentInputImage {
+                name: "example.png".to_string(),
+                mime_type: "image/png".to_string(),
+                data_url: "data:image/png;base64,AAAA".to_string(),
+                size_bytes: 4,
+            }],
+        };
+        let mut config = AgentRuntimeConfig::default();
+        config.model_supports_image_input = false;
+
+        let (op, _payload, _is_command) = build_stream_op(
+            &input,
+            &config,
+            Some("prepared text".to_string()),
+        );
+
+        match op {
+            Op::UserTurn { items, .. } => match &items[0] {
+                UserInputItem::Text { text } => assert_eq!(text, "prepared text"),
+                _ => panic!("expected text item"),
+            },
+            _ => panic!("expected user turn op"),
+        }
+    }
+
+    #[test]
+    fn render_image_recognition_args_template_replaces_placeholders() {
+        let image = AgentInputImage {
+            name: "sample.png".to_string(),
+            mime_type: "image/png".to_string(),
+            data_url: "data:image/png;base64,QUJD".to_string(),
+            size_bytes: 4,
+        };
+
+        let template = serde_json::json!({
+            "image": "{{data_url}}",
+            "payload": {
+                "base64": "{{base64}}",
+                "mime": "{{mime_type}}",
+                "name": "{{name}}",
+                "path": "{{path}}"
+            }
+        });
+
+        let rendered =
+            render_image_recognition_args_template(&template, &image, Some("C:\\temp\\sample.png"));
+        assert_eq!(rendered["image"], "data:image/png;base64,QUJD");
+        assert_eq!(rendered["payload"]["base64"], "QUJD");
+        assert_eq!(rendered["payload"]["mime"], "image/png");
+        assert_eq!(rendered["payload"]["name"], "sample.png");
+        assert_eq!(rendered["payload"]["path"], "C:\\temp\\sample.png");
+    }
+
+    #[test]
+    fn extract_text_from_call_tool_result_prefers_content_text() {
+        let result = serde_json::json!({
+            "content": [
+                { "type": "text", "text": "Line A" },
+                { "type": "text", "text": "Line B" }
+            ],
+            "structuredContent": {
+                "text": "Ignored fallback"
+            }
+        });
+
+        let text = extract_text_from_call_tool_result(&result).unwrap_or_default();
+        assert_eq!(text, "Line A\nLine B");
+    }
+
+    #[test]
+    fn rewrite_image_like_arguments_to_local_path_updates_bare_filename() {
+        let mut args = serde_json::json!({
+            "image": "image.png",
+            "nested": {
+                "file_path": "image.png"
+            }
+        });
+
+        let rewritten = rewrite_image_like_arguments_to_local_path(
+            &mut args,
+            "image.png",
+            "C:\\temp\\image-123.png",
+        );
+
+        assert_eq!(rewritten, 2);
+        assert_eq!(args["image"], "C:\\temp\\image-123.png");
+        assert_eq!(args["nested"]["file_path"], "C:\\temp\\image-123.png");
+    }
+
+    #[tokio::test]
+    async fn prepare_image_fallback_payload_without_mcp_manager_falls_back_to_image_note() {
+        let input = AgentStreamInput {
+            content: "describe this".to_string(),
+            images: vec![AgentInputImage {
+                name: "example.png".to_string(),
+                mime_type: "image/png".to_string(),
+                data_url: "data:image/png;base64,AAAA".to_string(),
+                size_bytes: 4,
+            }],
+        };
+
+        let mut config = AgentRuntimeConfig::default();
+        config.model_supports_image_input = false;
+        config.mcp.image_recognition.enabled = true;
+        config.mcp.image_recognition.server_name = "demo".to_string();
+        config.mcp.image_recognition.tool_name = "ocr".to_string();
+
+        let prepared = prepare_image_fallback_payload(&input, &config, None).await;
+        let payload_text = prepared.model_payload_text.unwrap_or_default();
+
+        assert!(payload_text.contains("User attached image files:"));
+        assert!(!prepared.warnings.is_empty());
     }
 }
 

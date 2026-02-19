@@ -100,6 +100,7 @@ async fn test_mcp_runtime_config_invalid_server_returns_error() {
         enabled: true,
         default_timeout_secs: Some(1),
         max_retries: Some(0),
+        image_recognition: Default::default(),
         servers: vec![McpServerRuntimeConfig {
             name: "bad-stdio".to_string(),
             enabled: true,
@@ -122,6 +123,7 @@ async fn test_mcp_runtime_config_legacy_transport_returns_migration_error() {
         enabled: true,
         default_timeout_secs: Some(1),
         max_retries: Some(0),
+        image_recognition: Default::default(),
         servers: vec![McpServerRuntimeConfig {
             name: "legacy-tcp".to_string(),
             enabled: true,
@@ -150,6 +152,7 @@ async fn test_mcp_runtime_config_http_alias_is_not_unsupported_transport() {
         enabled: true,
         default_timeout_secs: Some(1),
         max_retries: Some(0),
+        image_recognition: Default::default(),
         servers: vec![McpServerRuntimeConfig {
             name: "http-alias".to_string(),
             enabled: true,

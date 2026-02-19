@@ -59,14 +59,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
     fileInputRef.current?.click();
   };
 
-  const handleImagesSelected = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(event.target.files ?? []);
-    event.target.value = '';
-    if (files.length === 0) {
-      return;
-    }
-
-    setIsReadingImages(true);
+  const createImageAttachments = async (files: File[]): Promise<InputImageAttachment[]> => {
     const nextAttachments: InputImageAttachment[] = [];
 
     for (const file of files) {
@@ -105,11 +98,52 @@ const ChatInput: React.FC<ChatInputProps> = ({
       }
     }
 
+    return nextAttachments;
+  };
+
+  const appendImageFiles = async (files: File[]) => {
+    if (files.length === 0) {
+      return;
+    }
+
+    setIsReadingImages(true);
+    const nextAttachments = await createImageAttachments(files);
+
     if (nextAttachments.length > 0) {
       setImages((current) => [...current, ...nextAttachments]);
     }
 
     setIsReadingImages(false);
+  };
+
+  const handleImagesSelected = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    event.target.value = '';
+    await appendImageFiles(files);
+  };
+
+  const handlePaste = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const clipboard = event.clipboardData;
+    if (!clipboard) {
+      return;
+    }
+
+    const imageFilesFromItems = Array.from(clipboard.items ?? [])
+      .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null);
+
+    const imageFiles =
+      imageFilesFromItems.length > 0
+        ? imageFilesFromItems
+        : Array.from(clipboard.files ?? []).filter((file) => file.type.startsWith('image/'));
+
+    if (imageFiles.length === 0) {
+      return;
+    }
+
+    event.preventDefault();
+    void appendImageFiles(imageFiles);
   };
 
   const removeImage = (imageId: string) => {
@@ -218,6 +252,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
           value={input}
           onChange={(event) => setInput(event.target.value)}
           onKeyDown={handleKeyDown}
+          onPaste={handlePaste}
           placeholder="Type a message... (/command to run shell, // to send text starting with /)"
           disabled={disabled}
           rows={1}

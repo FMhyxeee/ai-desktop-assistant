@@ -1,6 +1,7 @@
 import {
   AgentProvider,
   type AppConfig,
+  type McpImageRecognitionConfig,
   type McpRuntimeConfig,
   type McpServerConfig,
   type SkillsRuntimeConfig,
@@ -109,6 +110,9 @@ const PRESET_MAP = new Map(PROVIDER_PRESETS.map((preset) => [preset.value, prese
 export const getProviderPreset = (provider: AgentProvider): ProviderPreset =>
   PRESET_MAP.get(provider) ?? PRESET_MAP.get(AgentProvider.OpenAi)!;
 
+const defaultModelSupportsImageInput = (provider: AgentProvider): boolean =>
+  provider === AgentProvider.OpenAi;
+
 export const createDefaultMcpServer = (): McpServerConfig => ({
   name: '',
   enabled: true,
@@ -117,11 +121,21 @@ export const createDefaultMcpServer = (): McpServerConfig => ({
   env: {},
 });
 
+export const createDefaultMcpImageRecognitionConfig = (): McpImageRecognitionConfig => ({
+  enabled: false,
+  serverName: '',
+  toolName: '',
+  argsTemplate: {
+    image: '{{data_url}}',
+  },
+});
+
 export const createDefaultMcpConfig = (): McpRuntimeConfig => ({
   enabled: false,
   defaultTimeoutSecs: 30,
   maxRetries: 3,
   servers: [],
+  imageRecognition: createDefaultMcpImageRecognitionConfig(),
 });
 
 export const createDefaultSkillsConfig = (): SkillsRuntimeConfig => ({
@@ -136,6 +150,7 @@ export const createDefaultConfig = (provider: AgentProvider = AgentProvider.Open
   return {
     provider: preset.value,
     model: preset.defaultModel,
+    modelSupportsImageInput: defaultModelSupportsImageInput(provider),
     apiKeyEnv: preset.defaultApiKeyEnv,
     apiKey: '',
     baseUrl: preset.supportsBaseUrl ? '' : undefined,
@@ -152,6 +167,7 @@ export const applyProviderDefaults = (config: AppConfig, provider: AgentProvider
     ...config,
     provider,
     model: preset.defaultModel,
+    modelSupportsImageInput: defaultModelSupportsImageInput(provider),
     apiKeyEnv: preset.defaultApiKeyEnv,
     apiKey: '',
     baseUrl: preset.supportsBaseUrl ? '' : undefined,
@@ -283,6 +299,26 @@ const normalizeMcpServerConfig = (value: unknown): McpServerConfig | null => {
   };
 };
 
+const normalizeMcpImageRecognitionConfig = (value: unknown): McpImageRecognitionConfig => {
+  const defaults = createDefaultMcpImageRecognitionConfig();
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return defaults;
+  }
+
+  const source = value as Record<string, unknown>;
+  const argsTemplate =
+    source.argsTemplate && typeof source.argsTemplate === 'object' && !Array.isArray(source.argsTemplate)
+      ? (source.argsTemplate as Record<string, unknown>)
+      : defaults.argsTemplate;
+
+  return {
+    enabled: normalizeBoolean(source.enabled, defaults.enabled),
+    serverName: normalizeOptionalText(source.serverName) ?? defaults.serverName,
+    toolName: normalizeOptionalText(source.toolName) ?? defaults.toolName,
+    argsTemplate,
+  };
+};
+
 export const normalizeMcpRuntimeConfig = (value: unknown): McpRuntimeConfig => {
   const defaults = createDefaultMcpConfig();
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
@@ -300,6 +336,7 @@ export const normalizeMcpRuntimeConfig = (value: unknown): McpRuntimeConfig => {
     defaultTimeoutSecs: normalizePositiveInt(source.defaultTimeoutSecs, defaults.defaultTimeoutSecs),
     maxRetries: normalizePositiveInt(source.maxRetries, defaults.maxRetries),
     servers,
+    imageRecognition: normalizeMcpImageRecognitionConfig(source.imageRecognition),
   };
 };
 
@@ -344,6 +381,10 @@ export const normalizeStoredConfig = (raw: unknown): Partial<AppConfig> => {
   const normalized: Partial<AppConfig> = {
     provider,
     model,
+    modelSupportsImageInput: normalizeBoolean(
+      source.modelSupportsImageInput,
+      defaultModelSupportsImageInput(provider)
+    ),
     apiKeyEnv,
     apiKey,
     systemPrompt,
