@@ -21,7 +21,7 @@ use agent_lib::protocol::{
 };
 use agent_lib::session::{Session, SessionConfig, SessionHandle};
 use agent_lib::skills::{SkillConfig, SkillLoader, SkillSource};
-use agent_lib::tools::builtin::{FileSystemTool, ShellTool};
+use agent_lib::tools::builtin::{CodeExecTool, FileSystemTool, NetworkTool, ShellTool};
 use agent_lib::tools::{Tool, ToolContext, ToolDef, ToolExecutor, ToolRegistry, ToolResult};
 use agent_lib::{AgentBuilder, AgentError, AgentResult, Event, TurnAbortReason};
 use base64::Engine;
@@ -1038,6 +1038,8 @@ async fn build_runtime_resources(
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(ShellTool::new()));
     registry.register(Arc::new(FileSystemTool::new()));
+    registry.register(Arc::new(NetworkTool::new()));
+    registry.register(Arc::new(CodeExecTool::new()));
 
     let mut mcp_manager = None;
     if config.mcp.enabled {
@@ -2410,8 +2412,8 @@ mod tests {
 
         assert!(names.iter().any(|name| name == "shell"));
         assert!(names.iter().any(|name| name == "filesystem"));
-        assert!(!names.iter().any(|name| name == "network"));
-        assert!(!names.iter().any(|name| name == "code_exec"));
+        assert!(names.iter().any(|name| name == "network"));
+        assert!(names.iter().any(|name| name == "code_exec"));
     }
 
     #[tokio::test]
