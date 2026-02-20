@@ -21,6 +21,7 @@ use agent_lib::protocol::{
 };
 use agent_lib::session::{Session, SessionConfig, SessionHandle};
 use agent_lib::skills::{SkillConfig, SkillLoader, SkillSource};
+use agent_lib::tools::builtin::{FileSystemTool, ShellTool};
 use agent_lib::tools::{Tool, ToolContext, ToolDef, ToolExecutor, ToolRegistry, ToolResult};
 use agent_lib::{AgentBuilder, AgentError, AgentResult, Event, TurnAbortReason};
 use base64::Engine;
@@ -384,10 +385,14 @@ impl AgentService {
 
         let runtime_resources = build_runtime_resources(&effective_config).await?;
         let model = build_model_client(&effective_config)?;
+        let default_cwd = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .to_string_lossy()
+            .to_string();
         let session_config = SessionConfig {
             model: Some(model),
             default_model: effective_config.model.clone(),
-            default_cwd: Some(".".to_string()),
+            default_cwd: Some(default_cwd),
             default_approval_policy: Some(ApprovalPolicy::NeverAsk),
             mcp_manager: runtime_resources.mcp_manager.clone(),
             tool_executor: runtime_resources.tool_executor.clone(),
@@ -1030,52 +1035,51 @@ async fn build_runtime_resources(
     config: &AgentRuntimeConfig,
 ) -> Result<RuntimeResources, AppError> {
     let skill_config = map_runtime_skill_config(&config.skills);
-    if !config.mcp.enabled {
-        return Ok(RuntimeResources {
-            mcp_manager: None,
-            tool_executor: None,
-            skill_config,
-        });
-    }
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(ShellTool::new()));
+    registry.register(Arc::new(FileSystemTool::new()));
 
-    let default_timeout_secs = config.mcp.default_timeout_secs.unwrap_or(30).max(1);
-    let max_retries = config.mcp.max_retries.unwrap_or(3);
-    let manager = McpManager::with_timeout_and_retries(
-        Duration::from_secs(default_timeout_secs),
-        max_retries,
-    );
+    let mut mcp_manager = None;
+    if config.mcp.enabled {
+        let default_timeout_secs = config.mcp.default_timeout_secs.unwrap_or(30).max(1);
+        let max_retries = config.mcp.max_retries.unwrap_or(3);
+        let manager = McpManager::with_timeout_and_retries(
+            Duration::from_secs(default_timeout_secs),
+            max_retries,
+        );
 
-    for server in &config.mcp.servers {
-        if !server.enabled {
-            continue;
+        for server in &config.mcp.servers {
+            if !server.enabled {
+                continue;
+            }
+
+            let server_config = map_runtime_mcp_server_config(server, default_timeout_secs)?;
+            manager
+                .add_server_with_config(server_config)
+                .await
+                .map_err(|err| AppError::InvalidConfig(err.to_string()))?;
         }
 
-        let server_config = map_runtime_mcp_server_config(server, default_timeout_secs)?;
-        manager
-            .add_server_with_config(server_config)
-            .await
-            .map_err(|err| AppError::InvalidConfig(err.to_string()))?;
-    }
-
-    let mut registry = ToolRegistry::new();
-    let tools = manager.get_all_tools().await;
-    for (server_name, tool_def, client) in tools {
-        let tool = PrefixedMcpTool::new(
-            server_name,
-            tool_def.name.to_string(),
-            tool_def
-                .description
-                .as_deref()
-                .unwrap_or_default()
-                .to_string(),
-            Value::Object((*tool_def.input_schema).clone()),
-            client,
-        );
-        registry.register(Arc::new(tool));
+        let tools = manager.get_all_tools().await;
+        for (server_name, tool_def, client) in tools {
+            let tool = PrefixedMcpTool::new(
+                server_name,
+                tool_def.name.to_string(),
+                tool_def
+                    .description
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_string(),
+                Value::Object((*tool_def.input_schema).clone()),
+                client,
+            );
+            registry.register(Arc::new(tool));
+        }
+        mcp_manager = Some(manager);
     }
 
     Ok(RuntimeResources {
-        mcp_manager: Some(manager),
+        mcp_manager,
         tool_executor: Some(Arc::new(ToolExecutor::new(registry))),
         skill_config,
     })
@@ -2383,6 +2387,31 @@ mod tests {
         assert_eq!(rewritten, 2);
         assert_eq!(args["image"], "C:\\temp\\image-123.png");
         assert_eq!(args["nested"]["file_path"], "C:\\temp\\image-123.png");
+    }
+
+    #[tokio::test]
+    async fn build_runtime_resources_without_mcp_registers_builtin_tools() {
+        let config = AgentRuntimeConfig::default();
+
+        let runtime = build_runtime_resources(&config)
+            .await
+            .expect("runtime resources should build");
+
+        assert!(runtime.mcp_manager.is_none());
+
+        let executor = runtime
+            .tool_executor
+            .expect("tool executor should be available");
+        let names = executor
+            .list()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name == "shell"));
+        assert!(names.iter().any(|name| name == "filesystem"));
+        assert!(!names.iter().any(|name| name == "network"));
+        assert!(!names.iter().any(|name| name == "code_exec"));
     }
 
     #[tokio::test]
