@@ -3,6 +3,8 @@ import { listen } from '@tauri-apps/api/event';
 import {
   type AgentEvent,
   type AppConfig,
+  type GovernanceReport,
+  type GovernanceUpdateReport,
   type InputCard,
   type McpConfigTestResult,
   type SkillScanResult,
@@ -172,9 +174,9 @@ export class TauriAPI {
     }
   }
 
-  static async updateRuntimeConfig(config: AppConfig): Promise<void> {
+  static async updateRuntimeConfig(config: AppConfig): Promise<GovernanceUpdateReport> {
     try {
-      await invoke('update_runtime_config', {
+      return await invoke<GovernanceUpdateReport>('update_runtime_config', {
         config: toRuntimeConfigPayload(config),
       });
     } catch (error) {
@@ -213,6 +215,18 @@ export class TauriAPI {
     } catch (error) {
       console.error('scan_skills_config error:', error);
       throw new Error(typeof error === 'string' ? error : 'Failed to scan skills config');
+    }
+  }
+
+  static async runGovernanceScan(config?: AppConfig): Promise<GovernanceReport> {
+    try {
+      const payload = config ? toRuntimeConfigPayload(config) : null;
+      return await invoke<GovernanceReport>('run_governance_scan', {
+        config: payload,
+      });
+    } catch (error) {
+      console.error('run_governance_scan error:', error);
+      throw new Error(typeof error === 'string' ? error : 'Failed to run governance scan');
     }
   }
 

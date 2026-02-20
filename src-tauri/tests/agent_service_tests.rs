@@ -2,11 +2,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ai_desktop_assistant_lib::agent_service::types::{
-    AgentEvent, AgentStreamInput, McpRuntimeConfig, McpServerRuntimeConfig, McpTransportKind,
-    SkillsRuntimeConfig,
+    AgentEvent, AgentProvider, AgentRuntimeConfig, AgentStreamInput, McpRuntimeConfig,
+    McpServerRuntimeConfig, McpTransportKind, ProtocolEventPayload, SkillsRuntimeConfig,
 };
 use ai_desktop_assistant_lib::agent_service::{
-    AgentService, Runner, scan_skills_runtime_config, test_mcp_runtime_config,
+    run_governance_scan_with_config, scan_skills_runtime_config, test_mcp_runtime_config,
+    AgentService, Runner,
 };
 
 struct MockRunner {
@@ -51,7 +52,7 @@ async fn chat_stream_emits_lifecycle_events() {
             "task-1".to_string(),
             AgentStreamInput::text("hi"),
             move |event| {
-            events_ref.lock().unwrap().push(event);
+                events_ref.lock().unwrap().push(event);
             },
         )
         .await
@@ -136,10 +137,7 @@ async fn test_mcp_runtime_config_legacy_transport_returns_migration_error() {
     let result = test_mcp_runtime_config(config).await;
     assert!(!result.success);
     assert_eq!(result.server_results.len(), 1);
-    let error_text = result.server_results[0]
-        .error
-        .clone()
-        .unwrap_or_default();
+    let error_text = result.server_results[0].error.clone().unwrap_or_default();
     assert!(error_text.contains("Unsupported transport 'tcp'"));
     assert!(error_text.contains("Supported: stdio, streamable_http"));
     assert!(error_text.contains("http/https -> streamable_http"));
@@ -165,10 +163,7 @@ async fn test_mcp_runtime_config_http_alias_is_not_unsupported_transport() {
     let result = test_mcp_runtime_config(config).await;
     assert!(!result.success);
     assert_eq!(result.server_results.len(), 1);
-    let error_text = result.server_results[0]
-        .error
-        .clone()
-        .unwrap_or_default();
+    let error_text = result.server_results[0].error.clone().unwrap_or_default();
     assert!(!error_text.contains("Unsupported transport"));
 }
 
@@ -199,4 +194,88 @@ Skill body
 
     assert!(result.success);
     assert!(result.skills.iter().any(|skill| skill.name == "demo-skill"));
+}
+
+#[tokio::test]
+async fn startup_stream_emits_governance_protocol_event() {
+    let mut config = AgentRuntimeConfig {
+        provider: AgentProvider::Local,
+        model: "qwen2.5-coder:7b".to_string(),
+        model_supports_image_input: true,
+        api_key_env: "LOCAL_API_KEY".to_string(),
+        api_key: None,
+        base_url: None,
+        max_tokens: None,
+        system_prompt: "local prompt".to_string(),
+        mcp: McpRuntimeConfig::default(),
+        skills: SkillsRuntimeConfig::default(),
+    };
+    config.mcp.enabled = false;
+
+    let service = AgentService::new_with_config(config).await.unwrap();
+    let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_ref = Arc::clone(&events);
+
+    service
+        .chat_stream(
+            "gov-task".to_string(),
+            AgentStreamInput::text("/echo hello"),
+            move |event| {
+                events_ref.lock().unwrap().push(event);
+            },
+        )
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let events = events.lock().unwrap();
+    let has_governance_report = events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::ProtocolEvent {
+                payload: ProtocolEventPayload::GovernanceReport { .. },
+                ..
+            }
+        )
+    });
+    assert!(has_governance_report);
+}
+
+#[tokio::test]
+async fn governance_scan_flags_duplicate_mcp_server_names() {
+    let mut config = AgentRuntimeConfig {
+        provider: AgentProvider::Local,
+        model: "qwen2.5-coder:7b".to_string(),
+        model_supports_image_input: true,
+        api_key_env: "LOCAL_API_KEY".to_string(),
+        api_key: None,
+        base_url: None,
+        max_tokens: None,
+        system_prompt: "local prompt".to_string(),
+        mcp: McpRuntimeConfig::default(),
+        skills: SkillsRuntimeConfig::default(),
+    };
+    config.mcp.enabled = true;
+    config.mcp.servers = vec![
+        McpServerRuntimeConfig {
+            name: "dup".to_string(),
+            enabled: true,
+            command: Some("npx".to_string()),
+            ..Default::default()
+        },
+        McpServerRuntimeConfig {
+            name: "dup".to_string(),
+            enabled: true,
+            command: Some("npx".to_string()),
+            ..Default::default()
+        },
+    ];
+
+    let report = run_governance_scan_with_config(config).await;
+    assert!(report.blocker_count > 0);
+    assert!(report
+        .issues
+        .iter()
+        .any(|issue| issue.code == "mcp_server_name_duplicate"));
 }

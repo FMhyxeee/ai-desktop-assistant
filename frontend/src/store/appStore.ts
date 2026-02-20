@@ -153,6 +153,8 @@ const summarizeEventPayload = (payload: ProtocolEventPayload): string => {
       return `SkillApplied · ${payload.name}`;
     case 'skill_file_content':
       return `SkillFileContent · ${payload.skill_name}/${payload.file_path}`;
+    case 'governance_report':
+      return `GovernanceReport · B:${payload.report.blockerCount} W:${payload.report.warningCount} I:${payload.report.infoCount}`;
   }
   return 'UnknownEvent';
 };
@@ -176,6 +178,14 @@ const levelFromEventPayload = (payload: ProtocolEventPayload): ProtocolCardLevel
     case 'skill_content':
     case 'skill_applied':
     case 'skill_file_content':
+      return 'success';
+    case 'governance_report':
+      if (payload.report.blockerCount > 0) {
+        return 'error';
+      }
+      if (payload.report.warningCount > 0) {
+        return 'warning';
+      }
       return 'success';
     default:
       return 'info';

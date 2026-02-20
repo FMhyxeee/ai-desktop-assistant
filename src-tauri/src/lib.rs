@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use agent_service::types::{
-    AgentEvent, AgentRuntimeConfig, AgentStreamInput, McpConfigTestResult, McpRuntimeConfig,
-    SkillScanResult, SkillsRuntimeConfig,
+    AgentEvent, AgentRuntimeConfig, AgentStreamInput, GovernanceReport, GovernanceUpdateReport,
+    McpConfigTestResult, McpRuntimeConfig, SkillScanResult, SkillsRuntimeConfig,
 };
 use agent_service::AgentService;
 use serde::Serialize;
@@ -109,13 +109,21 @@ async fn cancel_agent_task(
 async fn update_runtime_config(
     state: tauri::State<'_, AppState>,
     config: AgentRuntimeConfig,
-) -> Result<(), String> {
+) -> Result<GovernanceUpdateReport, String> {
+    let previous_service = { state.agent_service.lock().await.clone() };
+    let before = previous_service.run_governance_scan(None).await.ok();
+
     let service = AgentService::new_with_config(config)
         .await
         .map_err(|err| err.to_string())?;
+    let after = service
+        .latest_governance_report()
+        .ok_or_else(|| "missing governance report after runtime config update".to_string())?;
+
     let mut guard = state.agent_service.lock().await;
     *guard = service;
-    Ok(())
+
+    Ok(GovernanceUpdateReport { before, after })
 }
 
 #[tauri::command]
@@ -152,6 +160,22 @@ async fn test_runtime_config(config: AgentRuntimeConfig) -> Result<ConnectionTes
 #[tauri::command]
 async fn test_mcp_config(config: McpRuntimeConfig) -> Result<McpConfigTestResult, String> {
     Ok(agent_service::test_mcp_runtime_config(config).await)
+}
+
+#[tauri::command]
+async fn run_governance_scan(
+    state: tauri::State<'_, AppState>,
+    config: Option<AgentRuntimeConfig>,
+) -> Result<GovernanceReport, String> {
+    if let Some(config) = config {
+        return Ok(agent_service::run_governance_scan_with_config(config).await);
+    }
+
+    let service = { state.agent_service.lock().await.clone() };
+    service
+        .run_governance_scan(None)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -210,6 +234,7 @@ pub fn run() {
             update_runtime_config,
             test_runtime_config,
             test_mcp_config,
+            run_governance_scan,
             scan_skills_config,
             frontend_log
         ])

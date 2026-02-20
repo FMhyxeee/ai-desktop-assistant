@@ -301,6 +301,9 @@ pub enum ProtocolEventPayload {
         file_path: String,
         content: String,
     },
+    GovernanceReport {
+        report: GovernanceReport,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,13 +342,8 @@ pub struct ProtocolMcpPromptInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProtocolPromptContent {
-    Text {
-        text: String,
-    },
-    Image {
-        data: String,
-        mime_type: String,
-    },
+    Text { text: String },
+    Image { data: String, mime_type: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -363,6 +361,44 @@ pub struct ProtocolSkillEntry {
     pub path: String,
     pub source: String,
     pub has_auxiliary_files: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GovernanceSeverity {
+    Blocker,
+    Warning,
+    Info,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GovernanceIssue {
+    pub severity: GovernanceSeverity,
+    pub category: String,
+    pub code: String,
+    pub message: String,
+    pub evidence: Option<String>,
+    pub suggestion: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GovernanceReport {
+    pub generated_at_unix_ms: u64,
+    pub scope: String,
+    pub summary: String,
+    pub issues: Vec<GovernanceIssue>,
+    pub blocker_count: usize,
+    pub warning_count: usize,
+    pub info_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GovernanceUpdateReport {
+    pub before: Option<GovernanceReport>,
+    pub after: GovernanceReport,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

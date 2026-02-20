@@ -12,6 +12,7 @@ import { useAppStore } from '../store/appStore';
 import {
   AgentProvider,
   type AppConfig,
+  type GovernanceReport,
   type McpConfigTestResult,
   type McpServerConfig,
   type SkillScanResult,
@@ -181,6 +182,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
   const [isTestingModel, setIsTestingModel] = React.useState(false);
   const [isTestingMcp, setIsTestingMcp] = React.useState(false);
   const [isScanningSkills, setIsScanningSkills] = React.useState(false);
+  const [isRunningGovernance, setIsRunningGovernance] = React.useState(false);
 
   const [saveError, setSaveError] = React.useState<string | null>(null);
   const [modelFeedback, setModelFeedback] = React.useState<Feedback | null>(null);
@@ -192,6 +194,8 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
   const [imageRecognitionArgsTemplateError, setImageRecognitionArgsTemplateError] = React.useState<string | null>(null);
   const [skillsResult, setSkillsResult] = React.useState<SkillScanResult | null>(null);
   const [skillsError, setSkillsError] = React.useState<string | null>(null);
+  const [governanceReport, setGovernanceReport] = React.useState<GovernanceReport | null>(null);
+  const [governanceError, setGovernanceError] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     setLocalConfig(config);
@@ -209,11 +213,14 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
     setImageRecognitionArgsTemplateError(null);
     setSkillsResult(null);
     setSkillsError(null);
+    setGovernanceReport(null);
+    setGovernanceError(null);
   }, [config, isOpen]);
 
   const preset = getProviderPreset(localConfig.provider);
   const hasStreaming = Boolean(streamingTaskId);
-  const disableSave = isSaving || isTestingModel || isTestingMcp || isScanningSkills || hasStreaming;
+  const disableSave =
+    isSaving || isTestingModel || isTestingMcp || isScanningSkills || isRunningGovernance || hasStreaming;
 
   const updateServer = (index: number, updater: (server: McpServerConfig) => McpServerConfig) => {
     setLocalConfig((prev) => {
@@ -423,6 +430,26 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
     }
   };
 
+  const runGovernanceScan = async () => {
+    if (hasStreaming) {
+      setGovernanceError('当前有进行中的会话，请先停止生成再运行治理扫描。');
+      return;
+    }
+    setIsRunningGovernance(true);
+    setGovernanceError(null);
+    try {
+      const normalized = normalizeConfigForSave(
+        normalizeConfigWithImageRecognitionTemplate(localConfig)
+      );
+      const report = await TauriAPI.runGovernanceScan(normalized);
+      setGovernanceReport(report);
+    } catch (error) {
+      setGovernanceError(getErrorMessage(error));
+    } finally {
+      setIsRunningGovernance(false);
+    }
+  };
+
   const save = async () => {
     if (hasStreaming) {
       setSaveError('当前有进行中的会话，请先停止生成再保存设置。');
@@ -448,7 +475,8 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
     setIsSaving(true);
     setSaveError(null);
     try {
-      await TauriAPI.updateRuntimeConfig(normalized);
+      const updateReport = await TauriAPI.updateRuntimeConfig(normalized);
+      setGovernanceReport(updateReport.after);
       updateConfig(normalized);
       onClose();
     } catch (error) {
@@ -802,6 +830,62 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
                 </p>
                 {imageRecognitionArgsTemplateError && (
                   <p className="field-error">{imageRecognitionArgsTemplateError}</p>
+                )}
+              </section>
+
+              <section className="field-group">
+                <div className="settings-inline-head">
+                  <p className="settings-inline-title">治理扫描</p>
+                  <button
+                    type="button"
+                    className="btn-ghost"
+                    onClick={runGovernanceScan}
+                    disabled={isRunningGovernance || hasStreaming}
+                  >
+                    <PlugZap size={16} />{isRunningGovernance ? '扫描中...' : '运行治理扫描'}
+                  </button>
+                </div>
+
+                {governanceError && <p className="field-error">{governanceError}</p>}
+                {governanceReport && (
+                  <div className="result-list">
+                    <p
+                      className={`field-status ${
+                        governanceReport.blockerCount > 0
+                          ? 'error'
+                          : governanceReport.warningCount > 0
+                            ? 'warning'
+                            : 'success'
+                      }`}
+                    >
+                      {governanceReport.summary}
+                    </p>
+                    <p className="result-sub">
+                      blocker={governanceReport.blockerCount} · warning={governanceReport.warningCount} · info={governanceReport.infoCount}
+                    </p>
+                    {governanceReport.issues.slice(0, 8).map((issue) => (
+                      <div
+                        key={`${issue.category}-${issue.code}-${issue.message}`}
+                        className={`result-item ${
+                          issue.severity === 'blocker'
+                            ? 'error'
+                            : issue.severity === 'warning'
+                              ? 'warning'
+                              : 'success'
+                        }`}
+                      >
+                        <p className="result-title">
+                          [{issue.severity}] {issue.code}
+                        </p>
+                        <p className="result-sub">{issue.message}</p>
+                        {issue.evidence && <p className="result-sub">{issue.evidence}</p>}
+                        {issue.suggestion && <p className="result-sub">{issue.suggestion}</p>}
+                      </div>
+                    ))}
+                    {governanceReport.issues.length > 8 && (
+                      <p className="result-sub">仅展示前 8 条，可通过协议面板查看完整结构化事件。</p>
+                    )}
+                  </div>
                 )}
               </section>
             </>

@@ -78,6 +78,32 @@ export interface ProtocolSkillEntry {
   has_auxiliary_files: boolean;
 }
 
+export type GovernanceSeverity = 'blocker' | 'warning' | 'info';
+
+export interface GovernanceIssue {
+  severity: GovernanceSeverity;
+  category: string;
+  code: string;
+  message: string;
+  evidence?: string;
+  suggestion?: string;
+}
+
+export interface GovernanceReport {
+  generatedAtUnixMs: number;
+  scope: string;
+  summary: string;
+  issues: GovernanceIssue[];
+  blockerCount: number;
+  warningCount: number;
+  infoCount: number;
+}
+
+export interface GovernanceUpdateReport {
+  before?: GovernanceReport | null;
+  after: GovernanceReport;
+}
+
 export type ProtocolOpPayload =
   | {
       type: 'user_turn';
@@ -184,6 +210,10 @@ export type ProtocolEventPayload =
       skill_name: string;
       file_path: string;
       content: string;
+    }
+  | {
+      type: 'governance_report';
+      report: GovernanceReport;
     };
 
 export interface ProtocolCard {

@@ -1,3 +1,4 @@
+mod governance;
 pub mod types;
 
 use std::collections::HashMap;
@@ -15,8 +16,8 @@ use agent_lib::model::provider::{
 };
 use agent_lib::model::{ModelClient, TokenUsage};
 use agent_lib::protocol::{ApprovalPolicy, Op, ReasoningSummary, SandboxPolicy, UserInputItem};
-use agent_lib::skills::{SkillConfig, SkillLoader, SkillSource};
 use agent_lib::session::{Session, SessionConfig, SessionHandle};
+use agent_lib::skills::{SkillConfig, SkillLoader, SkillSource};
 use agent_lib::tools::{Tool, ToolContext, ToolDef, ToolExecutor, ToolRegistry, ToolResult};
 use agent_lib::{AgentBuilder, AgentError, AgentResult, Event, TurnAbortReason};
 use base64::Engine;
@@ -26,7 +27,7 @@ use tokio::time::timeout;
 
 use self::types::{
     AgentEvent, AgentInputImage, AgentProvider, AgentRuntimeConfig, AgentStreamInput, AppError,
-    McpAuthRuntimeConfig, McpAuthType, McpConfigTestResult, McpRuntimeConfig,
+    GovernanceReport, McpAuthRuntimeConfig, McpAuthType, McpConfigTestResult, McpRuntimeConfig,
     McpServerRuntimeConfig, McpServerTestResult, McpTlsRuntimeConfig, McpTransportKind,
     ProtocolEventPayload, ProtocolInputImage, ProtocolMcpPromptInfo, ProtocolMcpResourceInfo,
     ProtocolMcpToolInfo, ProtocolOpPayload, ProtocolPromptArgumentInfo, ProtocolPromptContent,
@@ -46,6 +47,7 @@ pub struct AgentService {
     runtime_mcp_manager: Option<Arc<McpManager>>,
     runtime_tool_executor: Option<Arc<ToolExecutor>>,
     runtime_skill_config: Option<SkillConfig>,
+    latest_governance_report: Option<GovernanceReport>,
     tasks: Arc<Mutex<HashMap<String, ActiveTask>>>,
 }
 
@@ -63,12 +65,14 @@ impl AgentService {
     pub async fn new_with_config(config: AgentRuntimeConfig) -> Result<Self, AppError> {
         let runner = AgentLibRunner::new(config.clone())?;
         let runtime_resources = build_runtime_resources(&config).await?;
+        let latest_governance_report = Some(governance::scan_runtime_governance(&config).await);
         Ok(Self {
             runner: Arc::new(runner),
             runtime_config: Some(config),
             runtime_mcp_manager: runtime_resources.mcp_manager,
             runtime_tool_executor: runtime_resources.tool_executor,
             runtime_skill_config: Some(runtime_resources.skill_config),
+            latest_governance_report,
             tasks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -80,6 +84,7 @@ impl AgentService {
             runtime_mcp_manager: None,
             runtime_tool_executor: None,
             runtime_skill_config: None,
+            latest_governance_report: None,
             tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -102,7 +107,8 @@ impl AgentService {
         });
 
         if let Some(config) = self.runtime_config.clone() {
-            self.chat_stream_protocol(task_id, input, config, emit).await
+            self.chat_stream_protocol(task_id, input, config, emit)
+                .await
         } else {
             self.chat_stream_legacy(task_id, input, emit).await
         }
@@ -133,19 +139,21 @@ impl AgentService {
 
         let (_session, handle) = Session::with_config(64, session_config);
         let control_handle = handle.clone();
-        let prepared_payload = prepare_image_fallback_payload(
-            &input,
-            &config,
-            self.runtime_mcp_manager.clone(),
-        )
-        .await;
-        let (op, op_payload, is_command_input) = build_stream_op(
-            &input,
-            &config,
-            prepared_payload.model_payload_text,
-        );
+        let prepared_payload =
+            prepare_image_fallback_payload(&input, &config, self.runtime_mcp_manager.clone()).await;
+        let (op, op_payload, is_command_input) =
+            build_stream_op(&input, &config, prepared_payload.model_payload_text);
 
         let mut seq = 0_u64;
+        if let Some(report) = self.latest_governance_report.clone() {
+            seq += 1;
+            emit(AgentEvent::ProtocolEvent {
+                task_id: task_id.clone(),
+                seq,
+                payload: ProtocolEventPayload::GovernanceReport { report },
+            });
+        }
+
         for warning in prepared_payload.warnings {
             seq += 1;
             emit(AgentEvent::ProtocolEvent {
@@ -175,7 +183,8 @@ impl AgentService {
             let mut aggregated_output = String::new();
 
             loop {
-                let next_event = timeout(Duration::from_secs(120), worker_handle.next_event()).await;
+                let next_event =
+                    timeout(Duration::from_secs(120), worker_handle.next_event()).await;
                 let event = match next_event {
                     Ok(Some(event)) => event,
                     Ok(None) => {
@@ -283,7 +292,10 @@ impl AgentService {
                         emit(AgentEvent::Error {
                             task_id: task_id_for_worker.clone(),
                             code: "turn_aborted".to_string(),
-                            message: format!("Turn aborted: {}", turn_abort_reason_to_text(&reason)),
+                            message: format!(
+                                "Turn aborted: {}",
+                                turn_abort_reason_to_text(&reason)
+                            ),
                         });
                         break;
                     }
@@ -362,6 +374,27 @@ impl AgentService {
         Ok(())
     }
 
+    pub fn latest_governance_report(&self) -> Option<GovernanceReport> {
+        self.latest_governance_report.clone()
+    }
+
+    pub async fn run_governance_scan(
+        &self,
+        config_override: Option<AgentRuntimeConfig>,
+    ) -> Result<GovernanceReport, AppError> {
+        let config = if let Some(config) = config_override {
+            config
+        } else if let Some(config) = self.runtime_config.clone() {
+            config
+        } else {
+            return Err(AppError::InvalidConfig(
+                "runtime config is unavailable for governance scan".to_string(),
+            ));
+        };
+
+        Ok(governance::scan_runtime_governance(&config).await)
+    }
+
     pub async fn cancel(&self, task_id: &str) -> Result<(), AppError> {
         let task = self.tasks.lock().await.remove(task_id);
         if let Some(task) = task {
@@ -380,6 +413,10 @@ struct RuntimeResources {
     mcp_manager: Option<Arc<McpManager>>,
     tool_executor: Option<Arc<ToolExecutor>>,
     skill_config: SkillConfig,
+}
+
+pub async fn run_governance_scan_with_config(config: AgentRuntimeConfig) -> GovernanceReport {
+    governance::scan_runtime_governance(&config).await
 }
 
 pub async fn test_mcp_runtime_config(config: McpRuntimeConfig) -> McpConfigTestResult {
@@ -508,7 +545,10 @@ pub async fn scan_skills_runtime_config(config: SkillsRuntimeConfig) -> SkillSca
         }
     } else if let Some(home) = skill_home_dir() {
         let dir = home.join(".cursor").join("skills");
-        match loader.load_from_directory(&dir, &SkillSource::Personal).await {
+        match loader
+            .load_from_directory(&dir, &SkillSource::Personal)
+            .await
+        {
             Ok(entries) => skills.extend(entries),
             Err(err) => warnings.push(format!(
                 "扫描默认 personal skills 目录失败 ({}): {}",
@@ -563,7 +603,9 @@ pub async fn scan_skills_runtime_config(config: SkillsRuntimeConfig) -> SkillSca
     }
 }
 
-async fn build_runtime_resources(config: &AgentRuntimeConfig) -> Result<RuntimeResources, AppError> {
+async fn build_runtime_resources(
+    config: &AgentRuntimeConfig,
+) -> Result<RuntimeResources, AppError> {
     let skill_config = map_runtime_skill_config(&config.skills);
     if !config.mcp.enabled {
         return Ok(RuntimeResources {
@@ -575,8 +617,10 @@ async fn build_runtime_resources(config: &AgentRuntimeConfig) -> Result<RuntimeR
 
     let default_timeout_secs = config.mcp.default_timeout_secs.unwrap_or(30).max(1);
     let max_retries = config.mcp.max_retries.unwrap_or(3);
-    let manager =
-        McpManager::with_timeout_and_retries(Duration::from_secs(default_timeout_secs), max_retries);
+    let manager = McpManager::with_timeout_and_retries(
+        Duration::from_secs(default_timeout_secs),
+        max_retries,
+    );
 
     for server in &config.mcp.servers {
         if !server.enabled {
@@ -689,12 +733,18 @@ fn map_runtime_transport(kind: McpTransportKind) -> Result<AgentMcpTransportType
         McpTransportKind::StreamableHttp | McpTransportKind::Http | McpTransportKind::Https => {
             Ok(AgentMcpTransportType::StreamableHttp)
         }
-        McpTransportKind::Tcp => Err(AppError::InvalidConfig(unsupported_transport_message("tcp"))),
-        McpTransportKind::Websocket => Err(AppError::InvalidConfig(
-            unsupported_transport_message("websocket"),
-        )),
-        McpTransportKind::Wss => Err(AppError::InvalidConfig(unsupported_transport_message("wss"))),
-        McpTransportKind::Sse => Err(AppError::InvalidConfig(unsupported_transport_message("sse"))),
+        McpTransportKind::Tcp => Err(AppError::InvalidConfig(unsupported_transport_message(
+            "tcp",
+        ))),
+        McpTransportKind::Websocket => Err(AppError::InvalidConfig(unsupported_transport_message(
+            "websocket",
+        ))),
+        McpTransportKind::Wss => Err(AppError::InvalidConfig(unsupported_transport_message(
+            "wss",
+        ))),
+        McpTransportKind::Sse => Err(AppError::InvalidConfig(unsupported_transport_message(
+            "sse",
+        ))),
     }
 }
 
@@ -733,7 +783,11 @@ fn map_runtime_mcp_auth(
         api_key_header: normalize_optional(config.api_key_header.clone()),
         query_param: normalize_optional(config.query_param.clone()),
         token_url: normalize_optional(config.token_url.clone()),
-        client_id: resolve_secret_env(config.client_id_env.as_deref(), server_name, "client_id_env")?,
+        client_id: resolve_secret_env(
+            config.client_id_env.as_deref(),
+            server_name,
+            "client_id_env",
+        )?,
         client_secret: resolve_secret_env(
             config.client_secret_env.as_deref(),
             server_name,
@@ -770,7 +824,9 @@ fn map_runtime_mcp_auth(
         }
         AgentMcpAuthType::OAuth2 => {
             let has_static_token = auth.token.is_some();
-            let has_flow = auth.token_url.is_some() && auth.client_id.is_some() && auth.client_secret.is_some();
+            let has_flow = auth.token_url.is_some()
+                && auth.client_id.is_some()
+                && auth.client_secret.is_some();
             if !has_static_token && !has_flow {
                 return Err(AppError::InvalidConfig(format!(
                     "MCP server '{}' requires token_env or token_url + client_id_env + client_secret_env for oauth2",
@@ -892,8 +948,9 @@ impl Tool for PrefixedMcpTool {
             .await
             .map_err(|err| AgentError::Tool(format!("MCP tool call failed: {}", err)))?;
 
-        let output = serde_json::to_value(result)
-            .map_err(|err| AgentError::Tool(format!("Failed to encode MCP tool result: {}", err)))?;
+        let output = serde_json::to_value(result).map_err(|err| {
+            AgentError::Tool(format!("Failed to encode MCP tool result: {}", err))
+        })?;
 
         Ok(ToolResult { output })
     }
@@ -958,28 +1015,32 @@ fn map_protocol_event(event: &Event) -> Option<ProtocolEventPayload> {
                     .collect(),
             })
         }
-        Event::McpResourceContent { uri, content } => Some(ProtocolEventPayload::McpResourceContent {
-            uri: uri.clone(),
-            content: content.clone(),
-        }),
-        Event::McpListPromptsResponse { prompts } => Some(ProtocolEventPayload::McpListPromptsResponse {
-            prompts: prompts
-                .iter()
-                .map(|item| ProtocolMcpPromptInfo {
-                    name: item.name.clone(),
-                    description: item.description.clone(),
-                    arguments: item.arguments.as_ref().map(|args| {
-                        args.iter()
-                            .map(|arg| ProtocolPromptArgumentInfo {
-                                name: arg.name.clone(),
-                                description: arg.description.clone(),
-                                required: arg.required,
-                            })
-                            .collect()
-                    }),
-                })
-                .collect(),
-        }),
+        Event::McpResourceContent { uri, content } => {
+            Some(ProtocolEventPayload::McpResourceContent {
+                uri: uri.clone(),
+                content: content.clone(),
+            })
+        }
+        Event::McpListPromptsResponse { prompts } => {
+            Some(ProtocolEventPayload::McpListPromptsResponse {
+                prompts: prompts
+                    .iter()
+                    .map(|item| ProtocolMcpPromptInfo {
+                        name: item.name.clone(),
+                        description: item.description.clone(),
+                        arguments: item.arguments.as_ref().map(|args| {
+                            args.iter()
+                                .map(|arg| ProtocolPromptArgumentInfo {
+                                    name: arg.name.clone(),
+                                    description: arg.description.clone(),
+                                    required: arg.required,
+                                })
+                                .collect()
+                        }),
+                    })
+                    .collect(),
+            })
+        }
         Event::McpPromptResult { messages } => Some(ProtocolEventPayload::McpPromptResult {
             messages: messages
                 .iter()
@@ -1020,9 +1081,9 @@ fn map_protocol_event(event: &Event) -> Option<ProtocolEventPayload> {
             content: content.clone(),
             auxiliary_files: auxiliary_files.clone(),
         }),
-        Event::SkillApplied { name } => Some(ProtocolEventPayload::SkillApplied {
-            name: name.clone(),
-        }),
+        Event::SkillApplied { name } => {
+            Some(ProtocolEventPayload::SkillApplied { name: name.clone() })
+        }
         Event::SkillFileContent {
             skill_name,
             file_path,
@@ -1068,9 +1129,9 @@ async fn prepare_image_fallback_payload(
     let fallback_note_text = append_image_note(&text, &input.images);
     let image_recognition = &config.mcp.image_recognition;
     if !image_recognition.enabled {
-        prepared.warnings.push(
-            "Image recognition fallback is disabled; using image filename note.".to_string(),
-        );
+        prepared
+            .warnings
+            .push("Image recognition fallback is disabled; using image filename note.".to_string());
         prepared.model_payload_text = Some(fallback_note_text);
         return prepared;
     }
@@ -1096,9 +1157,9 @@ async fn prepare_image_fallback_payload(
     };
 
     let Some(manager) = mcp_manager else {
-        prepared.warnings.push(
-            "MCP manager is unavailable, skipping image recognition fallback.".to_string(),
-        );
+        prepared
+            .warnings
+            .push("MCP manager is unavailable, skipping image recognition fallback.".to_string());
         prepared.model_payload_text = Some(fallback_note_text);
         return prepared;
     };
@@ -1229,7 +1290,10 @@ async fn prepare_image_fallback_payload(
     prepared
 }
 
-fn append_image_recognition_results(text: &str, recognized_sections: &[(String, String)]) -> String {
+fn append_image_recognition_results(
+    text: &str,
+    recognized_sections: &[(String, String)],
+) -> String {
     let mut lines = Vec::new();
     if !text.is_empty() {
         lines.push(text.to_string());
@@ -1251,9 +1315,7 @@ fn render_image_recognition_args_template(
 ) -> Value {
     match template {
         Value::String(value) => Value::String(replace_image_template_placeholders(
-            value,
-            image,
-            local_path,
+            value, image, local_path,
         )),
         Value::Array(items) => Value::Array(
             items
@@ -1388,7 +1450,8 @@ fn rewrite_image_like_arguments_to_local_path(
                         }
                     }
                 }
-                rewritten += rewrite_image_like_arguments_to_local_path(item, original_name, local_path);
+                rewritten +=
+                    rewrite_image_like_arguments_to_local_path(item, original_name, local_path);
             }
             rewritten
         }
@@ -1462,7 +1525,13 @@ fn extract_text_from_call_tool_result(result: &Value) -> Option<String> {
         }
     }
 
-    for key in ["structuredContent", "structured_content", "output", "result", "data"] {
+    for key in [
+        "structuredContent",
+        "structured_content",
+        "output",
+        "result",
+        "data",
+    ] {
         if let Some(candidate) = result.get(key) {
             if let Some(text) = extract_text_from_json_value(candidate) {
                 return Some(text);
@@ -1728,11 +1797,8 @@ mod tests {
         let mut config = AgentRuntimeConfig::default();
         config.model_supports_image_input = false;
 
-        let (op, _payload, _is_command) = build_stream_op(
-            &input,
-            &config,
-            Some("prepared text".to_string()),
-        );
+        let (op, _payload, _is_command) =
+            build_stream_op(&input, &config, Some("prepared text".to_string()));
 
         match op {
             Op::UserTurn { items, .. } => match &items[0] {
