@@ -12,6 +12,7 @@ import type {
   ProtocolCardLevel,
   ProtocolEventPayload,
   ProtocolOpPayload,
+  ProtocolRuntimeConfigPatch,
 } from '../types';
 
 type NewMessage = Omit<Message, 'id' | 'timestamp'>;
@@ -155,6 +156,12 @@ const summarizeEventPayload = (payload: ProtocolEventPayload): string => {
       return `SkillFileContent · ${payload.skill_name}/${payload.file_path}`;
     case 'governance_report':
       return `GovernanceReport · B:${payload.report.blockerCount} W:${payload.report.warningCount} I:${payload.report.infoCount}`;
+    case 'control_decision':
+      return `ControlDecision · ${payload.source} · ${payload.summary}`;
+    case 'config_change_request':
+      return `ConfigChangeRequest · ${payload.summary}`;
+    case 'config_change_result':
+      return `ConfigChangeResult · ${payload.approved ? 'approved' : 'rejected'} · ${payload.reason}`;
   }
   return 'UnknownEvent';
 };
@@ -187,9 +194,38 @@ const levelFromEventPayload = (payload: ProtocolEventPayload): ProtocolCardLevel
         return 'warning';
       }
       return 'success';
+    case 'config_change_request':
+      return 'warning';
+    case 'config_change_result':
+      return payload.approved ? 'success' : 'warning';
     default:
       return 'info';
   }
+};
+
+const mergePersistedPatchIntoConfig = (
+  config: AppConfig,
+  patch: ProtocolRuntimeConfigPatch
+): AppConfig => {
+  const next: AppConfig = { ...config };
+
+  if (typeof patch.systemPrompt === 'string' && patch.systemPrompt.trim().length > 0) {
+    next.systemPrompt = patch.systemPrompt;
+  }
+  if (patch.mcp && typeof patch.mcp === 'object') {
+    next.mcp = {
+      ...next.mcp,
+      ...(patch.mcp as unknown as AppConfig['mcp']),
+    };
+  }
+  if (patch.skills && typeof patch.skills === 'object') {
+    next.skills = {
+      ...next.skills,
+      ...(patch.skills as unknown as AppConfig['skills']),
+    };
+  }
+
+  return next;
 };
 
 const isTerminalEvent = (payload: ProtocolEventPayload): boolean =>
@@ -512,6 +548,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       return {
         conversations: state.conversations.map(updateConversation),
         activeProtocolStreamingCard: nextActiveProtocolStream,
+        config:
+          payload.type === 'config_change_result' &&
+          payload.approved &&
+          payload.persisted &&
+          payload.applied &&
+          payload.patch
+            ? mergePersistedPatchIntoConfig(state.config, payload.patch)
+            : state.config,
       };
     });
     return cardId;

@@ -88,9 +88,26 @@ fn parse_stream_input(input: serde_json::Value) -> Result<AgentStreamInput, Stri
             Ok(AgentStreamInput {
                 content: normalized_content,
                 images: Vec::new(),
+                conversation_id: None,
+                recent_messages: Vec::new(),
             })
         }
     }
+}
+
+#[tauri::command]
+async fn resolve_config_change_request(
+    state: tauri::State<'_, AppState>,
+    task_id: String,
+    request_id: String,
+    approved: bool,
+    persist: bool,
+) -> Result<(), String> {
+    let service = { state.agent_service.lock().await.clone() };
+    service
+        .resolve_config_change_request(&task_id, &request_id, approved, persist)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -230,6 +247,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             ask_agent,
             start_agent_stream,
+            resolve_config_change_request,
             cancel_agent_task,
             update_runtime_config,
             test_runtime_config,

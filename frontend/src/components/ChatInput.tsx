@@ -40,11 +40,11 @@ const ChatInput: React.FC<ChatInputProps> = ({
       return;
     }
 
-    setInput(draftInput.content);
-    setImages(draftInput.images ?? []);
-    onDraftConsumed?.();
-
     requestAnimationFrame(() => {
+      setInput(draftInput.content);
+      setImages(draftInput.images ?? []);
+      onDraftConsumed?.();
+
       textareaRef.current?.focus();
       const textarea = textareaRef.current;
       if (!textarea) {

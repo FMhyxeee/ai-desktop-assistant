@@ -2,16 +2,43 @@
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
-type PrismLightComponent = React.ComponentType<any> & {
-  registerLanguage?: (name: string, syntax: unknown) => void;
+type PrismStyle = Record<string, React.CSSProperties>;
+
+type PrismHighlighterProps = {
+  style?: PrismStyle;
+  language?: string;
+  PreTag?: React.ElementType;
+  className?: string;
+  customStyle?: React.CSSProperties;
+  children?: React.ReactNode;
 };
 
-type PrismStyle = Record<string, React.CSSProperties>;
+type PrismLightComponent = React.ComponentType<PrismHighlighterProps> & {
+  registerLanguage?: (name: string, syntax: unknown) => void;
+};
 
 interface MarkdownMessageProps {
   content: string;
   className?: string;
 }
+
+type MarkdownCodeProps = React.ComponentProps<'code'> & {
+  inline?: boolean;
+  node?: unknown;
+  className?: string;
+  children?: React.ReactNode;
+};
+
+type MarkdownAnchorProps = React.ComponentProps<'a'> & {
+  node?: unknown;
+  href?: string;
+  children?: React.ReactNode;
+};
+
+type MarkdownBlockquoteProps = React.ComponentProps<'blockquote'> & {
+  node?: unknown;
+  children?: React.ReactNode;
+};
 
 const LANGUAGE_ALIAS: Record<string, string> = {
   js: 'javascript',
@@ -123,7 +150,7 @@ const MarkdownMessage: React.FC<MarkdownMessageProps> = ({ content, className = 
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
-          code({ inline, className, children, ...props }: any) {
+          code({ inline, className, children, ...props }: MarkdownCodeProps) {
             const match = /language-(\w+)/.exec(className || '');
             const language = match ? normalizeLanguage(match[1]) : '';
 
@@ -159,15 +186,25 @@ const MarkdownMessage: React.FC<MarkdownMessageProps> = ({ content, className = 
               </code>
             );
           },
-          a({ children, href }: any) {
+          a({ children, href, ...props }: MarkdownAnchorProps) {
             return (
-              <a href={href} target="_blank" rel="noopener noreferrer" className="markdown-link">
+              <a
+                href={href}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="markdown-link"
+                {...props}
+              >
                 {children}
               </a>
             );
           },
-          blockquote({ children }: any) {
-            return <blockquote className="markdown-quote">{children}</blockquote>;
+          blockquote({ children, ...props }: MarkdownBlockquoteProps) {
+            return (
+              <blockquote className="markdown-quote" {...props}>
+                {children}
+              </blockquote>
+            );
           },
         }}
       >

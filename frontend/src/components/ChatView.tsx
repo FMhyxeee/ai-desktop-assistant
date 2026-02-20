@@ -5,7 +5,14 @@ import ChatInput from './ChatInput';
 import ProtocolPanel from './ProtocolPanel';
 import Sidebar from './Sidebar';
 import SettingsModal from './SettingsModal';
-import type { AgentEvent, InputCard, Message, ProtocolEventPayload, ProtocolOpPayload } from '../types';
+import type {
+  AgentEvent,
+  AgentHistoryMessage,
+  InputCard,
+  Message,
+  ProtocolEventPayload,
+  ProtocolOpPayload,
+} from '../types';
 import { AgentEventType } from '../types';
 import { parseSlashInput } from '../lib/input';
 import { TauriAPI } from '../lib/tauri';
@@ -298,12 +305,13 @@ const ChatView: React.FC = () => {
   }, [handleAgentEvent]);
 
   useEffect(() => {
+    const pendingDeltaByTask = pendingDeltaByTaskRef.current;
     return () => {
       if (typeof window !== 'undefined' && deltaFlushRafRef.current !== null) {
         window.cancelAnimationFrame(deltaFlushRafRef.current);
       }
       deltaFlushRafRef.current = null;
-      pendingDeltaByTaskRef.current.clear();
+      pendingDeltaByTask.clear();
     };
   }, []);
 
@@ -317,6 +325,20 @@ const ChatView: React.FC = () => {
       if (currentConversationId !== conversationId) {
         setCurrentConversation(conversationId);
       }
+      const historyWindowTurns = 8;
+      const recentMessages: AgentHistoryMessage[] = (
+        conversations.find((conversation) => conversation.id === conversationId)?.messages ?? []
+      )
+        .filter((message) => message.content.trim().length > 0)
+        .filter(
+          (message): message is Message & { role: 'user' | 'assistant' | 'system' } =>
+            message.role === 'user' || message.role === 'assistant' || message.role === 'system'
+        )
+        .slice(-historyWindowTurns * 2)
+        .map((message) => ({
+          role: message.role,
+          content: message.content,
+        }));
 
       const parsedInput = parseSlashInput(input.content);
       const outboundInput: InputCard = parsedInput.isCommand
@@ -353,7 +375,10 @@ const ChatView: React.FC = () => {
       }
 
       try {
-        await TauriAPI.startAgentStream(outboundInput, taskId);
+        await TauriAPI.startAgentStream(outboundInput, taskId, {
+          conversationId,
+          recentMessages,
+        });
         logger.info('Agent stream request sent', {
           taskId,
           conversationId,
@@ -374,6 +399,7 @@ const ChatView: React.FC = () => {
     [
       addMessage,
       beginStream,
+      conversations,
       currentConversationId,
       ensureConversation,
       failStream,
@@ -469,6 +495,19 @@ const ChatView: React.FC = () => {
       cancelStream(streamingTaskId);
     }
   }, [cancelStream, streamingTaskId]);
+
+  const handleResolveConfigChangeRequest = useCallback(
+    async (taskId: string, requestId: string, approved: boolean, persist: boolean) => {
+      await TauriAPI.resolveConfigChangeRequest(taskId, requestId, approved, persist);
+      logger.info('Config change request resolved', {
+        taskId,
+        requestId,
+        approved,
+        persist,
+      });
+    },
+    []
+  );
 
   const isStreaming = streamingTaskId !== null;
 
@@ -585,7 +624,11 @@ const ChatView: React.FC = () => {
             </section>
 
             <section className={`protocol-column ${protocolOpen ? 'open' : ''}`}>
-              <ProtocolPanel cards={currentConversation?.protocolCards || []} onRetry={handleRetryCard} />
+              <ProtocolPanel
+                cards={currentConversation?.protocolCards || []}
+                onRetry={handleRetryCard}
+                onResolveConfigChangeRequest={handleResolveConfigChangeRequest}
+              />
             </section>
           </div>
         </main>

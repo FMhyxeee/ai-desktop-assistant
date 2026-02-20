@@ -104,6 +104,21 @@ export interface GovernanceUpdateReport {
   after: GovernanceReport;
 }
 
+export type PatchDecisionSource = 'rule' | 'model_fallback';
+
+export interface ProtocolRuntimeConfigPatch {
+  systemPrompt?: string | null;
+  mcp?: McpRuntimeConfig | null;
+  skills?: SkillsRuntimeConfig | null;
+}
+
+export type AgentHistoryRole = 'user' | 'assistant' | 'system';
+
+export interface AgentHistoryMessage {
+  role: AgentHistoryRole;
+  content: string;
+}
+
 export type ProtocolOpPayload =
   | {
       type: 'user_turn';
@@ -214,6 +229,32 @@ export type ProtocolEventPayload =
   | {
       type: 'governance_report';
       report: GovernanceReport;
+    }
+  | {
+      type: 'control_decision';
+      source: PatchDecisionSource;
+      confidence: number;
+      summary: string;
+      developer_instructions?: string | null;
+      patch?: ProtocolRuntimeConfigPatch | null;
+    }
+  | {
+      type: 'config_change_request';
+      request_id: string;
+      summary: string;
+      source: PatchDecisionSource;
+      confidence: number;
+      patch: ProtocolRuntimeConfigPatch;
+      expires_at_unix_ms: number;
+    }
+  | {
+      type: 'config_change_result';
+      request_id: string;
+      approved: boolean;
+      persisted: boolean;
+      applied: boolean;
+      reason: string;
+      patch?: ProtocolRuntimeConfigPatch | null;
     };
 
 export interface ProtocolCard {

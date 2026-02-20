@@ -27,6 +27,8 @@ pub struct AgentRuntimeConfig {
     pub system_prompt: String,
     pub mcp: McpRuntimeConfig,
     pub skills: SkillsRuntimeConfig,
+    #[serde(default)]
+    pub control: AppControlRuntimeConfig,
 }
 
 impl Default for AgentRuntimeConfig {
@@ -42,6 +44,37 @@ impl Default for AgentRuntimeConfig {
             system_prompt: "You are a desktop AI assistant.".to_string(),
             mcp: McpRuntimeConfig::default(),
             skills: SkillsRuntimeConfig::default(),
+            control: AppControlRuntimeConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppControlRuntimeConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_history_window_turns")]
+    pub history_window_turns: usize,
+    #[serde(default = "default_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+    #[serde(default = "default_true")]
+    pub model_fallback_enabled: bool,
+    #[serde(default = "default_control_fallback_provider")]
+    pub model_fallback_provider: AgentProvider,
+    #[serde(default = "default_control_fallback_model")]
+    pub model_fallback_model: String,
+}
+
+impl Default for AppControlRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            history_window_turns: default_history_window_turns(),
+            approval_timeout_secs: default_approval_timeout_secs(),
+            model_fallback_enabled: true,
+            model_fallback_provider: default_control_fallback_provider(),
+            model_fallback_model: default_control_fallback_model(),
         }
     }
 }
@@ -188,6 +221,10 @@ pub struct AgentStreamInput {
     pub content: String,
     #[serde(default)]
     pub images: Vec<AgentInputImage>,
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub recent_messages: Vec<AgentHistoryMessage>,
 }
 
 impl AgentStreamInput {
@@ -195,8 +232,25 @@ impl AgentStreamInput {
         Self {
             content: content.into(),
             images: Vec::new(),
+            conversation_id: None,
+            recent_messages: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentHistoryRole {
+    User,
+    Assistant,
+    System,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentHistoryMessage {
+    pub role: AgentHistoryRole,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,6 +355,29 @@ pub enum ProtocolEventPayload {
         file_path: String,
         content: String,
     },
+    ControlDecision {
+        source: PatchDecisionSource,
+        confidence: f32,
+        summary: String,
+        developer_instructions: Option<String>,
+        patch: Option<ProtocolRuntimeConfigPatch>,
+    },
+    ConfigChangeRequest {
+        request_id: String,
+        summary: String,
+        source: PatchDecisionSource,
+        confidence: f32,
+        patch: ProtocolRuntimeConfigPatch,
+        expires_at_unix_ms: u64,
+    },
+    ConfigChangeResult {
+        request_id: String,
+        approved: bool,
+        persisted: bool,
+        applied: bool,
+        reason: String,
+        patch: Option<ProtocolRuntimeConfigPatch>,
+    },
     GovernanceReport {
         report: GovernanceReport,
     },
@@ -361,6 +438,24 @@ pub struct ProtocolSkillEntry {
     pub path: String,
     pub source: String,
     pub has_auxiliary_files: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatchDecisionSource {
+    Rule,
+    ModelFallback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolRuntimeConfigPatch {
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub mcp: Option<McpRuntimeConfig>,
+    #[serde(default)]
+    pub skills: Option<SkillsRuntimeConfig>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -491,6 +586,22 @@ impl From<agent_lib::AgentError> for AppError {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_history_window_turns() -> usize {
+    8
+}
+
+fn default_approval_timeout_secs() -> u64 {
+    60
+}
+
+fn default_control_fallback_provider() -> AgentProvider {
+    AgentProvider::Local
+}
+
+fn default_control_fallback_model() -> String {
+    "qwen2.5-coder:7b".to_string()
 }
 
 fn default_image_recognition_args_template() -> Value {

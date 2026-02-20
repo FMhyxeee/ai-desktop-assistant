@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import {
+  type AgentHistoryMessage,
   type AgentEvent,
   type AppConfig,
   type GovernanceReport,
@@ -51,6 +52,18 @@ interface RuntimeConfigPayload {
   systemPrompt: string;
   mcp: RuntimeMcpPayload;
   skills: RuntimeSkillsPayload;
+}
+
+interface StreamInputPayload {
+  content: string;
+  images: Array<{
+    name: string;
+    mimeType: string;
+    dataUrl: string;
+    sizeBytes: number;
+  }>;
+  conversationId?: string;
+  recentMessages: AgentHistoryMessage[];
 }
 
 export interface RuntimeConnectionTestResult {
@@ -153,15 +166,55 @@ export class TauriAPI {
     }
   }
 
-  static async startAgentStream(input: string | InputCard, taskId?: string): Promise<string> {
+  static async startAgentStream(
+    input: string | InputCard,
+    taskId?: string,
+    options?: {
+      conversationId?: string;
+      recentMessages?: AgentHistoryMessage[];
+    }
+  ): Promise<string> {
+    const streamInput: string | StreamInputPayload =
+      typeof input === 'string'
+        ? input
+        : {
+            content: input.content,
+            images: (input.images ?? []).map((image) => ({
+              name: image.name,
+              mimeType: image.mimeType,
+              dataUrl: image.dataUrl,
+              sizeBytes: image.sizeBytes,
+            })),
+            conversationId: options?.conversationId,
+            recentMessages: options?.recentMessages ?? [],
+          };
     try {
       return await invoke<string>('start_agent_stream', {
-        input,
+        input: streamInput,
         taskId,
       });
     } catch (error) {
       console.error('start_agent_stream error:', error);
       throw new Error(typeof error === 'string' ? error : 'Failed to start stream');
+    }
+  }
+
+  static async resolveConfigChangeRequest(
+    taskId: string,
+    requestId: string,
+    approved: boolean,
+    persist: boolean
+  ): Promise<void> {
+    try {
+      await invoke('resolve_config_change_request', {
+        taskId,
+        requestId,
+        approved,
+        persist,
+      });
+    } catch (error) {
+      console.error('resolve_config_change_request error:', error);
+      throw new Error(typeof error === 'string' ? error : 'Failed to resolve config change request');
     }
   }
 

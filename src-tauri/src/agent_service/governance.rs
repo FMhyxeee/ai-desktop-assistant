@@ -705,6 +705,7 @@ mod tests {
             system_prompt: "prompt".to_string(),
             mcp: McpRuntimeConfig::default(),
             skills: SkillsRuntimeConfig::default(),
+            control: Default::default(),
         }
     }
 

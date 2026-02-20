@@ -1,3 +1,4 @@
+mod control;
 mod governance;
 pub mod types;
 
@@ -14,8 +15,10 @@ use agent_lib::mcp::{
 use agent_lib::model::provider::{
     AnthropicProvider, GlmCodingPlanProvider, GlmProvider, LocalProvider, OpenAiProvider,
 };
-use agent_lib::model::{ModelClient, TokenUsage};
-use agent_lib::protocol::{ApprovalPolicy, Op, ReasoningSummary, SandboxPolicy, UserInputItem};
+use agent_lib::model::{Message, ModelClient, TokenUsage};
+use agent_lib::protocol::{
+    ApprovalPolicy, Op, PromptDirectives, ReasoningSummary, SandboxPolicy, UserInputItem,
+};
 use agent_lib::session::{Session, SessionConfig, SessionHandle};
 use agent_lib::skills::{SkillConfig, SkillLoader, SkillSource};
 use agent_lib::tools::{Tool, ToolContext, ToolDef, ToolExecutor, ToolRegistry, ToolResult};
@@ -23,16 +26,18 @@ use agent_lib::{AgentBuilder, AgentError, AgentResult, Event, TurnAbortReason};
 use base64::Engine;
 use serde_json::{Map, Value};
 use tauri::async_runtime::{JoinHandle, Mutex};
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 
+use self::control::{ControlInput, RuntimeConfigPatch};
 use self::types::{
-    AgentEvent, AgentInputImage, AgentProvider, AgentRuntimeConfig, AgentStreamInput, AppError,
-    GovernanceReport, McpAuthRuntimeConfig, McpAuthType, McpConfigTestResult, McpRuntimeConfig,
-    McpServerRuntimeConfig, McpServerTestResult, McpTlsRuntimeConfig, McpTransportKind,
-    ProtocolEventPayload, ProtocolInputImage, ProtocolMcpPromptInfo, ProtocolMcpResourceInfo,
-    ProtocolMcpToolInfo, ProtocolOpPayload, ProtocolPromptArgumentInfo, ProtocolPromptContent,
-    ProtocolPromptMessage, ProtocolSkillEntry, ProtocolTokenUsage, SkillScanEntry, SkillScanResult,
-    SkillsRuntimeConfig,
+    AgentEvent, AgentHistoryMessage, AgentHistoryRole, AgentInputImage, AgentProvider,
+    AgentRuntimeConfig, AgentStreamInput, AppError, GovernanceReport, McpAuthRuntimeConfig,
+    McpAuthType, McpConfigTestResult, McpRuntimeConfig, McpServerRuntimeConfig,
+    McpServerTestResult, McpTlsRuntimeConfig, McpTransportKind, ProtocolEventPayload,
+    ProtocolInputImage, ProtocolMcpPromptInfo, ProtocolMcpResourceInfo, ProtocolMcpToolInfo,
+    ProtocolOpPayload, ProtocolPromptArgumentInfo, ProtocolPromptContent, ProtocolPromptMessage,
+    ProtocolSkillEntry, ProtocolTokenUsage, SkillScanEntry, SkillScanResult, SkillsRuntimeConfig,
 };
 
 struct ActiveTask {
@@ -40,15 +45,47 @@ struct ActiveTask {
     session_handle: Option<SessionHandle>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct RuntimeConfigPatchAppliedState {
+    system_prompt: Option<String>,
+    mcp: Option<McpRuntimeConfig>,
+    skills: Option<SkillsRuntimeConfig>,
+}
+
+impl RuntimeConfigPatchAppliedState {
+    fn merge_patch(&mut self, patch: &RuntimeConfigPatch) {
+        if let Some(system_prompt) = patch.system_prompt.clone() {
+            self.system_prompt = Some(system_prompt);
+        }
+        if let Some(mcp) = patch.mcp.clone() {
+            self.mcp = Some(mcp);
+        }
+        if let Some(skills) = patch.skills.clone() {
+            self.skills = Some(skills);
+        }
+    }
+}
+
+struct PendingConfigRequest {
+    task_id: String,
+    response_tx: oneshot::Sender<ConfigChangeApproval>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ConfigChangeApproval {
+    approved: bool,
+    persist: bool,
+}
+
 #[derive(Clone)]
 pub struct AgentService {
     runner: Arc<dyn Runner>,
     runtime_config: Option<AgentRuntimeConfig>,
-    runtime_mcp_manager: Option<Arc<McpManager>>,
-    runtime_tool_executor: Option<Arc<ToolExecutor>>,
-    runtime_skill_config: Option<SkillConfig>,
     latest_governance_report: Option<GovernanceReport>,
     tasks: Arc<Mutex<HashMap<String, ActiveTask>>>,
+    conversation_overrides: Arc<Mutex<HashMap<String, RuntimeConfigPatchAppliedState>>>,
+    global_persisted_patch: Arc<Mutex<RuntimeConfigPatchAppliedState>>,
+    pending_config_requests: Arc<Mutex<HashMap<String, PendingConfigRequest>>>,
 }
 
 impl AgentService {
@@ -64,16 +101,16 @@ impl AgentService {
 
     pub async fn new_with_config(config: AgentRuntimeConfig) -> Result<Self, AppError> {
         let runner = AgentLibRunner::new(config.clone())?;
-        let runtime_resources = build_runtime_resources(&config).await?;
+        let _runtime_resources = build_runtime_resources(&config).await?;
         let latest_governance_report = Some(governance::scan_runtime_governance(&config).await);
         Ok(Self {
             runner: Arc::new(runner),
             runtime_config: Some(config),
-            runtime_mcp_manager: runtime_resources.mcp_manager,
-            runtime_tool_executor: runtime_resources.tool_executor,
-            runtime_skill_config: Some(runtime_resources.skill_config),
             latest_governance_report,
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            conversation_overrides: Arc::new(Mutex::new(HashMap::new())),
+            global_persisted_patch: Arc::new(Mutex::new(RuntimeConfigPatchAppliedState::default())),
+            pending_config_requests: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -81,11 +118,11 @@ impl AgentService {
         Self {
             runner,
             runtime_config: None,
-            runtime_mcp_manager: None,
-            runtime_tool_executor: None,
-            runtime_skill_config: None,
             latest_governance_report: None,
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            conversation_overrides: Arc::new(Mutex::new(HashMap::new())),
+            global_persisted_patch: Arc::new(Mutex::new(RuntimeConfigPatchAppliedState::default())),
+            pending_config_requests: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -124,35 +161,245 @@ impl AgentService {
     where
         F: FnMut(AgentEvent) + Send + 'static,
     {
-        let model = build_model_client(&config)?;
-
-        let session_config = SessionConfig {
-            model: Some(model),
-            default_model: config.model.clone(),
-            default_cwd: Some(".".to_string()),
-            default_approval_policy: Some(ApprovalPolicy::NeverAsk),
-            mcp_manager: self.runtime_mcp_manager.clone(),
-            tool_executor: self.runtime_tool_executor.clone(),
-            skill_config: self.runtime_skill_config.clone(),
-            ..Default::default()
-        };
-
-        let (_session, handle) = Session::with_config(64, session_config);
-        let control_handle = handle.clone();
-        let prepared_payload =
-            prepare_image_fallback_payload(&input, &config, self.runtime_mcp_manager.clone()).await;
-        let (op, op_payload, is_command_input) =
-            build_stream_op(&input, &config, prepared_payload.model_payload_text);
+        let conversation_id = normalize_optional(input.conversation_id.clone());
+        let mut effective_config = self
+            .build_effective_runtime_config(&config, conversation_id.as_deref())
+            .await;
+        let history_window_turns = effective_config.control.history_window_turns.max(1);
+        let recent_history = trim_recent_history(&input.recent_messages, history_window_turns);
 
         let mut seq = 0_u64;
-        if let Some(report) = self.latest_governance_report.clone() {
+        let baseline_governance = governance::scan_runtime_governance(&effective_config).await;
+        seq += 1;
+        emit(AgentEvent::ProtocolEvent {
+            task_id: task_id.clone(),
+            seq,
+            payload: ProtocolEventPayload::GovernanceReport {
+                report: baseline_governance,
+            },
+        });
+
+        let mut prompt_directives: Option<PromptDirectives> = None;
+
+        if effective_config.control.enabled {
+            let control_input = ControlInput {
+                user_input: input.content.clone(),
+                recent_messages: recent_history.clone(),
+                effective_config: effective_config.clone(),
+            };
+            let mut control_decision = control::evaluate_rules(&control_input);
+
+            if control_decision.patch.is_none()
+                && effective_config.control.model_fallback_enabled
+                && control::should_try_model_fallback(&input.content)
+            {
+                match build_control_fallback_model_client(&effective_config) {
+                    Ok(fallback_model) => {
+                        if let Some(fallback_decision) =
+                            control::evaluate_model_fallback(&control_input, fallback_model).await
+                        {
+                            if fallback_decision.patch.is_some()
+                                && fallback_decision.confidence >= 0.7
+                            {
+                                control_decision = fallback_decision;
+                            } else if control_decision.patch.is_none() {
+                                control_decision.source = fallback_decision.source;
+                                control_decision.confidence = fallback_decision.confidence;
+                                control_decision.summary = format!(
+                                    "model fallback inspected intent but did not produce an actionable patch (confidence={:.2})",
+                                    fallback_decision.confidence
+                                );
+                                if fallback_decision.developer_instructions.is_some() {
+                                    control_decision.developer_instructions =
+                                        fallback_decision.developer_instructions;
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        seq += 1;
+                        emit(AgentEvent::ProtocolEvent {
+                            task_id: task_id.clone(),
+                            seq,
+                            payload: ProtocolEventPayload::Warning {
+                                message: format!(
+                                    "control model fallback skipped because model init failed: {}",
+                                    err
+                                ),
+                            },
+                        });
+                    }
+                }
+            }
+
+            if control_decision.developer_instructions.is_none() {
+                control_decision.developer_instructions =
+                    Some(control::assemble_developer_instructions(
+                        &effective_config,
+                        control_decision.patch.as_ref(),
+                    ));
+            }
+
             seq += 1;
             emit(AgentEvent::ProtocolEvent {
                 task_id: task_id.clone(),
                 seq,
-                payload: ProtocolEventPayload::GovernanceReport { report },
+                payload: ProtocolEventPayload::ControlDecision {
+                    source: control_decision.source.clone(),
+                    confidence: control_decision.confidence,
+                    summary: control_decision.summary.clone(),
+                    developer_instructions: control_decision.developer_instructions.clone(),
+                    patch: control_decision
+                        .patch
+                        .as_ref()
+                        .map(RuntimeConfigPatch::to_protocol_patch),
+                },
+            });
+
+            if let Some(patch) = control_decision.patch.clone() {
+                let request_id = uuid::Uuid::new_v4().to_string();
+                let mut candidate_config = effective_config.clone();
+                apply_runtime_patch_to_config(&mut candidate_config, &patch);
+                let candidate_report = governance::scan_runtime_governance(&candidate_config).await;
+
+                if candidate_report.blocker_count > 0 {
+                    seq += 1;
+                    emit(AgentEvent::ProtocolEvent {
+                        task_id: task_id.clone(),
+                        seq,
+                        payload: ProtocolEventPayload::ConfigChangeResult {
+                            request_id,
+                            approved: false,
+                            persisted: false,
+                            applied: false,
+                            reason: format!(
+                                "rejected by governance blockers (count={})",
+                                candidate_report.blocker_count
+                            ),
+                            patch: Some(patch.to_protocol_patch()),
+                        },
+                    });
+                    seq += 1;
+                    emit(AgentEvent::ProtocolEvent {
+                        task_id: task_id.clone(),
+                        seq,
+                        payload: ProtocolEventPayload::GovernanceReport {
+                            report: candidate_report,
+                        },
+                    });
+                } else {
+                    let approval_timeout_secs =
+                        effective_config.control.approval_timeout_secs.max(1);
+                    let expires_at_unix_ms =
+                        current_time_millis() + approval_timeout_secs.saturating_mul(1000);
+
+                    seq += 1;
+                    emit(AgentEvent::ProtocolEvent {
+                        task_id: task_id.clone(),
+                        seq,
+                        payload: ProtocolEventPayload::ConfigChangeRequest {
+                            request_id: request_id.clone(),
+                            summary: control_decision.summary.clone(),
+                            source: control_decision.source,
+                            confidence: control_decision.confidence,
+                            patch: patch.to_protocol_patch(),
+                            expires_at_unix_ms,
+                        },
+                    });
+
+                    let (approval, reason) = self
+                        .wait_for_config_change_approval(
+                            &task_id,
+                            &request_id,
+                            approval_timeout_secs,
+                        )
+                        .await;
+                    let approved = approval.approved;
+                    let persisted = approval.approved && approval.persist;
+                    let mut applied = false;
+
+                    if approved {
+                        apply_runtime_patch_to_config(&mut effective_config, &patch);
+                        applied = true;
+
+                        if let Some(conversation_id) = conversation_id.as_deref() {
+                            self.merge_conversation_override(conversation_id, &patch)
+                                .await;
+                        }
+                        if persisted {
+                            self.merge_global_override(&patch).await;
+                            let updated_report =
+                                governance::scan_runtime_governance(&effective_config).await;
+                            seq += 1;
+                            emit(AgentEvent::ProtocolEvent {
+                                task_id: task_id.clone(),
+                                seq,
+                                payload: ProtocolEventPayload::GovernanceReport {
+                                    report: updated_report,
+                                },
+                            });
+                        }
+                    }
+
+                    seq += 1;
+                    emit(AgentEvent::ProtocolEvent {
+                        task_id: task_id.clone(),
+                        seq,
+                        payload: ProtocolEventPayload::ConfigChangeResult {
+                            request_id,
+                            approved,
+                            persisted,
+                            applied,
+                            reason,
+                            patch: Some(patch.to_protocol_patch()),
+                        },
+                    });
+                }
+            }
+
+            prompt_directives = Some(PromptDirectives {
+                developer_instructions: Some(control::assemble_developer_instructions(
+                    &effective_config,
+                    None,
+                )),
+                user_instructions: None,
             });
         }
+
+        let runtime_resources = build_runtime_resources(&effective_config).await?;
+        let model = build_model_client(&effective_config)?;
+        let session_config = SessionConfig {
+            model: Some(model),
+            default_model: effective_config.model.clone(),
+            default_cwd: Some(".".to_string()),
+            default_approval_policy: Some(ApprovalPolicy::NeverAsk),
+            mcp_manager: runtime_resources.mcp_manager.clone(),
+            tool_executor: runtime_resources.tool_executor.clone(),
+            skill_config: Some(runtime_resources.skill_config.clone()),
+            ..Default::default()
+        };
+
+        let (session, handle) = Session::with_config(64, session_config);
+        for message in recent_history
+            .iter()
+            .filter_map(agent_history_to_session_message)
+        {
+            session.push_message(message).await;
+        }
+
+        let control_handle = handle.clone();
+        let prepared_payload = prepare_image_fallback_payload(
+            &input,
+            &effective_config,
+            runtime_resources.mcp_manager.clone(),
+        )
+        .await;
+        let (op, op_payload, is_command_input) = build_stream_op(
+            &input,
+            &effective_config,
+            prepared_payload.model_payload_text,
+            prompt_directives,
+        );
 
         for warning in prepared_payload.warnings {
             seq += 1;
@@ -300,9 +547,37 @@ impl AgentService {
                         break;
                     }
                     Event::Error { error } => {
+                        let error_code_value = error_code(&error);
+                        let lower_text = error.to_string().to_lowercase();
+                        if error_code_value == "mcp_error"
+                            || (error_code_value == "tool_error" && lower_text.contains("mcp"))
+                        {
+                            seq += 1;
+                            emit(AgentEvent::ProtocolEvent {
+                                task_id: task_id_for_worker.clone(),
+                                seq,
+                                payload: ProtocolEventPayload::Warning {
+                                    message: "MCP execution failed. Suggestion: verify MCP server reachability or submit a reviewed config patch."
+                                        .to_string(),
+                                },
+                            });
+                        }
+                        if error_code_value == "tool_error"
+                            && (lower_text.contains("skill") || lower_text.contains("skills"))
+                        {
+                            seq += 1;
+                            emit(AgentEvent::ProtocolEvent {
+                                task_id: task_id_for_worker.clone(),
+                                seq,
+                                payload: ProtocolEventPayload::Warning {
+                                    message: "Skills execution failed. Suggestion: verify skills paths and auto-apply settings; no automatic config mutation was performed."
+                                        .to_string(),
+                                },
+                            });
+                        }
                         emit(AgentEvent::Error {
                             task_id: task_id_for_worker.clone(),
-                            code: error_code(&error),
+                            code: error_code_value,
                             message: error.to_string(),
                         });
                         break;
@@ -382,7 +657,7 @@ impl AgentService {
         &self,
         config_override: Option<AgentRuntimeConfig>,
     ) -> Result<GovernanceReport, AppError> {
-        let config = if let Some(config) = config_override {
+        let mut config = if let Some(config) = config_override {
             config
         } else if let Some(config) = self.runtime_config.clone() {
             config
@@ -391,11 +666,29 @@ impl AgentService {
                 "runtime config is unavailable for governance scan".to_string(),
             ));
         };
+        let global_state = self.global_persisted_patch.lock().await.clone();
+        apply_patch_state_to_config(&mut config, &global_state);
 
         Ok(governance::scan_runtime_governance(&config).await)
     }
 
     pub async fn cancel(&self, task_id: &str) -> Result<(), AppError> {
+        let mut pending = self.pending_config_requests.lock().await;
+        let request_ids = pending
+            .iter()
+            .filter(|(_, item)| item.task_id == task_id)
+            .map(|(request_id, _)| request_id.clone())
+            .collect::<Vec<_>>();
+        for request_id in request_ids {
+            if let Some(request) = pending.remove(&request_id) {
+                let _ = request.response_tx.send(ConfigChangeApproval {
+                    approved: false,
+                    persist: false,
+                });
+            }
+        }
+        drop(pending);
+
         let task = self.tasks.lock().await.remove(task_id);
         if let Some(task) = task {
             if let Some(handle) = task.session_handle {
@@ -405,6 +698,120 @@ impl AgentService {
             Ok(())
         } else {
             Err(AppError::TaskNotFound(task_id.to_string()))
+        }
+    }
+
+    pub async fn resolve_config_change_request(
+        &self,
+        task_id: &str,
+        request_id: &str,
+        approved: bool,
+        persist: bool,
+    ) -> Result<(), AppError> {
+        let mut pending = self.pending_config_requests.lock().await;
+        let Some(request) = pending.remove(request_id) else {
+            return Err(AppError::TaskNotFound(format!(
+                "pending config request not found: {}",
+                request_id
+            )));
+        };
+        if request.task_id != task_id {
+            let expected_task_id = request.task_id.clone();
+            pending.insert(request_id.to_string(), request);
+            return Err(AppError::InvalidConfig(format!(
+                "task id mismatch for config request: expected {}, got {}",
+                expected_task_id, task_id
+            )));
+        }
+        drop(pending);
+
+        request
+            .response_tx
+            .send(ConfigChangeApproval { approved, persist })
+            .map_err(|_| {
+                AppError::TaskNotFound(format!("config request receiver dropped: {}", request_id))
+            })
+    }
+
+    async fn build_effective_runtime_config(
+        &self,
+        base: &AgentRuntimeConfig,
+        conversation_id: Option<&str>,
+    ) -> AgentRuntimeConfig {
+        let mut effective = base.clone();
+
+        let global_state = self.global_persisted_patch.lock().await.clone();
+        apply_patch_state_to_config(&mut effective, &global_state);
+
+        if let Some(conversation_id) = conversation_id {
+            let conversation_state = self
+                .conversation_overrides
+                .lock()
+                .await
+                .get(conversation_id)
+                .cloned();
+            if let Some(conversation_state) = conversation_state {
+                apply_patch_state_to_config(&mut effective, &conversation_state);
+            }
+        }
+
+        effective
+    }
+
+    async fn merge_conversation_override(&self, conversation_id: &str, patch: &RuntimeConfigPatch) {
+        let mut overrides = self.conversation_overrides.lock().await;
+        let entry = overrides
+            .entry(conversation_id.to_string())
+            .or_insert_with(RuntimeConfigPatchAppliedState::default);
+        entry.merge_patch(patch);
+    }
+
+    async fn merge_global_override(&self, patch: &RuntimeConfigPatch) {
+        let mut state = self.global_persisted_patch.lock().await;
+        state.merge_patch(patch);
+    }
+
+    async fn wait_for_config_change_approval(
+        &self,
+        task_id: &str,
+        request_id: &str,
+        timeout_secs: u64,
+    ) -> (ConfigChangeApproval, String) {
+        let (response_tx, response_rx) = oneshot::channel::<ConfigChangeApproval>();
+        self.pending_config_requests.lock().await.insert(
+            request_id.to_string(),
+            PendingConfigRequest {
+                task_id: task_id.to_string(),
+                response_tx,
+            },
+        );
+
+        let wait_result = timeout(Duration::from_secs(timeout_secs.max(1)), response_rx).await;
+        self.pending_config_requests.lock().await.remove(request_id);
+
+        match wait_result {
+            Ok(Ok(approval)) if approval.approved => (approval, "approved".to_string()),
+            Ok(Ok(_)) => (
+                ConfigChangeApproval {
+                    approved: false,
+                    persist: false,
+                },
+                "rejected by user".to_string(),
+            ),
+            Ok(Err(_)) => (
+                ConfigChangeApproval {
+                    approved: false,
+                    persist: false,
+                },
+                "approval channel closed".to_string(),
+            ),
+            Err(_) => (
+                ConfigChangeApproval {
+                    approved: false,
+                    persist: false,
+                },
+                "approval timeout".to_string(),
+            ),
         }
     }
 }
@@ -954,6 +1361,87 @@ impl Tool for PrefixedMcpTool {
 
         Ok(ToolResult { output })
     }
+}
+
+fn apply_patch_state_to_config(
+    config: &mut AgentRuntimeConfig,
+    state: &RuntimeConfigPatchAppliedState,
+) {
+    if let Some(system_prompt) = state.system_prompt.clone() {
+        config.system_prompt = system_prompt;
+    }
+    if let Some(mcp) = state.mcp.clone() {
+        config.mcp = mcp;
+    }
+    if let Some(skills) = state.skills.clone() {
+        config.skills = skills;
+    }
+}
+
+fn apply_runtime_patch_to_config(config: &mut AgentRuntimeConfig, patch: &RuntimeConfigPatch) {
+    if let Some(system_prompt) = patch.system_prompt.clone() {
+        config.system_prompt = system_prompt;
+    }
+    if let Some(mcp) = patch.mcp.clone() {
+        config.mcp = mcp;
+    }
+    if let Some(skills) = patch.skills.clone() {
+        config.skills = skills;
+    }
+}
+
+fn trim_recent_history(
+    messages: &[AgentHistoryMessage],
+    history_window_turns: usize,
+) -> Vec<AgentHistoryMessage> {
+    let max_messages = history_window_turns
+        .max(1)
+        .saturating_mul(2)
+        .max(history_window_turns);
+    if messages.len() <= max_messages {
+        return messages.to_vec();
+    }
+    messages[messages.len() - max_messages..].to_vec()
+}
+
+fn agent_history_to_session_message(message: &AgentHistoryMessage) -> Option<Message> {
+    if message.content.trim().is_empty() {
+        return None;
+    }
+    match message.role {
+        AgentHistoryRole::User => Some(Message::user(message.content.clone())),
+        AgentHistoryRole::Assistant => Some(Message::assistant(message.content.clone())),
+        AgentHistoryRole::System => Some(Message::system(message.content.clone())),
+    }
+}
+
+fn build_control_fallback_model_client(
+    config: &AgentRuntimeConfig,
+) -> Result<Arc<dyn ModelClient>, AppError> {
+    let mut fallback_config = config.clone();
+    let same_provider = std::mem::discriminant(&config.provider)
+        == std::mem::discriminant(&config.control.model_fallback_provider);
+
+    fallback_config.provider = config.control.model_fallback_provider.clone();
+    fallback_config.model = normalize_optional(Some(config.control.model_fallback_model.clone()))
+        .unwrap_or_else(|| default_model_for_provider(&fallback_config.provider).to_string());
+
+    if !same_provider {
+        fallback_config.api_key_env =
+            default_api_env_for_provider(&fallback_config.provider).to_string();
+        if !matches!(fallback_config.provider, AgentProvider::Local) {
+            fallback_config.api_key = None;
+        }
+    }
+
+    build_model_client(&fallback_config)
+}
+
+fn current_time_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 fn map_protocol_event(event: &Event) -> Option<ProtocolEventPayload> {
@@ -1588,6 +2076,7 @@ fn build_stream_op(
     input: &AgentStreamInput,
     config: &AgentRuntimeConfig,
     prepared_model_payload_text: Option<String>,
+    prompt_directives: Option<PromptDirectives>,
 ) -> (Op, ProtocolOpPayload, bool) {
     match parse_slash_input(&input.content) {
         ParsedStreamInput::Command(command) => (
@@ -1634,6 +2123,7 @@ fn build_stream_op(
                         summary: String::new(),
                         token_count: 0,
                     },
+                    prompt_directives,
                     final_output_json_schema: None,
                     collaboration_mode: None,
                 },
@@ -1729,9 +2219,11 @@ mod tests {
         let input = AgentStreamInput {
             content: "/echo hello".to_string(),
             images: Vec::new(),
+            conversation_id: None,
+            recent_messages: Vec::new(),
         };
         let config = AgentRuntimeConfig::default();
-        let (op, payload, is_command) = build_stream_op(&input, &config, None);
+        let (op, payload, is_command) = build_stream_op(&input, &config, None, None);
 
         assert!(is_command);
         assert!(matches!(
@@ -1754,9 +2246,11 @@ mod tests {
                 data_url: "data:image/png;base64,AAAA".to_string(),
                 size_bytes: 4,
             }],
+            conversation_id: None,
+            recent_messages: Vec::new(),
         };
         let config = AgentRuntimeConfig::default();
-        let (op, payload, is_command) = build_stream_op(&input, &config, None);
+        let (op, payload, is_command) = build_stream_op(&input, &config, None, None);
 
         assert!(!is_command);
         match op {
@@ -1793,12 +2287,14 @@ mod tests {
                 data_url: "data:image/png;base64,AAAA".to_string(),
                 size_bytes: 4,
             }],
+            conversation_id: None,
+            recent_messages: Vec::new(),
         };
         let mut config = AgentRuntimeConfig::default();
         config.model_supports_image_input = false;
 
         let (op, _payload, _is_command) =
-            build_stream_op(&input, &config, Some("prepared text".to_string()));
+            build_stream_op(&input, &config, Some("prepared text".to_string()), None);
 
         match op {
             Op::UserTurn { items, .. } => match &items[0] {
@@ -1883,6 +2379,8 @@ mod tests {
                 data_url: "data:image/png;base64,AAAA".to_string(),
                 size_bytes: 4,
             }],
+            conversation_id: None,
+            recent_messages: Vec::new(),
         };
 
         let mut config = AgentRuntimeConfig::default();

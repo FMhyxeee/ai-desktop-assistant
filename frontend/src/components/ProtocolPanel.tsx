@@ -5,6 +5,12 @@ import type { ProtocolCard, ProtocolCardDirection, ProtocolCardLevel } from '../
 interface ProtocolPanelProps {
   cards: ProtocolCard[];
   onRetry: (cardId: string) => void;
+  onResolveConfigChangeRequest: (
+    taskId: string,
+    requestId: string,
+    approved: boolean,
+    persist: boolean
+  ) => Promise<void> | void;
 }
 
 type DirectionFilter = 'all' | ProtocolCardDirection;
@@ -156,12 +162,27 @@ const JsonTree: React.FC<{ value: unknown }> = ({ value }) => {
   return <div className="json-tree">{renderNode(value, 'root')}</div>;
 };
 
-const ProtocolPanel: React.FC<ProtocolPanelProps> = ({ cards, onRetry }) => {
+const ProtocolPanel: React.FC<ProtocolPanelProps> = ({
+  cards,
+  onRetry,
+  onResolveConfigChangeRequest,
+}) => {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [detailMode, setDetailMode] = useState<Record<string, DetailMode>>({});
   const [directionFilter, setDirectionFilter] = useState<DirectionFilter>('all');
   const [levelFilter, setLevelFilter] = useState<LevelFilter>('all');
   const [typeFilter, setTypeFilter] = useState<string>('all');
+  const [submittingRequests, setSubmittingRequests] = useState<Record<string, boolean>>({});
+
+  const resolvedRequestIds = useMemo(() => {
+    const resolved = new Set<string>();
+    cards.forEach((card) => {
+      if (card.payload.type === 'config_change_result') {
+        resolved.add(card.payload.request_id);
+      }
+    });
+    return resolved;
+  }, [cards]);
 
   const chronologicalCards = useMemo(
     () => [...cards].sort((a, b) => (a.timestamp === b.timestamp ? a.seq - b.seq : a.timestamp - b.timestamp)),
@@ -206,6 +227,29 @@ const ProtocolPanel: React.FC<ProtocolPanelProps> = ({ cards, onRetry }) => {
       ...state,
       [cardId]: !state[cardId],
     }));
+  };
+
+  const submitConfigRequest = async (
+    taskId: string,
+    requestId: string,
+    approved: boolean,
+    persist: boolean
+  ) => {
+    if (resolvedRequestIds.has(requestId) || submittingRequests[requestId]) {
+      return;
+    }
+    setSubmittingRequests((state) => ({
+      ...state,
+      [requestId]: true,
+    }));
+    try {
+      await onResolveConfigChangeRequest(taskId, requestId, approved, persist);
+    } finally {
+      setSubmittingRequests((state) => ({
+        ...state,
+        [requestId]: false,
+      }));
+    }
   };
 
   return (
@@ -288,6 +332,8 @@ const ProtocolPanel: React.FC<ProtocolPanelProps> = ({ cards, onRetry }) => {
           const isExpanded = expanded[card.id] ?? false;
           const mode = detailMode[card.id] ?? 'tree';
           const previousCard = previousCardById[card.id];
+          const configChangeRequestPayload =
+            card.payload.type === 'config_change_request' ? card.payload : null;
           const diffLines =
             mode === 'diff' && previousCard
               ? buildLineDiff(payloadToText(previousCard.payload), payloadToText(card.payload))
@@ -402,9 +448,71 @@ const ProtocolPanel: React.FC<ProtocolPanelProps> = ({ cards, onRetry }) => {
                   >
                     <RotateCcw size={14} />
                     重试
-                  </button>
+                    </button>
                 )}
               </div>
+
+              {configChangeRequestPayload && (
+                <div className="protocol-actions">
+                  <button
+                    type="button"
+                    className="protocol-action"
+                    disabled={
+                      resolvedRequestIds.has(configChangeRequestPayload.request_id) ||
+                      Boolean(submittingRequests[configChangeRequestPayload.request_id])
+                    }
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void submitConfigRequest(
+                        card.taskId,
+                        configChangeRequestPayload.request_id,
+                        true,
+                        false
+                      );
+                    }}
+                  >
+                    Approve (Session)
+                  </button>
+                  <button
+                    type="button"
+                    className="protocol-action"
+                    disabled={
+                      resolvedRequestIds.has(configChangeRequestPayload.request_id) ||
+                      Boolean(submittingRequests[configChangeRequestPayload.request_id])
+                    }
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void submitConfigRequest(
+                        card.taskId,
+                        configChangeRequestPayload.request_id,
+                        true,
+                        true
+                      );
+                    }}
+                  >
+                    Approve + Persist
+                  </button>
+                  <button
+                    type="button"
+                    className="protocol-action"
+                    disabled={
+                      resolvedRequestIds.has(configChangeRequestPayload.request_id) ||
+                      Boolean(submittingRequests[configChangeRequestPayload.request_id])
+                    }
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void submitConfigRequest(
+                        card.taskId,
+                        configChangeRequestPayload.request_id,
+                        false,
+                        false
+                      );
+                    }}
+                  >
+                    Reject
+                  </button>
+                </div>
+              )}
 
               {isExpanded && mode === 'tree' && (
                 <div className="protocol-payload json-mode">

@@ -209,6 +209,7 @@ async fn startup_stream_emits_governance_protocol_event() {
         system_prompt: "local prompt".to_string(),
         mcp: McpRuntimeConfig::default(),
         skills: SkillsRuntimeConfig::default(),
+        control: Default::default(),
     };
     config.mcp.enabled = false;
 
@@ -255,6 +256,7 @@ async fn governance_scan_flags_duplicate_mcp_server_names() {
         system_prompt: "local prompt".to_string(),
         mcp: McpRuntimeConfig::default(),
         skills: SkillsRuntimeConfig::default(),
+        control: Default::default(),
     };
     config.mcp.enabled = true;
     config.mcp.servers = vec![
