@@ -231,6 +231,11 @@ export type ProtocolEventPayload =
       report: GovernanceReport;
     }
   | {
+      type: 'conversation_title_suggestion';
+      conversation_id: string;
+      title: string;
+    }
+  | {
       type: 'control_decision';
       source: PatchDecisionSource;
       confidence: number;

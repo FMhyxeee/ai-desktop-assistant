@@ -263,7 +263,11 @@ const ChatView: React.FC = () => {
         }
         case AgentEventType.ProtocolEvent: {
           if (event.payload && typeof event.seq === 'number') {
-            addProtocolEventCard(event.task_id, event.seq, event.payload as ProtocolEventPayload);
+            const payload = event.payload as ProtocolEventPayload;
+            addProtocolEventCard(event.task_id, event.seq, payload);
+            if (payload.type === 'conversation_title_suggestion') {
+              renameConversation(payload.conversation_id, payload.title);
+            }
           }
           break;
         }
@@ -272,7 +276,15 @@ const ChatView: React.FC = () => {
         }
       }
     },
-    [addOpCard, addProtocolEventCard, completeStream, failStream, flushPendingDeltaForTask, queueDeltaChunk]
+    [
+      addOpCard,
+      addProtocolEventCard,
+      completeStream,
+      failStream,
+      flushPendingDeltaForTask,
+      queueDeltaChunk,
+      renameConversation,
+    ]
   );
 
   useEffect(() => {

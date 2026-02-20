@@ -355,6 +355,10 @@ pub enum ProtocolEventPayload {
         file_path: String,
         content: String,
     },
+    ConversationTitleSuggestion {
+        conversation_id: String,
+        title: String,
+    },
     ControlDecision {
         source: PatchDecisionSource,
         confidence: f32,

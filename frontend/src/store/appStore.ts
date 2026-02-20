@@ -74,17 +74,6 @@ const STORAGE_SCHEMA_VERSION = 2;
 const DEFAULT_CONVERSATION_TITLE = '新对话';
 const MAX_TITLE_LENGTH = 50;
 
-const deriveConversationTitle = (content: string): string => {
-  const text = content.trim();
-  if (!text) {
-    return DEFAULT_CONVERSATION_TITLE;
-  }
-  if (text.length <= MAX_TITLE_LENGTH) {
-    return text;
-  }
-  return `${text.slice(0, MAX_TITLE_LENGTH)}...`;
-};
-
 const findConversation = (conversations: Conversation[], id: string | null) =>
   id ? conversations.find((conversation) => conversation.id === id) : undefined;
 
@@ -156,6 +145,8 @@ const summarizeEventPayload = (payload: ProtocolEventPayload): string => {
       return `SkillFileContent · ${payload.skill_name}/${payload.file_path}`;
     case 'governance_report':
       return `GovernanceReport · B:${payload.report.blockerCount} W:${payload.report.warningCount} I:${payload.report.infoCount}`;
+    case 'conversation_title_suggestion':
+      return `ConversationTitleSuggestion · ${payload.title}`;
     case 'control_decision':
       return `ControlDecision · ${payload.source} · ${payload.summary}`;
     case 'config_change_request':
@@ -185,6 +176,7 @@ const levelFromEventPayload = (payload: ProtocolEventPayload): ProtocolCardLevel
     case 'skill_content':
     case 'skill_applied':
     case 'skill_file_content':
+    case 'conversation_title_suggestion':
       return 'success';
     case 'governance_report':
       if (payload.report.blockerCount > 0) {
@@ -389,10 +381,8 @@ export const useAppStore = create<AppState>((set, get) => ({
           id: messageId,
           timestamp: now,
         };
-        const shouldUpdateTitle = message.role === 'user' && conversation.messages.length === 0;
         return {
           ...conversation,
-          title: shouldUpdateTitle ? deriveConversationTitle(message.content) : conversation.title,
           messages: [...conversation.messages, nextMessage],
           updatedAt: now,
         };

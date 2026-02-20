@@ -58,6 +58,12 @@ struct ModelFallbackResponse {
     patch: Option<RuntimeConfigPatch>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct TitleSuggestionResponse {
+    title: Option<String>,
+}
+
 pub fn evaluate_rules(input: &ControlInput) -> ControlDecision {
     let text = input.user_input.trim();
     let normalized = text.to_lowercase();
@@ -180,6 +186,18 @@ pub async fn evaluate_model_fallback(
     })
 }
 
+pub async fn suggest_conversation_title(
+    input: &ControlInput,
+    model: Option<Arc<dyn ModelClient>>,
+) -> Option<String> {
+    if let Some(model) = model {
+        if let Some(title) = suggest_conversation_title_by_model(input, model).await {
+            return Some(title);
+        }
+    }
+    suggest_conversation_title_by_rules(input)
+}
+
 pub fn assemble_developer_instructions(
     config: &AgentRuntimeConfig,
     patch: Option<&RuntimeConfigPatch>,
@@ -198,6 +216,127 @@ pub fn assemble_developer_instructions(
         "{}\n\n[Runtime control context]\n- MCP enabled: {}\n- Skills enabled: {}\n- Follow approved runtime changes only.\n- Never assume unapproved config mutations are active.",
         active_system_prompt, mcp_enabled, skills_enabled
     )
+}
+
+async fn suggest_conversation_title_by_model(
+    input: &ControlInput,
+    model: Arc<dyn ModelClient>,
+) -> Option<String> {
+    let user_prompt = format!(
+        "Generate a concise conversation title (max 36 chars, plain text, no quotes).\n\ncurrent_input:\n{}\n\nrecent_messages:\n{}",
+        input.user_input,
+        serde_json::to_string_pretty(&input.recent_messages).ok()?
+    );
+
+    let messages = vec![
+        Message::system(
+            "You generate conversation titles. Return JSON only: {\"title\":\"...\"}.",
+        ),
+        Message::user(user_prompt),
+    ];
+
+    let response = model.chat(messages, Vec::new()).await.ok()?;
+    let parsed = parse_title_suggestion_response(&response.content)?;
+    normalize_title(Some(parsed))
+}
+
+fn suggest_conversation_title_by_rules(input: &ControlInput) -> Option<String> {
+    let merged = if input.recent_messages.is_empty() {
+        input.user_input.clone()
+    } else {
+        let mut parts = input
+            .recent_messages
+            .iter()
+            .rev()
+            .take(2)
+            .map(|m| m.content.trim())
+            .filter(|text| !text.is_empty())
+            .map(|text| text.to_string())
+            .collect::<Vec<_>>();
+        parts.reverse();
+        parts.push(input.user_input.clone());
+        parts.join(" ")
+    };
+
+    normalize_title(Some(heuristic_title_from_text(&merged)))
+}
+
+fn heuristic_title_from_text(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if let Some(command) = trimmed.strip_prefix('/') {
+        let compact = command.split_whitespace().collect::<Vec<_>>().join(" ");
+        return format!("Command: {}", compact);
+    }
+
+    let without_code_fence = trimmed.replace("```", " ");
+    let without_lines = without_code_fence
+        .lines()
+        .take(4)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let compact = without_lines.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    let sentence = compact
+        .split(|c| ['。', '.', '!', '?', ';', '；', '！', '？'].contains(&c))
+        .map(str::trim)
+        .find(|item| !item.is_empty())
+        .unwrap_or_default();
+
+    if sentence.is_empty() {
+        compact
+    } else {
+        sentence.to_string()
+    }
+}
+
+fn normalize_title(title: Option<String>) -> Option<String> {
+    let raw = title?;
+    let cleaned = raw
+        .replace(['\n', '\r', '\t'], " ")
+        .replace(['`', '"', '\'', '#'], "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let trimmed = cleaned.trim_matches(|c: char| c == '-' || c == ':' || c.is_whitespace());
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut out = String::new();
+    for ch in trimmed.chars().take(36) {
+        out.push(ch);
+    }
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn parse_title_suggestion_response(content: &str) -> Option<String> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(value) = serde_json::from_str::<TitleSuggestionResponse>(trimmed) {
+        return value.title;
+    }
+
+    if let Some(extracted) = extract_first_json_object(trimmed) {
+        if let Ok(value) = serde_json::from_str::<TitleSuggestionResponse>(&extracted) {
+            if value.title.is_some() {
+                return value.title;
+            }
+        }
+    }
+
+    trimmed.lines().next().map(|line| line.trim().to_string())
 }
 
 fn parse_model_fallback_response(content: &str) -> Option<ModelFallbackResponse> {
@@ -286,9 +425,15 @@ fn parse_system_prompt_override(raw: &str) -> Option<String> {
 }
 
 fn is_enable_mcp_intent(text: &str) -> bool {
-    ["enable mcp", "turn on mcp", "开启mcp", "启用mcp", "打开mcp"]
-        .iter()
-        .any(|pattern| text.contains(pattern))
+    [
+        "enable mcp",
+        "turn on mcp",
+        "开启mcp",
+        "启用mcp",
+        "打开mcp",
+    ]
+    .iter()
+    .any(|pattern| text.contains(pattern))
 }
 
 fn is_disable_mcp_intent(text: &str) -> bool {
@@ -412,5 +557,25 @@ mod tests {
         let parsed = parse_model_fallback_response(raw);
         assert!(parsed.is_some());
         assert_eq!(parsed.unwrap_or_default().summary.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn suggest_conversation_title_by_rules_returns_title() {
+        let input = ControlInput {
+            user_input: "请帮我分析 Rust MCP 客户端连接超时问题".to_string(),
+            recent_messages: Vec::new(),
+            effective_config: make_config(),
+        };
+
+        let title = suggest_conversation_title_by_rules(&input);
+        assert!(title.is_some());
+        assert!(!title.unwrap_or_default().is_empty());
+    }
+
+    #[test]
+    fn normalize_title_limits_length() {
+        let title = normalize_title(Some("x".repeat(100)));
+        assert!(title.is_some());
+        assert!(title.unwrap_or_default().chars().count() <= 36);
     }
 }

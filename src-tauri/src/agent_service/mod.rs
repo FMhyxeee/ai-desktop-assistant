@@ -167,6 +167,16 @@ impl AgentService {
             .await;
         let history_window_turns = effective_config.control.history_window_turns.max(1);
         let recent_history = trim_recent_history(&input.recent_messages, history_window_turns);
+        let control_input = ControlInput {
+            user_input: input.content.clone(),
+            recent_messages: recent_history.clone(),
+            effective_config: effective_config.clone(),
+        };
+        let control_fallback_model = if effective_config.control.model_fallback_enabled {
+            build_control_fallback_model_client(&effective_config).ok()
+        } else {
+            None
+        };
 
         let mut seq = 0_u64;
         let baseline_governance = governance::scan_runtime_governance(&effective_config).await;
@@ -179,56 +189,62 @@ impl AgentService {
             },
         });
 
+        if let Some(conversation_id_value) = conversation_id.as_ref() {
+            if let Some(title) =
+                control::suggest_conversation_title(&control_input, control_fallback_model.clone())
+                    .await
+            {
+                seq += 1;
+                emit(AgentEvent::ProtocolEvent {
+                    task_id: task_id.clone(),
+                    seq,
+                    payload: ProtocolEventPayload::ConversationTitleSuggestion {
+                        conversation_id: conversation_id_value.clone(),
+                        title,
+                    },
+                });
+            }
+        }
+
         let mut prompt_directives: Option<PromptDirectives> = None;
 
         if effective_config.control.enabled {
-            let control_input = ControlInput {
-                user_input: input.content.clone(),
-                recent_messages: recent_history.clone(),
-                effective_config: effective_config.clone(),
-            };
             let mut control_decision = control::evaluate_rules(&control_input);
 
             if control_decision.patch.is_none()
                 && effective_config.control.model_fallback_enabled
                 && control::should_try_model_fallback(&input.content)
             {
-                match build_control_fallback_model_client(&effective_config) {
-                    Ok(fallback_model) => {
-                        if let Some(fallback_decision) =
-                            control::evaluate_model_fallback(&control_input, fallback_model).await
+                if let Some(fallback_model) = control_fallback_model.clone() {
+                    if let Some(fallback_decision) =
+                        control::evaluate_model_fallback(&control_input, fallback_model).await
+                    {
+                        if fallback_decision.patch.is_some() && fallback_decision.confidence >= 0.7
                         {
-                            if fallback_decision.patch.is_some()
-                                && fallback_decision.confidence >= 0.7
-                            {
-                                control_decision = fallback_decision;
-                            } else if control_decision.patch.is_none() {
-                                control_decision.source = fallback_decision.source;
-                                control_decision.confidence = fallback_decision.confidence;
-                                control_decision.summary = format!(
-                                    "model fallback inspected intent but did not produce an actionable patch (confidence={:.2})",
-                                    fallback_decision.confidence
-                                );
-                                if fallback_decision.developer_instructions.is_some() {
-                                    control_decision.developer_instructions =
-                                        fallback_decision.developer_instructions;
-                                }
+                            control_decision = fallback_decision;
+                        } else if control_decision.patch.is_none() {
+                            control_decision.source = fallback_decision.source;
+                            control_decision.confidence = fallback_decision.confidence;
+                            control_decision.summary = format!(
+                                "model fallback inspected intent but did not produce an actionable patch (confidence={:.2})",
+                                fallback_decision.confidence
+                            );
+                            if fallback_decision.developer_instructions.is_some() {
+                                control_decision.developer_instructions =
+                                    fallback_decision.developer_instructions;
                             }
                         }
                     }
-                    Err(err) => {
-                        seq += 1;
-                        emit(AgentEvent::ProtocolEvent {
-                            task_id: task_id.clone(),
-                            seq,
-                            payload: ProtocolEventPayload::Warning {
-                                message: format!(
-                                    "control model fallback skipped because model init failed: {}",
-                                    err
-                                ),
-                            },
-                        });
-                    }
+                } else {
+                    seq += 1;
+                    emit(AgentEvent::ProtocolEvent {
+                        task_id: task_id.clone(),
+                        seq,
+                        payload: ProtocolEventPayload::Warning {
+                            message: "control model fallback skipped because model init failed"
+                                .to_string(),
+                        },
+                    });
                 }
             }
 
