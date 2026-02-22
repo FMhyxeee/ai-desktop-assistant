@@ -1,4 +1,4 @@
-﻿import { v4 as uuidv4 } from 'uuid';
+import { v4 as uuidv4 } from 'uuid';
 import { create } from 'zustand';
 import { createDefaultConfig, normalizeStoredConfig } from '../config/providers';
 import { logger } from '../lib/logger';
@@ -740,7 +740,7 @@ export const useAppStore = create<AppState>((set, get) => ({
               }
               return {
                 ...item,
-                content: `璇锋眰澶辫触: ${message}`,
+                content: `请求失败: ${message}`,
                 isStreaming: false,
               };
             }),
@@ -779,7 +779,7 @@ export const useAppStore = create<AppState>((set, get) => ({
               }
               return {
                 ...item,
-                content: '[宸插彇娑圿',
+                content: '[已取消]',
                 isStreaming: false,
               };
             }),
@@ -1027,7 +1027,3 @@ useAppStore.subscribe((state) => {
     delayMs
   );
 });
-
-
-
-

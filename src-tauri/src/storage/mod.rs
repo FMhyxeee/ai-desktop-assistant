@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::ffi::OsStr;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Once};
 
 use aes_gcm::aead::{Aead, KeyInit};
@@ -400,19 +401,21 @@ impl StorageService {
         workspace_root: &Path,
         conversation_id: &str,
     ) -> Result<(), StorageError> {
+        let safe_conversation_id =
+            validate_storage_path_segment(conversation_id, "conversation id")?;
         let conn = open_workspace_connection(workspace_root)?;
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM conversations WHERE id = ?1",
-            params![conversation_id],
+            params![safe_conversation_id.as_str()],
         )?;
         if get_workspace_state_with_tx(&tx, CURRENT_CONVERSATION_STATE_KEY)?.as_deref()
-            == Some(conversation_id)
+            == Some(safe_conversation_id.as_str())
         {
             set_workspace_state_with_tx(&tx, CURRENT_CONVERSATION_STATE_KEY, None)?;
         }
         tx.commit()?;
-        let assets = conversation_assets_dir(workspace_root, conversation_id);
+        let assets = conversation_assets_dir(workspace_root, &safe_conversation_id);
         if assets.exists() {
             let _ = fs::remove_dir_all(assets);
         }
@@ -438,9 +441,14 @@ impl StorageService {
         workspace_root: &Path,
         conversation_id: &str,
     ) -> Result<ConversationSnapshot, StorageError> {
+        let safe_conversation_id =
+            validate_storage_path_segment(conversation_id, "conversation id")?;
         let conn = open_workspace_connection(workspace_root)?;
-        load_single_conversation(&conn, workspace_root, conversation_id)?.ok_or_else(|| {
-            StorageError::NotFound(format!("conversation '{}' not found", conversation_id))
+        load_single_conversation(&conn, workspace_root, &safe_conversation_id)?.ok_or_else(|| {
+            StorageError::NotFound(format!(
+                "conversation '{}' not found",
+                safe_conversation_id
+            ))
         })
     }
 
@@ -526,11 +534,97 @@ fn global_memory_database_path() -> PathBuf {
 }
 
 fn conversation_assets_dir(workspace_root: &Path, conversation_id: &str) -> PathBuf {
+    conversation_assets_root_dir(workspace_root).join(conversation_id)
+}
+
+fn conversation_assets_root_dir(workspace_root: &Path) -> PathBuf {
     workspace_root
         .join(".ah")
         .join("assets")
         .join("conversations")
-        .join(conversation_id)
+}
+
+fn validate_storage_path_segment(value: &str, field_name: &str) -> Result<String, StorageError> {
+    if value.trim().is_empty() {
+        return Err(StorageError::InvalidInput(format!(
+            "{field_name} is empty"
+        )));
+    }
+    if value != value.trim() {
+        return Err(StorageError::InvalidInput(format!(
+            "{field_name} has surrounding whitespace"
+        )));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(StorageError::InvalidInput(format!(
+            "{field_name} contains control characters"
+        )));
+    }
+    if value
+        .chars()
+        .any(|ch| matches!(ch, ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+    {
+        return Err(StorageError::InvalidInput(format!(
+            "{field_name} contains unsupported characters"
+        )));
+    }
+
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return Err(StorageError::InvalidInput(format!(
+            "{field_name} must be a single relative path segment"
+        )));
+    }
+
+    let mut components = path.components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(value.to_string()),
+        _ => Err(StorageError::InvalidInput(format!(
+            "{field_name} must be a single relative path segment"
+        ))),
+    }
+}
+
+fn resolve_workspace_asset_absolute_path(
+    workspace_root: &Path,
+    asset_path: &str,
+) -> Result<PathBuf, StorageError> {
+    let trimmed = asset_path.trim();
+    if trimmed.is_empty() {
+        return Err(StorageError::InvalidInput("asset path is empty".to_string()));
+    }
+
+    let relative = Path::new(trimmed);
+    if relative.is_absolute() {
+        return Err(StorageError::InvalidInput(format!(
+            "asset path '{}' must be relative",
+            asset_path
+        )));
+    }
+
+    let mut components = relative.components();
+    for expected in [".ah", "assets", "conversations"] {
+        match components.next() {
+            Some(Component::Normal(segment)) if segment == OsStr::new(expected) => {}
+            _ => {
+                return Err(StorageError::InvalidInput(format!(
+                    "asset path '{}' is outside workspace assets root",
+                    asset_path
+                )));
+            }
+        }
+    }
+
+    for component in components {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(StorageError::InvalidInput(format!(
+                "asset path '{}' is outside workspace assets root",
+                asset_path
+            )));
+        }
+    }
+
+    Ok(workspace_root.join(relative))
 }
 
 fn open_workspace_connection(workspace_root: &Path) -> Result<Connection, StorageError> {
@@ -745,6 +839,7 @@ fn upsert_conversation_snapshot_with_tx(
     workspace_root: &Path,
     snapshot: &ConversationSnapshot,
 ) -> Result<(), StorageError> {
+    let safe_conversation_id = validate_storage_path_segment(&snapshot.id, "conversation id")?;
     tx.execute(
         "INSERT INTO conversations(id, title, pinned, created_at, updated_at)
          VALUES(?1, ?2, ?3, ?4, ?5)
@@ -753,7 +848,7 @@ fn upsert_conversation_snapshot_with_tx(
             pinned = excluded.pinned,
             updated_at = excluded.updated_at",
         params![
-            snapshot.id,
+            safe_conversation_id.as_str(),
             snapshot.title,
             bool_to_i64(snapshot.pinned),
             snapshot.created_at,
@@ -763,35 +858,36 @@ fn upsert_conversation_snapshot_with_tx(
 
     tx.execute(
         "DELETE FROM protocol_cards WHERE conversation_id = ?1",
-        params![snapshot.id],
+        params![safe_conversation_id.as_str()],
     )?;
     tx.execute(
         "DELETE FROM messages WHERE conversation_id = ?1",
-        params![snapshot.id],
+        params![safe_conversation_id.as_str()],
     )?;
     tx.execute(
         "DELETE FROM memory_index_jobs
          WHERE chunk_id IN (SELECT id FROM memory_chunks WHERE conversation_id = ?1)",
-        params![snapshot.id],
+        params![safe_conversation_id.as_str()],
     )?;
     tx.execute(
         "DELETE FROM memory_chunks WHERE conversation_id = ?1",
-        params![snapshot.id],
+        params![safe_conversation_id.as_str()],
     )?;
 
-    let assets = conversation_assets_dir(workspace_root, &snapshot.id);
+    let assets = conversation_assets_dir(workspace_root, &safe_conversation_id);
     if assets.exists() {
         let _ = fs::remove_dir_all(&assets);
     }
     fs::create_dir_all(&assets).map_err(|err| StorageError::Io(err.to_string()))?;
 
     for message in &snapshot.messages {
+        let safe_message_id = validate_storage_path_segment(&message.id, "message id")?;
         tx.execute(
             "INSERT INTO messages(id, conversation_id, role, content, timestamp, is_streaming)
              VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                message.id,
-                snapshot.id,
+                safe_message_id.as_str(),
+                safe_conversation_id.as_str(),
                 message.role,
                 message.content,
                 message.timestamp,
@@ -800,14 +896,15 @@ fn upsert_conversation_snapshot_with_tx(
         )?;
 
         for image in &message.images {
+            let safe_image_id = validate_storage_path_segment(&image.id, "image id")?;
             let (mime_type, bytes) = decode_data_url(&image.data_url)?;
             let ext = file_extension_from_mime(&mime_type);
             let relative = PathBuf::from(".ah")
                 .join("assets")
                 .join("conversations")
-                .join(&snapshot.id)
-                .join(&message.id)
-                .join(format!("{}.{}", image.id, ext));
+                .join(&safe_conversation_id)
+                .join(&safe_message_id)
+                .join(format!("{}.{}", safe_image_id, ext));
             let absolute = workspace_root.join(&relative);
             if let Some(parent) = absolute.parent() {
                 fs::create_dir_all(parent).map_err(|err| StorageError::Io(err.to_string()))?;
@@ -817,9 +914,9 @@ fn upsert_conversation_snapshot_with_tx(
                 "INSERT INTO message_images(id, message_id, conversation_id, name, mime_type, size_bytes, asset_path, sha256)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
-                    image.id,
-                    message.id,
-                    snapshot.id,
+                    safe_image_id.as_str(),
+                    safe_message_id.as_str(),
+                    safe_conversation_id.as_str(),
                     image.name,
                     mime_type,
                     image.size_bytes as i64,
@@ -835,8 +932,8 @@ fn upsert_conversation_snapshot_with_tx(
                 "INSERT INTO memory_chunks(conversation_id, message_id, chunk_text, content_hash, created_at, updated_at, status)
                  VALUES(?1, ?2, ?3, ?4, ?5, ?6, 'pending')",
                 params![
-                    snapshot.id,
-                    message.id,
+                    safe_conversation_id.as_str(),
+                    safe_message_id.as_str(),
                     chunk_text,
                     hex_sha256(chunk_text.as_bytes()),
                     message.timestamp,
@@ -860,7 +957,7 @@ fn upsert_conversation_snapshot_with_tx(
              ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 card.id,
-                snapshot.id,
+                safe_conversation_id.as_str(),
                 card.task_id,
                 card.seq,
                 card.direction,
@@ -983,7 +1080,19 @@ fn load_message_images(
     let mut items = Vec::new();
     while let Some(row) = rows.next()? {
         let asset_path: String = row.get(4)?;
-        let absolute = workspace_root.join(asset_path);
+        let absolute = match resolve_workspace_asset_absolute_path(workspace_root, &asset_path) {
+            Ok(path) => path,
+            Err(err) => {
+                log::warn!(
+                    "skip invalid message asset path | conversation_id={} message_id={} asset_path={} reason={}",
+                    conversation_id,
+                    message_id,
+                    asset_path,
+                    err
+                );
+                continue;
+            }
+        };
         let data_url = if absolute.exists() {
             let bytes = fs::read(absolute).map_err(|err| StorageError::Io(err.to_string()))?;
             format!(
@@ -2006,6 +2115,75 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn validate_storage_path_segment_rejects_unsafe_inputs() {
+        assert!(validate_storage_path_segment("conv-1", "conversation id").is_ok());
+        assert!(validate_storage_path_segment("../conv", "conversation id").is_err());
+        assert!(validate_storage_path_segment("a/b", "conversation id").is_err());
+        assert!(validate_storage_path_segment(" a ", "conversation id").is_err());
+        assert!(validate_storage_path_segment("C:\\tmp", "conversation id").is_err());
+    }
+
+    #[test]
+    fn resolve_workspace_asset_absolute_path_rejects_unsafe_inputs() {
+        let workspace = TempWorkspace::new("asset-path-guard");
+
+        let valid_relative = ".ah/assets/conversations/conv-1/msg-1/img-1.png";
+        let resolved =
+            resolve_workspace_asset_absolute_path(&workspace.root, valid_relative).expect("valid path should resolve");
+        assert_eq!(resolved, workspace.root.join(valid_relative));
+
+        assert!(
+            resolve_workspace_asset_absolute_path(
+                &workspace.root,
+                ".ah/assets/conversations/../outside.png"
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_workspace_asset_absolute_path(&workspace.root, "assets/conversations/a.png")
+                .is_err()
+        );
+        assert!(
+            resolve_workspace_asset_absolute_path(&workspace.root, "../outside.png").is_err()
+        );
+        assert!(
+            resolve_workspace_asset_absolute_path(
+                &workspace.root,
+                &workspace
+                    .root
+                    .join("outside.png")
+                    .to_string_lossy()
+                    .to_string()
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_conversation_rejects_unsafe_conversation_id() {
+        let service = mock_service();
+        let workspace = TempWorkspace::new("delete-conversation-path-guard");
+
+        let err = service
+            .delete_conversation(&workspace.root, "../outside")
+            .await
+            .expect_err("unsafe conversation id should be rejected");
+        assert!(matches!(err, StorageError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn upsert_conversation_rejects_unsafe_conversation_id() {
+        let service = mock_service();
+        let workspace = TempWorkspace::new("upsert-conversation-path-guard");
+
+        let err = service
+            .upsert_conversation(&workspace.root, sample_conversation("../outside"))
+            .await
+            .expect_err("unsafe conversation id should be rejected");
+        assert!(matches!(err, StorageError::InvalidInput(_)));
     }
 
     #[tokio::test]

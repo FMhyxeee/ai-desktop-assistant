@@ -154,12 +154,21 @@ async fn cancel_agent_task(
 #[tauri::command]
 async fn update_runtime_config(
     state: tauri::State<'_, AppState>,
-    config: AgentRuntimeConfig,
+    config: serde_json::Value,
 ) -> Result<GovernanceUpdateReport, String> {
     let previous_service = { state.agent_service.lock().await.clone() };
     let before = previous_service.run_governance_scan(None).await.ok();
+    let previous_runtime_config = previous_service.current_runtime_config();
 
-    let service = AgentService::new_with_config(config)
+    let parsed_config = serde_json::from_value::<AgentRuntimeConfig>(config.clone())
+        .map_err(|err| format!("invalid runtime config payload: {err}"))?;
+    let merged_config = merge_runtime_config_with_previous(
+        &config,
+        parsed_config,
+        previous_runtime_config.as_ref(),
+    );
+
+    let service = AgentService::new_with_config(merged_config)
         .await
         .map_err(|err| err.to_string())?;
     let after = service
@@ -170,6 +179,25 @@ async fn update_runtime_config(
     *guard = service;
 
     Ok(GovernanceUpdateReport { before, after })
+}
+
+fn merge_runtime_config_with_previous(
+    raw_config: &serde_json::Value,
+    mut incoming: AgentRuntimeConfig,
+    previous: Option<&AgentRuntimeConfig>,
+) -> AgentRuntimeConfig {
+    let Some(previous) = previous else {
+        return incoming;
+    };
+
+    if raw_config.get("memory").is_none() {
+        incoming.memory = previous.memory.clone();
+    }
+    if raw_config.get("control").is_none() {
+        incoming.control = previous.control.clone();
+    }
+
+    incoming
 }
 
 #[tauri::command]
@@ -374,6 +402,55 @@ fn summarize_text(input: &str, max_chars: usize) -> String {
         "(空响应)".to_string()
     } else {
         buf
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_runtime_config_with_previous_preserves_missing_memory_and_control() {
+        let mut previous = AgentRuntimeConfig::default();
+        previous.memory.enabled = false;
+        previous.control.enabled = false;
+
+        let mut raw = serde_json::to_value(AgentRuntimeConfig::default())
+            .expect("default config should serialize");
+        let object = raw
+            .as_object_mut()
+            .expect("serialized config should be json object");
+        object.remove("memory");
+        object.remove("control");
+
+        let incoming: AgentRuntimeConfig =
+            serde_json::from_value(raw.clone()).expect("payload should deserialize");
+        let merged = merge_runtime_config_with_previous(&raw, incoming, Some(&previous));
+
+        assert!(!merged.memory.enabled);
+        assert!(!merged.control.enabled);
+    }
+
+    #[test]
+    fn merge_runtime_config_with_previous_keeps_explicit_memory_and_control() {
+        let mut previous = AgentRuntimeConfig::default();
+        previous.memory.enabled = false;
+        previous.control.enabled = false;
+
+        let mut incoming_config = AgentRuntimeConfig::default();
+        incoming_config.memory.enabled = true;
+        incoming_config.control.enabled = true;
+
+        let raw =
+            serde_json::to_value(&incoming_config).expect("incoming config should serialize");
+        let merged = merge_runtime_config_with_previous(
+            &raw,
+            incoming_config.clone(),
+            Some(&previous),
+        );
+
+        assert!(merged.memory.enabled);
+        assert!(merged.control.enabled);
     }
 }
 

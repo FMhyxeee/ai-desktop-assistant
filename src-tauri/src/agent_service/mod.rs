@@ -911,6 +911,10 @@ impl AgentService {
         WorkspaceContext::resolve(&WorkspaceRuntimeConfig::default()).root_dir
     }
 
+    pub fn current_runtime_config(&self) -> Option<AgentRuntimeConfig> {
+        self.runtime_config.clone()
+    }
+
     pub fn current_memory_config(&self) -> MemoryRuntimeConfig {
         self.runtime_config
             .as_ref()
