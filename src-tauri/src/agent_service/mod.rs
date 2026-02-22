@@ -1876,6 +1876,22 @@ fn build_stage2_guidance_context(
         workspace_context.image_recognition_dir.display(),
         workspace_context.screenshots_dir.display()
     ));
+    if guidance_focus_needs_image_hints(focus) {
+        let image_hints = collect_recent_image_path_hints(workspace_context, 4);
+        if image_hints.is_empty() {
+            lines.push(
+                "- Recent local image files: none detected under .ah/image-recognition or .ah/screenshots."
+                    .to_string(),
+            );
+        } else {
+            lines.push(
+                "- Recent local image files (prefer using one exact absolute path):".to_string(),
+            );
+            for hint in image_hints {
+                lines.push(format!("  - {}", hint));
+            }
+        }
+    }
 
     if !focus.signals.is_empty() {
         lines.push(format!(
@@ -2029,6 +2045,60 @@ fn format_guidance_name_list(items: &[String], limit: usize) -> String {
         preview.push(format!("+{} more", items.len() - limit));
     }
     preview.join(", ")
+}
+
+fn guidance_focus_needs_image_hints(focus: &Stage2GuidanceFocus) -> bool {
+    focus.signals.contains("image_intent")
+}
+
+fn collect_recent_image_path_hints(
+    workspace_context: &WorkspaceContext,
+    limit: usize,
+) -> Vec<String> {
+    let mut candidates = Vec::<(u128, PathBuf)>::new();
+    collect_recent_image_files_from_dir(&workspace_context.image_recognition_dir, &mut candidates);
+    collect_recent_image_files_from_dir(&workspace_context.screenshots_dir, &mut candidates);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    candidates.dedup_by(|left, right| left.1 == right.1);
+    candidates
+        .into_iter()
+        .take(limit)
+        .map(|(_, path)| absolute_path(&path).to_string_lossy().to_string())
+        .collect()
+}
+
+fn collect_recent_image_files_from_dir(root_dir: &Path, out: &mut Vec<(u128, PathBuf)>) {
+    if !root_dir.exists() {
+        return;
+    }
+
+    let mut stack = vec![root_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.is_file() || !has_image_extension(&path) {
+                continue;
+            }
+            let modified_millis = std::fs::metadata(&path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_millis())
+                .unwrap_or_default();
+            out.push((modified_millis, path));
+        }
+    }
 }
 
 fn build_guidance_tool_argument_template_lines(
@@ -3059,6 +3129,7 @@ fn resolve_unique_image_path(
     gateway: &McpPathGatewayContext,
 ) -> Result<PathBuf, String> {
     let mut candidates = Vec::<PathBuf>::new();
+    let mut exact_candidates = Vec::<PathBuf>::new();
     let normalized = raw_value.trim().to_ascii_lowercase();
     let normalized_stem = Path::new(raw_value.trim())
         .file_stem()
@@ -3066,6 +3137,30 @@ fn resolve_unique_image_path(
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
+
+    for dir in [&gateway.image_recognition_dir, &gateway.screenshots_dir] {
+        collect_exact_image_paths(dir, &normalized, &mut exact_candidates).map_err(|err| {
+            format!(
+                "failed to search exact image path in '{}': {}",
+                dir.display(),
+                err
+            )
+        })?;
+    }
+
+    exact_candidates.sort();
+    exact_candidates.dedup();
+    match exact_candidates.len() {
+        1 => return Ok(exact_candidates[0].clone()),
+        0 => {}
+        _ => {
+            return Err(format!(
+                "image '{}' is ambiguous: {} exact matches found",
+                raw_value,
+                exact_candidates.len()
+            ));
+        }
+    }
 
     for dir in [&gateway.image_recognition_dir, &gateway.screenshots_dir] {
         collect_matching_image_paths(dir, &normalized, &normalized_stem, &mut candidates).map_err(
@@ -3114,6 +3209,40 @@ fn resolve_unique_image_path(
             candidates.len()
         )),
     }
+}
+
+fn collect_exact_image_paths(
+    root_dir: &Path,
+    normalized_raw: &str,
+    out: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
+    if !root_dir.exists() || normalized_raw.is_empty() {
+        return Ok(());
+    }
+
+    let mut stack = vec![root_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry_result in std::fs::read_dir(&dir)? {
+            let entry = entry_result?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.is_file() || !has_image_extension(&path) {
+                continue;
+            }
+
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if file_name.to_ascii_lowercase() == normalized_raw {
+                out.push(absolute_path(&path));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn is_generic_image_reference(raw_value: &str) -> bool {
@@ -4131,7 +4260,60 @@ fn persist_image_for_recognition(
     let path = directory.join(filename);
     std::fs::write(&path, image_bytes)
         .map_err(|err| format!("failed to write image fallback file: {}", err))?;
+    persist_image_alias_for_lookup(image, directory, extension.as_str(), &path);
     Ok(path)
+}
+
+fn persist_image_alias_for_lookup(
+    image: &AgentInputImage,
+    directory: &Path,
+    extension: &str,
+    primary_path: &Path,
+) {
+    let alias_name = sanitize_image_alias_filename(&image.name, extension);
+    let alias_path = directory.join(alias_name);
+    if absolute_path(&alias_path) == absolute_path(primary_path) {
+        return;
+    }
+
+    if let Err(err) = std::fs::copy(primary_path, &alias_path) {
+        log::warn!(
+            "failed to persist image alias for lookup | source={} alias={} error={}",
+            primary_path.display(),
+            alias_path.display(),
+            err
+        );
+    }
+}
+
+fn sanitize_image_alias_filename(name: &str, default_extension: &str) -> String {
+    let raw_file_name = Path::new(name)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("image");
+    let sanitized = raw_file_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('.')
+        .trim_matches('_')
+        .to_string();
+
+    let mut file_name = if sanitized.is_empty() {
+        "image".to_string()
+    } else {
+        sanitized
+    };
+    if extension_from_filename(&file_name).is_none() {
+        file_name = format!("{}.{}", file_name.trim_end_matches('.'), default_extension);
+    }
+    file_name
 }
 
 fn sanitize_image_file_stem(name: &str) -> String {
@@ -4854,6 +5036,41 @@ mod tests {
         let err =
             normalize_mcp_tool_args(&contract, args, &ctx).expect_err("normalization should fail");
         assert!(err.to_string().contains("ambiguous"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn normalize_mcp_tool_args_prefers_exact_filename_match_over_stem_candidates() {
+        let workspace = unique_temp_dir("mcp-path-gateway-image-exact-priority");
+        let image_dir = workspace.join(".ah").join("image-recognition");
+        fs::create_dir_all(&image_dir).expect("should create image-recognition dir");
+        let exact = image_dir.join("image.png");
+        let stem_match = image_dir.join("image-1735819700000-abc.png");
+        fs::write(&exact, "img").expect("should write exact image");
+        fs::write(&stem_match, "img").expect("should write stem image");
+
+        let contract = McpToolContract::compile(
+            "zai-mcp-server",
+            "analyze_image",
+            &serde_json::json!({
+                "type": "object",
+                "properties": { "image_source": { "type": "string" } }
+            }),
+        );
+        let ctx = tool_context_for_workspace(&workspace);
+        let args = serde_json::json!({ "image_source": "image.png" })
+            .as_object()
+            .cloned()
+            .expect("args should be object");
+
+        let normalized =
+            normalize_mcp_tool_args(&contract, args, &ctx).expect("normalization should succeed");
+        let expected = absolute_path(&exact).to_string_lossy().to_string();
+        assert_eq!(
+            normalized.get("image_source").and_then(Value::as_str),
+            Some(expected.as_str())
+        );
 
         let _ = fs::remove_dir_all(workspace);
     }
@@ -5585,6 +5802,47 @@ mod tests {
     }
 
     #[test]
+    fn build_stage2_guidance_context_includes_recent_image_hints_for_image_intent() {
+        let root = unique_temp_dir("guidance-image-hints");
+        let workspace_context = WorkspaceContext::from_root(root.clone());
+        workspace_context
+            .ensure_layout()
+            .expect("workspace layout should exist");
+        let sample = workspace_context.image_recognition_dir.join("image.png");
+        fs::write(&sample, "img").expect("should create image sample");
+
+        let runtime_resources = RuntimeResources {
+            mcp_manager: None,
+            tool_executor: None,
+            skill_config: SkillConfig {
+                enabled: false,
+                personal_dir: None,
+                project_dirs: Vec::new(),
+                auto_apply: false,
+            },
+            mcp_tool_contracts: Vec::new(),
+        };
+        let snapshot = Stage2GuidanceSnapshot {
+            mcp_servers: Vec::new(),
+            skills: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let mut focus = Stage2GuidanceFocus::default();
+        focus.signals.insert("image_intent".to_string());
+
+        let guidance = build_stage2_guidance_context(
+            &workspace_context,
+            &runtime_resources,
+            &snapshot,
+            &focus,
+        );
+        assert!(guidance.contains("Recent local image files"));
+        assert!(guidance.contains(sample.to_string_lossy().as_ref()));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn merge_prompt_directives_with_guidance_appends_context() {
         let config = AgentRuntimeConfig::default();
         let directives = Some(PromptDirectives {
@@ -5632,6 +5890,25 @@ mod tests {
             persist_image_for_recognition(&image, &image_dir).expect("image should be persisted");
         assert!(saved.starts_with(&image_dir));
         assert!(saved.exists());
+
+        let _ = fs::remove_dir_all(image_dir);
+    }
+
+    #[test]
+    fn persist_image_for_recognition_creates_lookup_alias_filename() {
+        let image_dir = unique_temp_dir("workspace-image-alias");
+        fs::create_dir_all(&image_dir).expect("should create image dir");
+        let image = AgentInputImage {
+            name: "image.png".to_string(),
+            mime_type: "image/png".to_string(),
+            data_url: "data:image/png;base64,AAAA".to_string(),
+            size_bytes: 4,
+        };
+
+        let saved =
+            persist_image_for_recognition(&image, &image_dir).expect("image should be persisted");
+        assert!(saved.exists());
+        assert!(image_dir.join("image.png").exists());
 
         let _ = fs::remove_dir_all(image_dir);
     }
