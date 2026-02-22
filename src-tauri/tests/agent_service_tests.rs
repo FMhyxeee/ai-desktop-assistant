@@ -214,6 +214,7 @@ async fn startup_stream_emits_governance_protocol_event() {
         workspace: WorkspaceRuntimeConfig::default(),
         mcp: McpRuntimeConfig::default(),
         skills: SkillsRuntimeConfig::default(),
+        memory: Default::default(),
         control: Default::default(),
     };
     config.mcp.enabled = false;
@@ -249,6 +250,121 @@ async fn startup_stream_emits_governance_protocol_event() {
 }
 
 #[tokio::test]
+async fn stream_emits_guidance_context_and_governance() {
+    let mut config = AgentRuntimeConfig {
+        provider: AgentProvider::Local,
+        model: "qwen2.5-coder:7b".to_string(),
+        model_supports_image_input: true,
+        api_key_env: "LOCAL_API_KEY".to_string(),
+        api_key: None,
+        base_url: None,
+        max_tokens: None,
+        system_prompt: "local prompt".to_string(),
+        workspace: WorkspaceRuntimeConfig::default(),
+        mcp: McpRuntimeConfig::default(),
+        skills: SkillsRuntimeConfig::default(),
+        memory: Default::default(),
+        control: Default::default(),
+    };
+    config.mcp.enabled = false;
+
+    let service = AgentService::new_with_config(config).await.unwrap();
+    let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_ref = Arc::clone(&events);
+
+    service
+        .chat_stream(
+            "guidance-task".to_string(),
+            AgentStreamInput::text("/echo hello"),
+            move |event| {
+                events_ref.lock().unwrap().push(event);
+            },
+        )
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let events = events.lock().unwrap();
+    let has_governance_report = events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::ProtocolEvent {
+                payload: ProtocolEventPayload::GovernanceReport { .. },
+                ..
+            }
+        )
+    });
+    let has_guidance_context = events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::ProtocolEvent {
+                payload: ProtocolEventPayload::GuidanceContext { .. },
+                ..
+            }
+        )
+    });
+    assert!(has_governance_report);
+    assert!(has_guidance_context);
+}
+
+#[tokio::test]
+async fn warning_compat_still_present_with_guidance_context() {
+    let mut config = AgentRuntimeConfig {
+        provider: AgentProvider::Local,
+        model: "qwen2.5-coder:7b".to_string(),
+        model_supports_image_input: true,
+        api_key_env: "LOCAL_API_KEY".to_string(),
+        api_key: None,
+        base_url: None,
+        max_tokens: None,
+        system_prompt: "local prompt".to_string(),
+        workspace: WorkspaceRuntimeConfig::default(),
+        mcp: McpRuntimeConfig::default(),
+        skills: SkillsRuntimeConfig::default(),
+        memory: Default::default(),
+        control: Default::default(),
+    };
+    config.mcp.enabled = false;
+
+    let service = AgentService::new_with_config(config).await.unwrap();
+    let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_ref = Arc::clone(&events);
+
+    service
+        .chat_stream(
+            "guidance-warning-task".to_string(),
+            AgentStreamInput::text("/echo hello"),
+            move |event| {
+                events_ref.lock().unwrap().push(event);
+            },
+        )
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let events = events.lock().unwrap();
+    let warning_messages = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ProtocolEvent {
+                payload: ProtocolEventPayload::Warning { message },
+                ..
+            } => Some(message.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let has_summary_warning = warning_messages
+        .iter()
+        .any(|message| message.contains("Guidance context injected"));
+    let has_audit_warning = warning_messages
+        .iter()
+        .any(|message| message.contains("GuidanceAudit"));
+
+    assert!(has_summary_warning);
+    assert!(has_audit_warning);
+}
+
+#[tokio::test]
 async fn governance_scan_flags_duplicate_mcp_server_names() {
     let mut config = AgentRuntimeConfig {
         provider: AgentProvider::Local,
@@ -262,6 +378,7 @@ async fn governance_scan_flags_duplicate_mcp_server_names() {
         workspace: WorkspaceRuntimeConfig::default(),
         mcp: McpRuntimeConfig::default(),
         skills: SkillsRuntimeConfig::default(),
+        memory: Default::default(),
         control: Default::default(),
     };
     config.mcp.enabled = true;

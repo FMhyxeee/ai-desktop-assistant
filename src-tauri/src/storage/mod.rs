@@ -25,6 +25,40 @@ const EMBEDDING_DIMENSION: usize = 1024;
 const SECRET_KEYCHAIN_SERVICE: &str = "ai-desktop-assistant";
 const SECRET_KEYCHAIN_USERNAME: &str = "memory-master-key";
 const SECRET_ALG: &str = "aes-256-gcm";
+const DEFAULT_RECALL_MAX_ITEMS: usize = 8;
+const DEFAULT_RECALL_MAX_NON_SECRET_ITEMS: usize = 3;
+const DEFAULT_RECALL_MAX_SECRET_ITEMS: usize = 2;
+const DEFAULT_SECRET_SIMILARITY_THRESHOLD: f32 = 0.82;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecallBuildOptions {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_recall_max_items")]
+    pub max_recall_items: usize,
+    #[serde(default = "default_recall_max_non_secret_items")]
+    pub max_non_secret_items: usize,
+    #[serde(default = "default_recall_max_secret_items")]
+    pub max_secret_items: usize,
+    #[serde(default = "default_secret_similarity_threshold")]
+    pub secret_similarity_threshold: f32,
+    #[serde(default = "default_true")]
+    pub require_explicit_secret_intent: bool,
+}
+
+impl Default for RecallBuildOptions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_recall_items: DEFAULT_RECALL_MAX_ITEMS,
+            max_non_secret_items: DEFAULT_RECALL_MAX_NON_SECRET_ITEMS,
+            max_secret_items: DEFAULT_RECALL_MAX_SECRET_ITEMS,
+            secret_similarity_threshold: DEFAULT_SECRET_SIMILARITY_THRESHOLD,
+            require_explicit_secret_intent: true,
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -448,7 +482,23 @@ impl StorageService {
         workspace_root: &Path,
         query: &str,
     ) -> Result<Option<String>, StorageError> {
-        build_recall_context(self.embedding_client.clone(), workspace_root, query).await
+        self.build_recall_context_with_options(workspace_root, query, RecallBuildOptions::default())
+            .await
+    }
+
+    pub async fn build_recall_context_with_options(
+        &self,
+        workspace_root: &Path,
+        query: &str,
+        options: RecallBuildOptions,
+    ) -> Result<Option<String>, StorageError> {
+        build_recall_context_with_options(
+            self.embedding_client.clone(),
+            workspace_root,
+            query,
+            &options,
+        )
+        .await
     }
 
     pub async fn process_workspace_index_jobs(
@@ -1591,24 +1641,36 @@ fn delete_personal_memory(request: MemoryDeletePersonalRequest) -> Result<(), St
     Ok(())
 }
 
-async fn build_recall_context(
+async fn build_recall_context_with_options(
     embedding_client: Arc<dyn EmbeddingClient>,
     workspace_root: &Path,
     query: &str,
+    options: &RecallBuildOptions,
 ) -> Result<Option<String>, StorageError> {
+    if !options.enabled {
+        return Ok(None);
+    }
     let normalized = query.trim();
     if normalized.is_empty() {
         return Ok(None);
     }
 
-    let secret_intent = detect_secret_intent(normalized);
+    let max_recall_items = options.max_recall_items.max(1);
+    let max_non_secret_items = options.max_non_secret_items;
+    let max_secret_items = options.max_secret_items;
+    let similarity_threshold = options.secret_similarity_threshold.clamp(0.0, 1.0);
+    let secret_intent = if options.require_explicit_secret_intent {
+        detect_secret_intent(normalized)
+    } else {
+        true
+    };
     let response = search_memory(
         embedding_client,
         workspace_root,
         MemorySearchRequest {
             query: normalized.to_string(),
             scope: Some(MemorySearchScope::Both),
-            limit: Some(8),
+            limit: Some(max_recall_items),
             include_secrets: true,
         },
     )
@@ -1619,27 +1681,45 @@ async fn build_recall_context(
 
     let mut lines = vec!["Memory recall context (internal only):".to_string()];
     let mut added = false;
+    let mut total_added = 0_usize;
 
-    for entry in response.results.iter().filter(|item| !item.secret).take(3) {
+    for entry in response
+        .results
+        .iter()
+        .filter(|item| !item.secret)
+        .take(max_non_secret_items)
+    {
+        if total_added >= max_recall_items {
+            break;
+        }
         lines.push(format!(
             "- {} [{}]: {}",
             entry.label, entry.source, entry.snippet
         ));
         added = true;
+        total_added += 1;
     }
 
-    if secret_intent {
+    if secret_intent && max_secret_items > 0 && total_added < max_recall_items {
         for entry in response
             .results
             .iter()
-            .filter(|item| item.secret && item.score >= 0.78)
-            .take(2)
+            .filter(|item| item.secret && item.score >= similarity_threshold)
+            .take(max_secret_items)
         {
+            if total_added >= max_recall_items {
+                break;
+            }
             if let Some(memory_id) = entry.memory_id {
                 if let Ok(secret_value) = load_decrypted_secret(memory_id) {
                     lines.push(format!("- {} [credential]: {}", entry.label, secret_value));
                     added = true;
-                    let _ = audit_secret_injection(memory_id, &entry.label, "intent+similarity");
+                    total_added += 1;
+                    let _ = audit_secret_injection(
+                        memory_id,
+                        &entry.label,
+                        &format!("intent+similarity>= {:.2}", similarity_threshold),
+                    );
                 }
             }
         }
@@ -1788,6 +1868,26 @@ fn sqlite_vec_available_on_connection(conn: &Connection) -> bool {
         .is_ok()
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_recall_max_items() -> usize {
+    DEFAULT_RECALL_MAX_ITEMS
+}
+
+fn default_recall_max_non_secret_items() -> usize {
+    DEFAULT_RECALL_MAX_NON_SECRET_ITEMS
+}
+
+fn default_recall_max_secret_items() -> usize {
+    DEFAULT_RECALL_MAX_SECRET_ITEMS
+}
+
+fn default_secret_similarity_threshold() -> f32 {
+    DEFAULT_SECRET_SIMILARITY_THRESHOLD
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1799,6 +1899,26 @@ mod tests {
     impl EmbeddingClient for MockEmbeddingClient {
         async fn embed(&self, _text: &str) -> Result<Vec<f32>, StorageError> {
             Ok(vec![0.01; EMBEDDING_DIMENSION])
+        }
+    }
+
+    #[derive(Clone)]
+    struct HashEmbeddingClient;
+
+    #[async_trait]
+    impl EmbeddingClient for HashEmbeddingClient {
+        async fn embed(&self, text: &str) -> Result<Vec<f32>, StorageError> {
+            let mut hash = 1469598103934665603_u64;
+            for byte in text.as_bytes() {
+                hash ^= *byte as u64;
+                hash = hash.wrapping_mul(1099511628211_u64);
+            }
+            let mut vector = vec![0.0_f32; EMBEDDING_DIMENSION];
+            vector[0] = ((hash & 0xFFFF) as f32) / 65535.0;
+            vector[1] = (((hash >> 16) & 0xFFFF) as f32) / 65535.0;
+            vector[2] = (((hash >> 32) & 0xFFFF) as f32) / 65535.0;
+            vector[3] = (((hash >> 48) & 0xFFFF) as f32) / 65535.0;
+            Ok(vector)
         }
     }
 
@@ -1868,6 +1988,24 @@ mod tests {
             created_at: 1_700_000_100_000,
             updated_at: 1_700_000_100_500,
         }
+    }
+
+    fn redact_recall_for_guidance(context: &str) -> String {
+        context
+            .lines()
+            .map(|line| {
+                if line.contains("[credential]:") {
+                    if let Some((left, _)) = line.split_once(':') {
+                        format!("{}: <redacted>", left.trim_end())
+                    } else {
+                        "- credential: <redacted>".to_string()
+                    }
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[tokio::test]
@@ -1996,5 +2134,141 @@ mod tests {
             .and_then(|message| message.images.first())
             .expect("expected exported image");
         assert!(image.data_url.starts_with("data:image/png;base64,"));
+    }
+
+    #[tokio::test]
+    async fn recall_options_limit_non_secret_items() {
+        let service = mock_service();
+        let workspace = TempWorkspace::new("recall-non-secret-limit");
+        let token = format!("recall-non-secret-{}", Uuid::new_v4());
+        let mut inserted_ids = Vec::new();
+
+        for index in 0..3 {
+            let note = service
+                .upsert_personal_note(MemoryUpsertPersonalNoteRequest {
+                    label: format!("note-{index}-{token}"),
+                    descriptor_text: token.clone(),
+                    scope: "global".to_string(),
+                })
+                .await
+                .expect("should insert personal note");
+            inserted_ids.push(note.id);
+        }
+
+        let context = service
+            .build_recall_context_with_options(
+                &workspace.root,
+                &token,
+                RecallBuildOptions {
+                    max_recall_items: 8,
+                    max_non_secret_items: 1,
+                    max_secret_items: 0,
+                    secret_similarity_threshold: 0.82,
+                    require_explicit_secret_intent: true,
+                    enabled: true,
+                },
+            )
+            .await
+            .expect("should build recall context");
+
+        let context = context.expect("recall context should exist");
+        let lines = context
+            .lines()
+            .filter(|line| line.trim_start().starts_with("- "))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+
+        for id in inserted_ids {
+            let _ = service
+                .delete_personal(MemoryDeletePersonalRequest { id })
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_secret_requires_explicit_intent() {
+        let service = mock_service();
+        let workspace = TempWorkspace::new("recall-secret-intent");
+        let token = format!("recall-secret-intent-{}", Uuid::new_v4());
+
+        let secret = service
+            .upsert_personal_secret(MemoryUpsertPersonalSecretRequest {
+                label: format!("secret-{token}"),
+                descriptor_text: token.clone(),
+                secret_text: "secret-value-for-intent-test".to_string(),
+                scope: "global".to_string(),
+            })
+            .await
+            .expect("should insert personal secret");
+
+        let context = service
+            .build_recall_context_with_options(
+                &workspace.root,
+                &token,
+                RecallBuildOptions {
+                    enabled: true,
+                    max_recall_items: 8,
+                    max_non_secret_items: 0,
+                    max_secret_items: 1,
+                    secret_similarity_threshold: 0.0,
+                    require_explicit_secret_intent: true,
+                },
+            )
+            .await
+            .expect("should build recall context");
+        assert!(context.is_none());
+
+        let _ = service
+            .delete_personal(MemoryDeletePersonalRequest { id: secret.id })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn recall_secret_threshold_gate() {
+        let service = StorageService::with_embedding_client(Arc::new(HashEmbeddingClient));
+        let workspace = TempWorkspace::new("recall-secret-threshold");
+        let token = format!("recall-secret-threshold-{}", Uuid::new_v4());
+
+        let secret = service
+            .upsert_personal_secret(MemoryUpsertPersonalSecretRequest {
+                label: format!("secret-{token}"),
+                descriptor_text: format!("descriptor {token}"),
+                secret_text: "secret-value-for-threshold-test".to_string(),
+                scope: "global".to_string(),
+            })
+            .await
+            .expect("should insert personal secret");
+
+        let context = service
+            .build_recall_context_with_options(
+                &workspace.root,
+                &format!("{token} query"),
+                RecallBuildOptions {
+                    enabled: true,
+                    max_recall_items: 8,
+                    max_non_secret_items: 0,
+                    max_secret_items: 1,
+                    secret_similarity_threshold: 1.0,
+                    require_explicit_secret_intent: false,
+                },
+            )
+            .await
+            .expect("should build recall context");
+        assert!(context.is_none());
+
+        let _ = service
+            .delete_personal(MemoryDeletePersonalRequest { id: secret.id })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn recall_guidance_redaction_does_not_leak_secret() {
+        let secret_text = "secret-value-for-redaction-test";
+        let context = format!(
+            "Memory recall context (internal only):\n- workspace note [workspace]: some note\n- api token [credential]: {secret_text}"
+        );
+        let redacted = redact_recall_for_guidance(&context);
+        assert!(redacted.contains("<redacted>"));
+        assert!(!redacted.contains(secret_text));
     }
 }

@@ -112,6 +112,87 @@ export interface ProtocolRuntimeConfigPatch {
   skills?: SkillsRuntimeConfig | null;
 }
 
+export interface ProtocolMcpRewriteEntry {
+  fieldPath: string;
+  reason: string;
+  before: string;
+  after: string;
+}
+
+export interface ProtocolMcpRejectPreview {
+  fieldPath: string;
+  reason: string;
+}
+
+export interface ProtocolMcpArgNormalization {
+  rewrittenCount: number;
+  rewrites: ProtocolMcpRewriteEntry[];
+  rejectPreview?: ProtocolMcpRejectPreview | null;
+}
+
+export interface ProtocolGuidanceTemplate {
+  templateType: string;
+  target: string;
+  payload: Record<string, unknown>;
+}
+
+export interface ProtocolGuidancePathVars {
+  workspaceRoot: string;
+  ahDir: string;
+  screenshotsDir: string;
+  imageRecognitionDir: string;
+}
+
+export interface ProtocolGuidanceToolConstraint {
+  tool: string;
+  serverName: string;
+  imageTool: boolean;
+  imageFields: string[];
+  pathFields: string[];
+}
+
+export interface ProtocolGuidanceHitRules {
+  signals: string[];
+  selectedContracts: string[];
+  selectedServers: string[];
+  selectedPrompts: string[];
+}
+
+export interface ProtocolGuidanceGovernanceSummary {
+  blockerCount: number;
+  warningCount: number;
+  infoCount: number;
+  topIssueCodes: string[];
+}
+
+export interface ProtocolGuidanceMemorySummary {
+  enabled: boolean;
+  contextFound: boolean;
+  nonSecretCount: number;
+  secretCount: number;
+  sourceTags: string[];
+  redactedLines: string[];
+}
+
+export interface ProtocolGuidanceInput {
+  userInput: string;
+  workspaceRoot: string;
+  mcpContractsTotal: number;
+  mcpServersTotal: number;
+  skillsTotal: number;
+  hitRules: ProtocolGuidanceHitRules;
+  governance: ProtocolGuidanceGovernanceSummary;
+  memory: ProtocolGuidanceMemorySummary;
+}
+
+export interface ProtocolGuidanceOutput {
+  systemPromptFragment: string;
+  pathVars: ProtocolGuidancePathVars;
+  toolConstraints: ProtocolGuidanceToolConstraint[];
+  templates: ProtocolGuidanceTemplate[];
+  warnings: string[];
+}
+
 export type AgentHistoryRole = 'user' | 'assistant' | 'system';
 
 export interface AgentHistoryMessage {
@@ -158,6 +239,7 @@ export type ProtocolEventPayload =
       type: 'tool_call_requested';
       tool: string;
       args: unknown;
+      normalization?: ProtocolMcpArgNormalization | null;
     }
   | {
       type: 'tool_call_result';
@@ -229,6 +311,11 @@ export type ProtocolEventPayload =
   | {
       type: 'governance_report';
       report: GovernanceReport;
+    }
+  | {
+      type: 'guidance_context';
+      input: ProtocolGuidanceInput;
+      output: ProtocolGuidanceOutput;
     }
   | {
       type: 'conversation_title_suggestion';

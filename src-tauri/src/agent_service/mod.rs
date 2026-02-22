@@ -35,11 +35,15 @@ use self::types::{
     AgentEvent, AgentHistoryMessage, AgentHistoryRole, AgentInputImage, AgentProvider,
     AgentRuntimeConfig, AgentStreamInput, AppError, GovernanceReport, McpAuthRuntimeConfig,
     McpAuthType, McpConfigTestResult, McpRuntimeConfig, McpServerRuntimeConfig,
-    McpServerTestResult, McpTlsRuntimeConfig, McpTransportKind, ProtocolEventPayload,
-    ProtocolInputImage, ProtocolMcpPromptInfo, ProtocolMcpResourceInfo, ProtocolMcpToolInfo,
-    ProtocolOpPayload, ProtocolPromptArgumentInfo, ProtocolPromptContent, ProtocolPromptMessage,
-    ProtocolSkillEntry, ProtocolTokenUsage, SkillScanEntry, SkillScanResult, SkillsRuntimeConfig,
-    WorkspaceRuntimeConfig,
+    McpServerTestResult, McpTlsRuntimeConfig, McpTransportKind, MemoryRuntimeConfig,
+    ProtocolEventPayload, ProtocolGuidanceGovernanceSummary, ProtocolGuidanceHitRules,
+    ProtocolGuidanceInput, ProtocolGuidanceMemorySummary, ProtocolGuidanceOutput,
+    ProtocolGuidancePathVars, ProtocolGuidanceTemplate, ProtocolGuidanceToolConstraint,
+    ProtocolInputImage, ProtocolMcpArgNormalization, ProtocolMcpPromptInfo,
+    ProtocolMcpRejectPreview, ProtocolMcpResourceInfo, ProtocolMcpRewriteEntry,
+    ProtocolMcpToolInfo, ProtocolOpPayload, ProtocolPromptArgumentInfo, ProtocolPromptContent,
+    ProtocolPromptMessage, ProtocolSkillEntry, ProtocolTokenUsage, SkillScanEntry, SkillScanResult,
+    SkillsRuntimeConfig, WorkspaceRuntimeConfig,
 };
 
 struct ActiveTask {
@@ -325,7 +329,7 @@ impl AgentService {
             task_id: task_id.clone(),
             seq,
             payload: ProtocolEventPayload::GovernanceReport {
-                report: baseline_governance,
+                report: baseline_governance.clone(),
             },
         });
 
@@ -539,17 +543,31 @@ impl AgentService {
         let guidance_snapshot = collect_stage2_guidance_snapshot(&runtime_resources).await;
         let guidance_focus =
             build_stage2_guidance_focus(&input.content, &runtime_resources, &guidance_snapshot);
-        let guidance_context = build_stage2_guidance_context(
+        let guidance_result = build_stage2_guidance_result(
+            &input.content,
             &workspace_context,
             &runtime_resources,
             &guidance_snapshot,
             &guidance_focus,
+            &baseline_governance,
+            &recent_history,
+            &effective_config.memory,
         );
+        let guidance_fragment = render_guidance_system_fragment(&guidance_result);
         prompt_directives = Some(merge_prompt_directives_with_guidance(
             &effective_config,
             prompt_directives,
-            &guidance_context,
+            &guidance_fragment,
         ));
+        seq += 1;
+        emit(AgentEvent::ProtocolEvent {
+            task_id: task_id.clone(),
+            seq,
+            payload: ProtocolEventPayload::GuidanceContext {
+                input: guidance_result_to_protocol_input(&guidance_result),
+                output: guidance_result_to_protocol_output(&guidance_result),
+            },
+        });
         seq += 1;
         emit(AgentEvent::ProtocolEvent {
             task_id: task_id.clone(),
@@ -891,6 +909,13 @@ impl AgentService {
             return WorkspaceContext::resolve(&config.workspace).root_dir;
         }
         WorkspaceContext::resolve(&WorkspaceRuntimeConfig::default()).root_dir
+    }
+
+    pub fn current_memory_config(&self) -> MemoryRuntimeConfig {
+        self.runtime_config
+            .as_ref()
+            .map(|config| config.memory.clone())
+            .unwrap_or_default()
     }
 
     pub async fn cancel(&self, task_id: &str) -> Result<(), AppError> {
@@ -1368,6 +1393,83 @@ struct Stage2SkillSnapshot {
     path: String,
 }
 
+#[derive(Debug, Clone)]
+struct Stage2GuidanceTemplate {
+    template_type: String,
+    target: String,
+    payload: Value,
+}
+
+#[derive(Debug, Clone)]
+struct Stage2GuidancePathVars {
+    workspace_root: String,
+    ah_dir: String,
+    screenshots_dir: String,
+    image_recognition_dir: String,
+}
+
+#[derive(Debug, Clone)]
+struct Stage2GuidanceToolConstraint {
+    tool: String,
+    server_name: String,
+    image_tool: bool,
+    image_fields: Vec<String>,
+    path_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Stage2GuidanceHitRules {
+    signals: Vec<String>,
+    selected_contracts: Vec<String>,
+    selected_servers: Vec<String>,
+    selected_prompts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Stage2GuidanceGovernanceSummary {
+    blocker_count: usize,
+    warning_count: usize,
+    info_count: usize,
+    top_issue_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Stage2GuidanceMemorySummary {
+    enabled: bool,
+    context_found: bool,
+    non_secret_count: usize,
+    secret_count: usize,
+    source_tags: Vec<String>,
+    redacted_lines: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct Stage2GuidanceInput {
+    user_input: String,
+    workspace_root: String,
+    mcp_contracts_total: usize,
+    mcp_servers_total: usize,
+    skills_total: usize,
+    hit_rules: Stage2GuidanceHitRules,
+    governance: Stage2GuidanceGovernanceSummary,
+    memory: Stage2GuidanceMemorySummary,
+}
+
+#[derive(Debug, Clone)]
+struct Stage2GuidanceOutput {
+    system_prompt_fragment: String,
+    path_vars: Stage2GuidancePathVars,
+    tool_constraints: Vec<Stage2GuidanceToolConstraint>,
+    templates: Vec<Stage2GuidanceTemplate>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct Stage2GuidanceResult {
+    input: Stage2GuidanceInput,
+    output: Stage2GuidanceOutput,
+}
+
 async fn collect_stage2_guidance_snapshot(
     runtime_resources: &RuntimeResources,
 ) -> Stage2GuidanceSnapshot {
@@ -1843,6 +1945,282 @@ async fn collect_stage2_skills_from_directory(
     }
 }
 
+fn build_stage2_guidance_result(
+    user_input: &str,
+    workspace_context: &WorkspaceContext,
+    runtime_resources: &RuntimeResources,
+    snapshot: &Stage2GuidanceSnapshot,
+    focus: &Stage2GuidanceFocus,
+    governance: &GovernanceReport,
+    recent_history: &[AgentHistoryMessage],
+    memory_config: &MemoryRuntimeConfig,
+) -> Stage2GuidanceResult {
+    let hit_rules = build_stage2_guidance_hit_rules(focus);
+    let governance_summary = build_stage2_guidance_governance_summary(governance);
+    let memory_summary = build_stage2_guidance_memory_summary(recent_history, memory_config);
+
+    let mut system_prompt_fragment =
+        build_stage2_guidance_context(workspace_context, runtime_resources, snapshot, focus);
+    system_prompt_fragment.push_str("\n- Governance guidance summary:");
+    system_prompt_fragment.push_str(&format!(
+        "\n  - blockers={} warnings={} info={}",
+        governance_summary.blocker_count,
+        governance_summary.warning_count,
+        governance_summary.info_count
+    ));
+    if !governance_summary.top_issue_codes.is_empty() {
+        system_prompt_fragment.push_str(&format!(
+            "\n  - top_issue_codes={}",
+            governance_summary.top_issue_codes.join(", ")
+        ));
+    }
+
+    if memory_summary.enabled {
+        if memory_summary.context_found {
+            system_prompt_fragment.push_str("\n- Memory recall summary (redacted for guidance):");
+            system_prompt_fragment.push_str(&format!(
+                "\n  - non_secret={} secret={}",
+                memory_summary.non_secret_count, memory_summary.secret_count
+            ));
+            if !memory_summary.source_tags.is_empty() {
+                system_prompt_fragment.push_str(&format!(
+                    "\n  - sources={}",
+                    memory_summary.source_tags.join(", ")
+                ));
+            }
+            for line in memory_summary.redacted_lines.iter().take(4) {
+                system_prompt_fragment.push_str("\n  ");
+                system_prompt_fragment.push_str(line);
+            }
+        } else {
+            system_prompt_fragment
+                .push_str("\n- Memory recall summary (redacted for guidance): no recall context.");
+        }
+    } else {
+        system_prompt_fragment.push_str("\n- Memory recall disabled by runtime config.");
+    }
+
+    let path_vars = Stage2GuidancePathVars {
+        workspace_root: workspace_context.root_dir.to_string_lossy().to_string(),
+        ah_dir: workspace_context.ah_dir.to_string_lossy().to_string(),
+        screenshots_dir: workspace_context
+            .screenshots_dir
+            .to_string_lossy()
+            .to_string(),
+        image_recognition_dir: workspace_context
+            .image_recognition_dir
+            .to_string_lossy()
+            .to_string(),
+    };
+
+    let mut templates = build_guidance_tool_argument_templates(
+        workspace_context,
+        &runtime_resources.mcp_tool_contracts,
+        focus,
+    );
+    templates.extend(build_guidance_prompt_argument_templates(
+        workspace_context,
+        snapshot,
+        focus,
+    ));
+
+    Stage2GuidanceResult {
+        input: Stage2GuidanceInput {
+            user_input: user_input.to_string(),
+            workspace_root: path_vars.workspace_root.clone(),
+            mcp_contracts_total: runtime_resources.mcp_tool_contracts.len(),
+            mcp_servers_total: snapshot.mcp_servers.len(),
+            skills_total: snapshot.skills.len(),
+            hit_rules,
+            governance: governance_summary,
+            memory: memory_summary,
+        },
+        output: Stage2GuidanceOutput {
+            system_prompt_fragment,
+            path_vars,
+            tool_constraints: build_guidance_tool_constraints(
+                &runtime_resources.mcp_tool_contracts,
+                focus,
+            ),
+            templates,
+            warnings: snapshot.warnings.clone(),
+        },
+    }
+}
+
+fn build_stage2_guidance_hit_rules(focus: &Stage2GuidanceFocus) -> Stage2GuidanceHitRules {
+    Stage2GuidanceHitRules {
+        signals: focus.signals.iter().cloned().collect(),
+        selected_contracts: focus.selected_contract_names.iter().cloned().collect(),
+        selected_servers: focus.selected_server_names.iter().cloned().collect(),
+        selected_prompts: focus.selected_prompt_keys.iter().cloned().collect(),
+    }
+}
+
+fn build_stage2_guidance_governance_summary(
+    governance: &GovernanceReport,
+) -> Stage2GuidanceGovernanceSummary {
+    let mut top_issue_codes = Vec::<String>::new();
+    let mut seen = BTreeSet::<String>::new();
+    for issue in &governance.issues {
+        if issue.code.trim().is_empty() {
+            continue;
+        }
+        if seen.insert(issue.code.clone()) {
+            top_issue_codes.push(issue.code.clone());
+        }
+        if top_issue_codes.len() >= 6 {
+            break;
+        }
+    }
+    Stage2GuidanceGovernanceSummary {
+        blocker_count: governance.blocker_count,
+        warning_count: governance.warning_count,
+        info_count: governance.info_count,
+        top_issue_codes,
+    }
+}
+
+fn build_stage2_guidance_memory_summary(
+    recent_history: &[AgentHistoryMessage],
+    memory_config: &MemoryRuntimeConfig,
+) -> Stage2GuidanceMemorySummary {
+    let mut summary = Stage2GuidanceMemorySummary {
+        enabled: memory_config.enabled,
+        ..Default::default()
+    };
+    if !memory_config.enabled {
+        return summary;
+    }
+
+    let Some(recall_context) = recent_history
+        .iter()
+        .rev()
+        .find(|message| {
+            matches!(message.role, AgentHistoryRole::System)
+                && message
+                    .content
+                    .starts_with("Memory recall context (internal only):")
+        })
+        .map(|message| message.content.clone())
+    else {
+        return summary;
+    };
+
+    summary.context_found = true;
+    let mut source_tags = BTreeSet::<String>::new();
+    for line in recall_context.lines().skip(1) {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("- ") {
+            continue;
+        }
+        let body = trimmed.trim_start_matches("- ").trim();
+        if body.is_empty() {
+            continue;
+        }
+
+        if let Some(source) = extract_recall_source_tag(body) {
+            source_tags.insert(source);
+        }
+
+        if body.contains("[credential]:") {
+            summary.secret_count += 1;
+            let redacted = if let Some((left, _)) = body.split_once(':') {
+                format!("- {}: <redacted>", left.trim())
+            } else {
+                "- credential: <redacted>".to_string()
+            };
+            summary.redacted_lines.push(redacted);
+            continue;
+        }
+
+        summary.non_secret_count += 1;
+        summary.redacted_lines.push(format!("- {}", body));
+    }
+    summary.source_tags = source_tags.into_iter().collect();
+    summary
+}
+
+fn extract_recall_source_tag(line: &str) -> Option<String> {
+    let open = line.find('[')?;
+    let close = line[open + 1..].find(']')?;
+    let tag = line[open + 1..open + 1 + close].trim();
+    if tag.is_empty() {
+        None
+    } else {
+        Some(tag.to_string())
+    }
+}
+
+fn render_guidance_system_fragment(result: &Stage2GuidanceResult) -> String {
+    result.output.system_prompt_fragment.clone()
+}
+
+fn guidance_result_to_protocol_input(result: &Stage2GuidanceResult) -> ProtocolGuidanceInput {
+    ProtocolGuidanceInput {
+        user_input: result.input.user_input.clone(),
+        workspace_root: result.input.workspace_root.clone(),
+        mcp_contracts_total: result.input.mcp_contracts_total,
+        mcp_servers_total: result.input.mcp_servers_total,
+        skills_total: result.input.skills_total,
+        hit_rules: ProtocolGuidanceHitRules {
+            signals: result.input.hit_rules.signals.clone(),
+            selected_contracts: result.input.hit_rules.selected_contracts.clone(),
+            selected_servers: result.input.hit_rules.selected_servers.clone(),
+            selected_prompts: result.input.hit_rules.selected_prompts.clone(),
+        },
+        governance: ProtocolGuidanceGovernanceSummary {
+            blocker_count: result.input.governance.blocker_count,
+            warning_count: result.input.governance.warning_count,
+            info_count: result.input.governance.info_count,
+            top_issue_codes: result.input.governance.top_issue_codes.clone(),
+        },
+        memory: ProtocolGuidanceMemorySummary {
+            enabled: result.input.memory.enabled,
+            context_found: result.input.memory.context_found,
+            non_secret_count: result.input.memory.non_secret_count,
+            secret_count: result.input.memory.secret_count,
+            source_tags: result.input.memory.source_tags.clone(),
+            redacted_lines: result.input.memory.redacted_lines.clone(),
+        },
+    }
+}
+
+fn guidance_result_to_protocol_output(result: &Stage2GuidanceResult) -> ProtocolGuidanceOutput {
+    ProtocolGuidanceOutput {
+        system_prompt_fragment: result.output.system_prompt_fragment.clone(),
+        path_vars: ProtocolGuidancePathVars {
+            workspace_root: result.output.path_vars.workspace_root.clone(),
+            ah_dir: result.output.path_vars.ah_dir.clone(),
+            screenshots_dir: result.output.path_vars.screenshots_dir.clone(),
+            image_recognition_dir: result.output.path_vars.image_recognition_dir.clone(),
+        },
+        tool_constraints: result
+            .output
+            .tool_constraints
+            .iter()
+            .map(|constraint| ProtocolGuidanceToolConstraint {
+                tool: constraint.tool.clone(),
+                server_name: constraint.server_name.clone(),
+                image_tool: constraint.image_tool,
+                image_fields: constraint.image_fields.clone(),
+                path_fields: constraint.path_fields.clone(),
+            })
+            .collect(),
+        templates: result
+            .output
+            .templates
+            .iter()
+            .map(|template| ProtocolGuidanceTemplate {
+                template_type: template.template_type.clone(),
+                target: template.target.clone(),
+                payload: template.payload.clone(),
+            })
+            .collect(),
+        warnings: result.output.warnings.clone(),
+    }
+}
+
 fn build_stage2_guidance_context(
     workspace_context: &WorkspaceContext,
     runtime_resources: &RuntimeResources,
@@ -2106,7 +2484,24 @@ fn build_guidance_tool_argument_template_lines(
     contracts: &[McpToolContract],
     focus: &Stage2GuidanceFocus,
 ) -> Vec<String> {
-    let mut lines = Vec::<String>::new();
+    build_guidance_tool_argument_templates(workspace_context, contracts, focus)
+        .into_iter()
+        .map(|template| {
+            format!(
+                "- {} -> {}",
+                template.target,
+                format_guidance_template_object(&template.payload)
+            )
+        })
+        .collect()
+}
+
+fn build_guidance_tool_argument_templates(
+    workspace_context: &WorkspaceContext,
+    contracts: &[McpToolContract],
+    focus: &Stage2GuidanceFocus,
+) -> Vec<Stage2GuidanceTemplate> {
+    let mut templates = Vec::<Stage2GuidanceTemplate>::new();
     for contract in contracts.iter().take(30) {
         if !focus.selected_contract_names.is_empty()
             && !focus
@@ -2138,13 +2533,13 @@ fn build_guidance_tool_argument_template_lines(
             continue;
         }
 
-        lines.push(format!(
-            "- {} -> {}",
-            contract.public_name,
-            format_guidance_template_object(&template)
-        ));
+        templates.push(Stage2GuidanceTemplate {
+            template_type: "tool_args".to_string(),
+            target: contract.public_name.clone(),
+            payload: template_payload_from_pairs(&template),
+        });
     }
-    lines
+    templates
 }
 
 fn build_guidance_prompt_argument_template_lines(
@@ -2152,7 +2547,24 @@ fn build_guidance_prompt_argument_template_lines(
     snapshot: &Stage2GuidanceSnapshot,
     focus: &Stage2GuidanceFocus,
 ) -> Vec<String> {
-    let mut lines = Vec::<String>::new();
+    build_guidance_prompt_argument_templates(workspace_context, snapshot, focus)
+        .into_iter()
+        .map(|template| {
+            format!(
+                "- {} -> {}",
+                template.target,
+                format_guidance_template_object(&template.payload)
+            )
+        })
+        .collect()
+}
+
+fn build_guidance_prompt_argument_templates(
+    workspace_context: &WorkspaceContext,
+    snapshot: &Stage2GuidanceSnapshot,
+    focus: &Stage2GuidanceFocus,
+) -> Vec<Stage2GuidanceTemplate> {
+    let mut templates = Vec::<Stage2GuidanceTemplate>::new();
     for server in snapshot.mcp_servers.iter().take(20) {
         if !focus.selected_server_names.is_empty()
             && !focus.selected_server_names.contains(&server.server_name)
@@ -2179,18 +2591,28 @@ fn build_guidance_prompt_argument_template_lines(
                 continue;
             }
 
-            lines.push(format!(
-                "- {}:{} -> {}",
-                server.server_name,
-                prompt.name,
-                format_guidance_template_object(&template)
-            ));
-            if lines.len() >= 20 {
-                return lines;
+            templates.push(Stage2GuidanceTemplate {
+                template_type: "prompt_args".to_string(),
+                target: format!("{}:{}", server.server_name, prompt.name),
+                payload: template_payload_from_pairs(&template),
+            });
+            if templates.len() >= 20 {
+                return templates;
             }
         }
     }
-    lines
+    templates
+}
+
+fn template_payload_from_pairs(template: &BTreeSet<(String, String)>) -> Value {
+    let mut map = Map::new();
+    for (key, value) in template {
+        if key.trim().is_empty() {
+            continue;
+        }
+        map.insert(key.clone(), Value::String(value.clone()));
+    }
+    Value::Object(map)
 }
 
 fn guidance_prompt_argument_template_value(
@@ -2242,22 +2664,40 @@ fn guidance_workspace_path_template(workspace_context: &WorkspaceContext) -> Str
     )
 }
 
-fn format_guidance_template_object(template: &BTreeSet<(String, String)>) -> String {
-    let mut map = Map::new();
-    for (key, value) in template {
-        if key.trim().is_empty() {
-            continue;
-        }
-        map.insert(key.clone(), Value::String(value.clone()));
-    }
-    Value::Object(map).to_string()
+fn format_guidance_template_object(template: &Value) -> String {
+    template.to_string()
 }
 
 fn build_guidance_contract_lines(
     contracts: &[McpToolContract],
     focus: &Stage2GuidanceFocus,
 ) -> Vec<String> {
-    let mut lines = Vec::<String>::new();
+    build_guidance_tool_constraints(contracts, focus)
+        .into_iter()
+        .map(|constraint| {
+            let image_text = if constraint.image_fields.is_empty() {
+                "none".to_string()
+            } else {
+                constraint.image_fields.join(", ")
+            };
+            let generic_text = if constraint.path_fields.is_empty() {
+                "none".to_string()
+            } else {
+                constraint.path_fields.join(", ")
+            };
+            format!(
+                "- {} | image_tool={} | image_fields=[{}] | path_fields=[{}]",
+                constraint.tool, constraint.image_tool, image_text, generic_text
+            )
+        })
+        .collect()
+}
+
+fn build_guidance_tool_constraints(
+    contracts: &[McpToolContract],
+    focus: &Stage2GuidanceFocus,
+) -> Vec<Stage2GuidanceToolConstraint> {
+    let mut constraints = Vec::<Stage2GuidanceToolConstraint>::new();
     for contract in contracts {
         if !focus.selected_contract_names.is_empty()
             && !focus
@@ -2287,24 +2727,16 @@ fn build_guidance_contract_lines(
             continue;
         }
 
-        let image_text = if image_fields.is_empty() {
-            "none".to_string()
-        } else {
-            image_fields.into_iter().collect::<Vec<_>>().join(", ")
-        };
-        let generic_text = if generic_fields.is_empty() {
-            "none".to_string()
-        } else {
-            generic_fields.into_iter().collect::<Vec<_>>().join(", ")
-        };
-
-        lines.push(format!(
-            "- {} | image_tool={} | image_fields=[{}] | path_fields=[{}]",
-            contract.public_name, contract.is_image_tool, image_text, generic_text
-        ));
+        constraints.push(Stage2GuidanceToolConstraint {
+            tool: contract.public_name.clone(),
+            server_name: contract.server_name.clone(),
+            image_tool: contract.is_image_tool,
+            image_fields: image_fields.into_iter().collect(),
+            path_fields: generic_fields.into_iter().collect(),
+        });
     }
 
-    lines
+    constraints
 }
 
 fn merge_prompt_directives_with_guidance(
@@ -2838,9 +3270,25 @@ impl McpToolContract {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone)]
+struct McpPathRewriteEntry {
+    field_path: String,
+    reason: String,
+    before: String,
+    after: String,
+}
+
+#[derive(Debug, Clone)]
+struct McpPathRejectPreview {
+    field_path: String,
+    reason: String,
+}
+
+#[derive(Debug, Default, Clone)]
 struct McpPathNormalizationReport {
     rewritten_count: usize,
+    rewrites: Vec<McpPathRewriteEntry>,
+    reject_preview: Option<McpPathRejectPreview>,
 }
 
 #[derive(Debug, Clone)]
@@ -2880,6 +3328,7 @@ impl McpPathGateway {
     }
 }
 
+#[cfg(test)]
 fn normalize_mcp_tool_args(
     contract: &McpToolContract,
     args: Map<String, Value>,
@@ -2896,31 +3345,40 @@ fn normalize_mcp_tool_args_with_report(
     let gateway = McpPathGateway::from_tool_context(ctx)?;
     let mut report = McpPathNormalizationReport::default();
 
-    for (field_name, value) in args.iter_mut() {
-        let field_path = vec![field_name.clone()];
-        normalize_mcp_tool_arg_value(
-            contract,
-            &gateway,
-            value,
-            &field_path,
-            &mut report,
-        )
-        .map_err(|reject| {
-            log::warn!(
-                "mcp_path_gateway rejected arguments | tool={} server={} rejected_field={} reason={}",
-                contract.public_name,
-                contract.server_name,
-                reject.field_path,
-                reject.reason
-            );
-            AgentError::Tool(format!(
-                "mcp_path_gateway_rejected: field '{}' for tool '{}' ({})",
-                reject.field_path, contract.public_name, reject.reason
-            ))
-        })?;
+    if let Err(reject) =
+        normalize_mcp_tool_args_with_gateway(contract, &gateway, &mut args, &mut report)
+    {
+        report.reject_preview = Some(McpPathRejectPreview {
+            field_path: reject.field_path.clone(),
+            reason: reject.reason.clone(),
+        });
+        log::warn!(
+            "mcp_path_gateway rejected arguments | tool={} server={} rejected_field={} reason={}",
+            contract.public_name,
+            contract.server_name,
+            reject.field_path,
+            reject.reason
+        );
+        return Err(AgentError::Tool(format!(
+            "mcp_path_gateway_rejected: field '{}' for tool '{}' ({})",
+            reject.field_path, contract.public_name, reject.reason
+        )));
     }
 
     Ok((args, report))
+}
+
+fn normalize_mcp_tool_args_with_gateway(
+    contract: &McpToolContract,
+    gateway: &McpPathGatewayContext,
+    args: &mut Map<String, Value>,
+    report: &mut McpPathNormalizationReport,
+) -> Result<(), McpPathGatewayReject> {
+    for (field_name, value) in args.iter_mut() {
+        let field_path = vec![field_name.clone()];
+        normalize_mcp_tool_arg_value(contract, gateway, value, &field_path, report)?;
+    }
+    Ok(())
 }
 
 fn normalize_mcp_tool_arg_value(
@@ -2948,12 +3406,19 @@ fn normalize_mcp_tool_arg_value(
         Value::String(text) => {
             let original = text.clone();
             let current_key = current_path.last().map(String::as_str).unwrap_or_default();
-            if let Some(normalized) =
+            if let Some((normalized, reason)) =
                 normalize_mcp_path_string(contract, gateway, current_path, current_key, &original)?
             {
                 if normalized != original {
+                    let field_path = format_field_path(current_path);
                     *text = normalized;
                     report.rewritten_count += 1;
+                    report.rewrites.push(McpPathRewriteEntry {
+                        field_path,
+                        reason,
+                        before: original,
+                        after: text.clone(),
+                    });
                 }
             }
             Ok(())
@@ -2968,7 +3433,7 @@ fn normalize_mcp_path_string(
     current_path: &[String],
     current_key: &str,
     raw_value: &str,
-) -> Result<Option<String>, McpPathGatewayReject> {
+) -> Result<Option<(String, String)>, McpPathGatewayReject> {
     let raw_trimmed = raw_value.trim();
     if raw_trimmed.is_empty() {
         return Ok(None);
@@ -3009,12 +3474,16 @@ fn normalize_mcp_path_string(
         resolved.requires_existence_check,
     )?;
 
-    Ok(Some(resolved.path.to_string_lossy().to_string()))
+    Ok(Some((
+        resolved.path.to_string_lossy().to_string(),
+        resolved.rewrite_reason,
+    )))
 }
 
 struct ResolvedMcpPath {
     path: PathBuf,
     requires_existence_check: bool,
+    rewrite_reason: String,
 }
 
 fn resolve_mcp_path_value(
@@ -3028,6 +3497,7 @@ fn resolve_mcp_path_value(
         return Ok(ResolvedMcpPath {
             path: absolute_path(&raw_path),
             requires_existence_check: is_image_field,
+            rewrite_reason: "normalized absolute path".to_string(),
         });
     }
 
@@ -3035,6 +3505,7 @@ fn resolve_mcp_path_value(
         return Ok(ResolvedMcpPath {
             path: absolute_path(&gateway.workspace_root.join(raw_trimmed)),
             requires_existence_check: is_image_field,
+            rewrite_reason: "resolved relative path against workspace root".to_string(),
         });
     }
 
@@ -3048,6 +3519,8 @@ fn resolve_mcp_path_value(
         return Ok(ResolvedMcpPath {
             path: resolved,
             requires_existence_check: true,
+            rewrite_reason: "resolved image basename from .ah/image-recognition or .ah/screenshots"
+                .to_string(),
         });
     }
 
@@ -3065,6 +3538,7 @@ fn resolve_mcp_path_value(
     Ok(ResolvedMcpPath {
         path: candidate,
         requires_existence_check: true,
+        rewrite_reason: "resolved workspace path with existence check".to_string(),
     })
 }
 
@@ -3648,12 +4122,20 @@ impl Tool for PrefixedMcpTool {
         let (normalized_arguments, report) =
             normalize_mcp_tool_args_with_report(&self.contract, arguments, ctx)?;
         if report.rewritten_count > 0 {
+            let rewrite_preview = report
+                .rewrites
+                .iter()
+                .take(6)
+                .map(|entry| format!("{}:{}", entry.field_path, entry.reason))
+                .collect::<Vec<_>>()
+                .join("; ");
             log::info!(
-                "mcp_path_gateway normalized arguments | tool={} server={} call_name={} rewritten_count={}",
+                "mcp_path_gateway normalized arguments | tool={} server={} call_name={} rewritten_count={} rewrites={}",
                 self.public_name,
                 self.server_name,
                 self.contract.call_name,
-                report.rewritten_count
+                report.rewritten_count,
+                rewrite_preview
             );
         }
 
@@ -3761,21 +4243,21 @@ fn normalize_tool_call_requested_args_for_display(
     tool: &str,
     args: &Value,
     workspace_root: Option<&Path>,
-) -> Value {
+) -> (Value, Option<ProtocolMcpArgNormalization>) {
     let Some(workspace_root) = workspace_root else {
-        return args.clone();
+        return (args.clone(), None);
     };
     if !tool.starts_with("mcp:") {
-        return args.clone();
+        return (args.clone(), None);
     }
     let Some(arguments) = args.as_object().cloned() else {
-        return args.clone();
+        return (args.clone(), None);
     };
 
     let tool_name = tool.trim();
     let stripped = tool_name.trim_start_matches("mcp:");
     let Some((server_name, call_name)) = stripped.split_once(':') else {
-        return args.clone();
+        return (args.clone(), None);
     };
 
     let contract = McpToolContract {
@@ -3791,16 +4273,69 @@ fn normalize_tool_call_requested_args_for_display(
         sandbox_root: Some(workspace_root),
     };
 
-    match normalize_mcp_tool_args(&contract, arguments, &ctx) {
-        Ok(normalized) => Value::Object(normalized),
+    let original = args.clone();
+    match normalize_mcp_tool_args_with_report(&contract, arguments, &ctx) {
+        Ok((normalized, report)) => (
+            Value::Object(normalized),
+            Some(protocol_mcp_arg_normalization_from_report(report)),
+        ),
         Err(err) => {
             log::debug!(
                 "mcp_path_gateway preview normalization failed | tool={} reason={}",
                 tool_name,
                 err
             );
-            args.clone()
+            let normalization = ProtocolMcpArgNormalization {
+                rewritten_count: 0,
+                rewrites: Vec::new(),
+                reject_preview: Some(parse_preview_reject_from_error(&err)),
+            };
+            (original, Some(normalization))
         }
+    }
+}
+
+fn protocol_mcp_arg_normalization_from_report(
+    report: McpPathNormalizationReport,
+) -> ProtocolMcpArgNormalization {
+    ProtocolMcpArgNormalization {
+        rewritten_count: report.rewritten_count,
+        rewrites: report
+            .rewrites
+            .into_iter()
+            .map(|entry| ProtocolMcpRewriteEntry {
+                field_path: entry.field_path,
+                reason: entry.reason,
+                before: entry.before,
+                after: entry.after,
+            })
+            .collect(),
+        reject_preview: report
+            .reject_preview
+            .map(|reject| ProtocolMcpRejectPreview {
+                field_path: reject.field_path,
+                reason: reject.reason,
+            }),
+    }
+}
+
+fn parse_preview_reject_from_error(err: &AgentError) -> ProtocolMcpRejectPreview {
+    let message = err.to_string();
+    let marker = "mcp_path_gateway_rejected: field '";
+    if let Some(start) = message.find(marker) {
+        let remaining = &message[start + marker.len()..];
+        if let Some(field_end) = remaining.find('\'') {
+            let field_path = remaining[..field_end].to_string();
+            let reason = remaining
+                .split_once('(')
+                .and_then(|(_, tail)| tail.rsplit_once(')').map(|(body, _)| body.to_string()))
+                .unwrap_or_else(|| message.clone());
+            return ProtocolMcpRejectPreview { field_path, reason };
+        }
+    }
+    ProtocolMcpRejectPreview {
+        field_path: "<unknown>".to_string(),
+        reason: message,
     }
 }
 
@@ -3819,10 +4354,15 @@ fn map_protocol_event(
             content: content.clone(),
             usage: protocol_usage(usage),
         }),
-        Event::ToolCallRequested { tool, args } => Some(ProtocolEventPayload::ToolCallRequested {
-            tool: tool.clone(),
-            args: normalize_tool_call_requested_args_for_display(tool, args, workspace_root),
-        }),
+        Event::ToolCallRequested { tool, args } => {
+            let (normalized_args, normalization) =
+                normalize_tool_call_requested_args_for_display(tool, args, workspace_root);
+            Some(ProtocolEventPayload::ToolCallRequested {
+                tool: tool.clone(),
+                args: normalized_args,
+                normalization,
+            })
+        }
         Event::ToolCallResult { tool, result } => Some(ProtocolEventPayload::ToolCallResult {
             tool: tool.clone(),
             result: result.output.clone(),
@@ -5403,7 +5943,7 @@ mod tests {
             "prompt": "describe image"
         });
 
-        let preview = normalize_tool_call_requested_args_for_display(
+        let (preview, normalization) = normalize_tool_call_requested_args_for_display(
             "mcp:zai-mcp-server:analyze_image",
             &raw_args,
             Some(&workspace),
@@ -5414,6 +5954,10 @@ mod tests {
             Some(absolute_path(&image_path).to_string_lossy().as_ref())
         );
         assert_eq!(preview["prompt"].as_str(), Some("describe image"));
+        let normalization = normalization.expect("normalization should be present");
+        assert_eq!(normalization.rewritten_count, 1);
+        assert_eq!(normalization.rewrites.len(), 1);
+        assert!(normalization.reject_preview.is_none());
 
         let _ = fs::remove_dir_all(workspace);
     }
@@ -5436,15 +5980,93 @@ mod tests {
 
         let payload = map_protocol_event(&event, Some(&workspace)).expect("payload should exist");
         match payload {
-            ProtocolEventPayload::ToolCallRequested { tool, args } => {
+            ProtocolEventPayload::ToolCallRequested {
+                tool,
+                args,
+                normalization,
+            } => {
                 assert_eq!(tool, "mcp:zai-mcp-server:analyze_image");
                 assert_eq!(
                     args["image_source"].as_str(),
                     Some(absolute_path(&image_path).to_string_lossy().as_ref())
                 );
                 assert_eq!(args["prompt"].as_str(), Some("describe image"));
+                let normalization = normalization.expect("normalization should exist");
+                assert_eq!(normalization.rewritten_count, 1);
+                assert_eq!(normalization.rewrites.len(), 1);
+                assert!(normalization
+                    .rewrites
+                    .iter()
+                    .any(|entry| entry.field_path == "image_source"));
             }
             _ => panic!("expected tool_call_requested payload"),
+        }
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn tool_call_requested_contains_normalization_rewrites() {
+        let workspace = unique_temp_dir("mcp-path-gateway-normalization-rewrites");
+        let image_dir = workspace.join(".ah").join("image-recognition");
+        fs::create_dir_all(&image_dir).expect("should create image-recognition dir");
+        let image_path = image_dir.join("image.png");
+        fs::write(&image_path, "img").expect("should write image file");
+
+        let event = Event::ToolCallRequested {
+            tool: "mcp:zai-mcp-server:analyze_image".to_string(),
+            args: serde_json::json!({
+                "image_source": "image.png",
+                "prompt": "describe image"
+            }),
+        };
+
+        let payload = map_protocol_event(&event, Some(&workspace)).expect("payload should exist");
+        match payload {
+            ProtocolEventPayload::ToolCallRequested {
+                normalization: Some(normalization),
+                ..
+            } => {
+                assert_eq!(normalization.rewritten_count, 1);
+                assert_eq!(normalization.rewrites.len(), 1);
+                assert!(normalization.reject_preview.is_none());
+            }
+            _ => panic!("expected tool_call_requested payload with normalization"),
+        }
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn tool_call_requested_contains_normalization_reject_reason() {
+        let workspace = unique_temp_dir("mcp-path-gateway-normalization-reject");
+        fs::create_dir_all(workspace.join(".ah").join("image-recognition"))
+            .expect("should create image-recognition dir");
+
+        let event = Event::ToolCallRequested {
+            tool: "mcp:zai-mcp-server:analyze_image".to_string(),
+            args: serde_json::json!({
+                "image_source": "missing.png",
+                "prompt": "describe image"
+            }),
+        };
+
+        let payload = map_protocol_event(&event, Some(&workspace)).expect("payload should exist");
+        match payload {
+            ProtocolEventPayload::ToolCallRequested {
+                args,
+                normalization: Some(normalization),
+                ..
+            } => {
+                assert_eq!(args["image_source"].as_str(), Some("missing.png"));
+                assert_eq!(normalization.rewritten_count, 0);
+                let reject = normalization
+                    .reject_preview
+                    .expect("reject preview should be present");
+                assert!(!reject.field_path.trim().is_empty());
+                assert!(!reject.reason.trim().is_empty());
+            }
+            _ => panic!("expected tool_call_requested payload with reject preview"),
         }
 
         let _ = fs::remove_dir_all(workspace);
@@ -5622,6 +6244,137 @@ mod tests {
         assert!(guidance.contains("sample guidance warning"));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_stage2_guidance_result_includes_governance_and_memory() {
+        let root = unique_temp_dir("guidance-result");
+        let workspace_context = WorkspaceContext::from_root(root.clone());
+        workspace_context
+            .ensure_layout()
+            .expect("workspace layout should exist");
+
+        let runtime_resources = RuntimeResources {
+            mcp_manager: None,
+            tool_executor: None,
+            skill_config: SkillConfig {
+                enabled: false,
+                personal_dir: None,
+                project_dirs: Vec::new(),
+                auto_apply: false,
+            },
+            mcp_tool_contracts: Vec::new(),
+        };
+        let snapshot = Stage2GuidanceSnapshot::default();
+        let focus = Stage2GuidanceFocus::default();
+        let governance = GovernanceReport {
+            generated_at_unix_ms: 1,
+            scope: "runtime".to_string(),
+            summary: "sample".to_string(),
+            issues: vec![crate::agent_service::types::GovernanceIssue {
+                severity: crate::agent_service::types::GovernanceSeverity::Warning,
+                category: "memory".to_string(),
+                code: "memory_secret_exposure".to_string(),
+                message: "sample issue".to_string(),
+                evidence: None,
+                suggestion: None,
+            }],
+            blocker_count: 1,
+            warning_count: 2,
+            info_count: 3,
+        };
+        let recent_history = vec![AgentHistoryMessage {
+            role: AgentHistoryRole::System,
+            content: "Memory recall context (internal only):\n- note [workspace]: remember this\n- api token [credential]: sk-live-secret-value".to_string(),
+        }];
+
+        let result = build_stage2_guidance_result(
+            "analyze this",
+            &workspace_context,
+            &runtime_resources,
+            &snapshot,
+            &focus,
+            &governance,
+            &recent_history,
+            &MemoryRuntimeConfig::default(),
+        );
+
+        assert_eq!(result.input.governance.blocker_count, 1);
+        assert_eq!(result.input.governance.warning_count, 2);
+        assert_eq!(result.input.governance.info_count, 3);
+        assert_eq!(
+            result.input.governance.top_issue_codes,
+            vec!["memory_secret_exposure".to_string()]
+        );
+        assert!(result.input.memory.context_found);
+        assert_eq!(result.input.memory.non_secret_count, 1);
+        assert_eq!(result.input.memory.secret_count, 1);
+        assert!(result
+            .input
+            .memory
+            .redacted_lines
+            .iter()
+            .any(|line| line.contains("<redacted>")));
+        assert!(result
+            .output
+            .system_prompt_fragment
+            .contains("Governance guidance summary"));
+        assert!(result
+            .output
+            .system_prompt_fragment
+            .contains("Memory recall summary"));
+        assert!(!result
+            .output
+            .system_prompt_fragment
+            .contains("sk-live-secret-value"));
+        assert!(result.output.system_prompt_fragment.contains("<redacted>"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn guidance_context_protocol_event_emitted() {
+        let workspace = unique_temp_dir("guidance-context-event");
+        fs::create_dir_all(&workspace).expect("should create workspace");
+
+        let mut config = AgentRuntimeConfig::default();
+        config.provider = AgentProvider::Local;
+        config.model = "qwen2.5-coder:7b".to_string();
+        config.api_key_env = "LOCAL_API_KEY".to_string();
+        config.workspace.root_dir = workspace.to_string_lossy().to_string();
+        config.mcp.enabled = false;
+
+        let service = AgentService::new_with_config(config)
+            .await
+            .expect("service should initialize");
+        let events: std::sync::Arc<std::sync::Mutex<Vec<AgentEvent>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events_ref = std::sync::Arc::clone(&events);
+
+        service
+            .chat_stream(
+                "guidance-context-task".to_string(),
+                AgentStreamInput::text("/echo hello"),
+                move |event| {
+                    events_ref.lock().expect("lock events").push(event);
+                },
+            )
+            .await
+            .expect("stream should run");
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let events = events.lock().expect("lock events");
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                AgentEvent::ProtocolEvent {
+                    payload: ProtocolEventPayload::GuidanceContext { .. },
+                    ..
+                }
+            )
+        }));
+
+        let _ = fs::remove_dir_all(workspace);
     }
 
     #[test]
@@ -6124,6 +6877,17 @@ fn load_runtime_config() -> AgentRuntimeConfig {
             }
             Err(err) => {
                 log::warn!("failed to parse AGENT_SKILLS_CONFIG_JSON: {}", err);
+            }
+        }
+    }
+
+    if let Ok(memory_config_json) = std::env::var("AGENT_MEMORY_CONFIG_JSON") {
+        match serde_json::from_str::<MemoryRuntimeConfig>(&memory_config_json) {
+            Ok(memory_config) => {
+                config.memory = memory_config;
+            }
+            Err(err) => {
+                log::warn!("failed to parse AGENT_MEMORY_CONFIG_JSON: {}", err);
             }
         }
     }

@@ -30,6 +30,8 @@ pub struct AgentRuntimeConfig {
     pub mcp: McpRuntimeConfig,
     pub skills: SkillsRuntimeConfig,
     #[serde(default)]
+    pub memory: MemoryRuntimeConfig,
+    #[serde(default)]
     pub control: AppControlRuntimeConfig,
 }
 
@@ -47,6 +49,7 @@ impl Default for AgentRuntimeConfig {
             workspace: WorkspaceRuntimeConfig::default(),
             mcp: McpRuntimeConfig::default(),
             skills: SkillsRuntimeConfig::default(),
+            memory: MemoryRuntimeConfig::default(),
             control: AppControlRuntimeConfig::default(),
         }
     }
@@ -85,6 +88,36 @@ impl Default for AppControlRuntimeConfig {
             model_fallback_enabled: true,
             model_fallback_provider: default_control_fallback_provider(),
             model_fallback_model: default_control_fallback_model(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryRuntimeConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_memory_max_recall_items")]
+    pub max_recall_items: usize,
+    #[serde(default = "default_memory_max_non_secret_items")]
+    pub max_non_secret_items: usize,
+    #[serde(default = "default_memory_max_secret_items")]
+    pub max_secret_items: usize,
+    #[serde(default = "default_memory_secret_similarity_threshold")]
+    pub secret_similarity_threshold: f32,
+    #[serde(default = "default_true")]
+    pub require_explicit_secret_intent: bool,
+}
+
+impl Default for MemoryRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_recall_items: default_memory_max_recall_items(),
+            max_non_secret_items: default_memory_max_non_secret_items(),
+            max_secret_items: default_memory_max_secret_items(),
+            secret_similarity_threshold: default_memory_secret_similarity_threshold(),
+            require_explicit_secret_intent: true,
         }
     }
 }
@@ -312,6 +345,8 @@ pub enum ProtocolEventPayload {
     ToolCallRequested {
         tool: String,
         args: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        normalization: Option<ProtocolMcpArgNormalization>,
     },
     ToolCallResult {
         tool: String,
@@ -395,6 +430,126 @@ pub enum ProtocolEventPayload {
     GovernanceReport {
         report: GovernanceReport,
     },
+    GuidanceContext {
+        input: ProtocolGuidanceInput,
+        output: ProtocolGuidanceOutput,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolMcpRewriteEntry {
+    pub field_path: String,
+    pub reason: String,
+    pub before: String,
+    pub after: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolMcpRejectPreview {
+    pub field_path: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolMcpArgNormalization {
+    pub rewritten_count: usize,
+    #[serde(default)]
+    pub rewrites: Vec<ProtocolMcpRewriteEntry>,
+    pub reject_preview: Option<ProtocolMcpRejectPreview>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolGuidanceTemplate {
+    pub template_type: String,
+    pub target: String,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolGuidancePathVars {
+    pub workspace_root: String,
+    pub ah_dir: String,
+    pub screenshots_dir: String,
+    pub image_recognition_dir: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolGuidanceToolConstraint {
+    pub tool: String,
+    pub server_name: String,
+    pub image_tool: bool,
+    #[serde(default)]
+    pub image_fields: Vec<String>,
+    #[serde(default)]
+    pub path_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolGuidanceHitRules {
+    #[serde(default)]
+    pub signals: Vec<String>,
+    #[serde(default)]
+    pub selected_contracts: Vec<String>,
+    #[serde(default)]
+    pub selected_servers: Vec<String>,
+    #[serde(default)]
+    pub selected_prompts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolGuidanceGovernanceSummary {
+    pub blocker_count: usize,
+    pub warning_count: usize,
+    pub info_count: usize,
+    #[serde(default)]
+    pub top_issue_codes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolGuidanceMemorySummary {
+    pub enabled: bool,
+    pub context_found: bool,
+    pub non_secret_count: usize,
+    pub secret_count: usize,
+    #[serde(default)]
+    pub source_tags: Vec<String>,
+    #[serde(default)]
+    pub redacted_lines: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolGuidanceInput {
+    pub user_input: String,
+    pub workspace_root: String,
+    pub mcp_contracts_total: usize,
+    pub mcp_servers_total: usize,
+    pub skills_total: usize,
+    pub hit_rules: ProtocolGuidanceHitRules,
+    pub governance: ProtocolGuidanceGovernanceSummary,
+    pub memory: ProtocolGuidanceMemorySummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolGuidanceOutput {
+    pub system_prompt_fragment: String,
+    pub path_vars: ProtocolGuidancePathVars,
+    #[serde(default)]
+    pub tool_constraints: Vec<ProtocolGuidanceToolConstraint>,
+    #[serde(default)]
+    pub templates: Vec<ProtocolGuidanceTemplate>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -616,6 +771,22 @@ fn default_control_fallback_provider() -> AgentProvider {
 
 fn default_control_fallback_model() -> String {
     "qwen2.5-coder:7b".to_string()
+}
+
+fn default_memory_max_recall_items() -> usize {
+    8
+}
+
+fn default_memory_max_non_secret_items() -> usize {
+    3
+}
+
+fn default_memory_max_secret_items() -> usize {
+    2
+}
+
+fn default_memory_secret_similarity_threshold() -> f32 {
+    0.82
 }
 
 fn default_image_recognition_args_template() -> Value {

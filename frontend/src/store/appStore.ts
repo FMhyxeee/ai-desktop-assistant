@@ -1,4 +1,4 @@
-import { v4 as uuidv4 } from 'uuid';
+﻿import { v4 as uuidv4 } from 'uuid';
 import { create } from 'zustand';
 import { createDefaultConfig, normalizeStoredConfig } from '../config/providers';
 import { logger } from '../lib/logger';
@@ -98,9 +98,9 @@ const toInputCardFromOpPayload = (payload: ProtocolOpPayload): InputCard | undef
 const summarizeOpPayload = (payload: ProtocolOpPayload): string => {
   switch (payload.type) {
     case 'user_turn':
-      return `UserTurn · ${payload.text.slice(0, 80)}`;
+      return `UserTurn | ${payload.text.slice(0, 80)}`;
     case 'run_user_shell_command':
-      return `RunUserShellCommand · ${payload.command}`;
+      return `RunUserShellCommand | ${payload.command}`;
     case 'interrupt':
       return 'Interrupt';
   }
@@ -110,53 +110,64 @@ const summarizeOpPayload = (payload: ProtocolOpPayload): string => {
 const summarizeEventPayload = (payload: ProtocolEventPayload): string => {
   switch (payload.type) {
     case 'turn_started':
-      return `TurnStarted · ${payload.turn_id}`;
+      return `TurnStarted | ${payload.turn_id}`;
     case 'model_streaming':
-      return `ModelStreaming · ${payload.chunk.slice(0, 80)}`;
+      return `ModelStreaming | ${payload.chunk.slice(0, 80)}`;
     case 'model_complete':
-      return `ModelComplete · ${payload.usage.total_tokens} tokens`;
-    case 'tool_call_requested':
-      return `ToolCallRequested · ${payload.tool}`;
+      return `ModelComplete | ${payload.usage.total_tokens} tokens`;
+    case 'tool_call_requested': {
+      const rewrittenCount = payload.normalization?.rewrittenCount ?? 0;
+      const rejectReason = payload.normalization?.rejectPreview?.reason;
+      if (rejectReason) {
+        return `ToolCallRequested | ${payload.tool} | reject: ${rejectReason}`;
+      }
+      if (rewrittenCount > 0) {
+        return `ToolCallRequested | ${payload.tool} | rewrites:${rewrittenCount}`;
+      }
+      return `ToolCallRequested | ${payload.tool}`;
+    }
     case 'tool_call_result':
-      return `ToolCallResult · ${payload.tool}`;
+      return `ToolCallResult | ${payload.tool}`;
     case 'run_user_shell_command':
-      return `RunUserShellCommand · ${payload.command}`;
+      return `RunUserShellCommand | ${payload.command}`;
     case 'warning':
-      return `Warning · ${payload.message}`;
+      return `Warning | ${payload.message}`;
     case 'error':
-      return `Error · ${payload.message}`;
+      return `Error | ${payload.message}`;
     case 'turn_aborted':
-      return `TurnAborted · ${payload.reason}`;
+      return `TurnAborted | ${payload.reason}`;
     case 'turn_complete':
       return 'TurnComplete';
     case 'mcp_list_tools_response':
-      return `McpListToolsResponse · ${payload.tools.length} tools`;
+      return `McpListToolsResponse | ${payload.tools.length} tools`;
     case 'mcp_list_resources_response':
-      return `McpListResourcesResponse · ${payload.resources.length} resources`;
+      return `McpListResourcesResponse | ${payload.resources.length} resources`;
     case 'mcp_resource_content':
-      return `McpResourceContent · ${payload.uri}`;
+      return `McpResourceContent | ${payload.uri}`;
     case 'mcp_list_prompts_response':
-      return `McpListPromptsResponse · ${payload.prompts.length} prompts`;
+      return `McpListPromptsResponse | ${payload.prompts.length} prompts`;
     case 'mcp_prompt_result':
-      return `McpPromptResult · ${payload.messages.length} messages`;
+      return `McpPromptResult | ${payload.messages.length} messages`;
     case 'list_skills_response':
-      return `ListSkillsResponse · ${payload.skills.length} skills`;
+      return `ListSkillsResponse | ${payload.skills.length} skills`;
     case 'skill_content':
-      return `SkillContent · ${payload.name}`;
+      return `SkillContent | ${payload.name}`;
     case 'skill_applied':
-      return `SkillApplied · ${payload.name}`;
+      return `SkillApplied | ${payload.name}`;
     case 'skill_file_content':
-      return `SkillFileContent · ${payload.skill_name}/${payload.file_path}`;
+      return `SkillFileContent | ${payload.skill_name}/${payload.file_path}`;
     case 'governance_report':
-      return `GovernanceReport · B:${payload.report.blockerCount} W:${payload.report.warningCount} I:${payload.report.infoCount}`;
+      return `GovernanceReport | B:${payload.report.blockerCount} W:${payload.report.warningCount} I:${payload.report.infoCount}`;
+    case 'guidance_context':
+      return `GuidanceContext | contracts:${payload.input.mcpContractsTotal} servers:${payload.input.mcpServersTotal} skills:${payload.input.skillsTotal}`;
     case 'conversation_title_suggestion':
-      return `ConversationTitleSuggestion · ${payload.title}`;
+      return `ConversationTitleSuggestion | ${payload.title}`;
     case 'control_decision':
-      return `ControlDecision · ${payload.source} · ${payload.summary}`;
+      return `ControlDecision | ${payload.source} | ${payload.summary}`;
     case 'config_change_request':
-      return `ConfigChangeRequest · ${payload.summary}`;
+      return `ConfigChangeRequest | ${payload.summary}`;
     case 'config_change_result':
-      return `ConfigChangeResult · ${payload.approved ? 'approved' : 'rejected'} · ${payload.reason}`;
+      return `ConfigChangeResult | ${payload.approved ? 'approved' : 'rejected'} | ${payload.reason}`;
   }
   return 'UnknownEvent';
 };
@@ -166,6 +177,8 @@ const levelFromEventPayload = (payload: ProtocolEventPayload): ProtocolCardLevel
     case 'error':
     case 'turn_aborted':
       return 'error';
+    case 'tool_call_requested':
+      return payload.normalization?.rejectPreview ? 'warning' : 'info';
     case 'warning':
       return 'warning';
     case 'model_complete':
@@ -190,6 +203,8 @@ const levelFromEventPayload = (payload: ProtocolEventPayload): ProtocolCardLevel
         return 'warning';
       }
       return 'success';
+    case 'guidance_context':
+      return 'info';
     case 'config_change_request':
       return 'warning';
     case 'config_change_result':
@@ -725,7 +740,7 @@ export const useAppStore = create<AppState>((set, get) => ({
               }
               return {
                 ...item,
-                content: `请求失败: ${message}`,
+                content: `璇锋眰澶辫触: ${message}`,
                 isStreaming: false,
               };
             }),
@@ -764,7 +779,7 @@ export const useAppStore = create<AppState>((set, get) => ({
               }
               return {
                 ...item,
-                content: '[已取消]',
+                content: '[宸插彇娑圿',
                 isStreaming: false,
               };
             }),
@@ -1012,4 +1027,7 @@ useAppStore.subscribe((state) => {
     delayMs
   );
 });
+
+
+
 

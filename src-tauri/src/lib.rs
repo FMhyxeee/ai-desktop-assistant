@@ -45,15 +45,30 @@ async fn start_agent_stream(
     let mut stream_input = parse_stream_input(input)?;
     let service = { state.agent_service.lock().await.clone() };
     let workspace_root = service.current_workspace_root();
-    if let Ok(Some(recall_context)) = state
-        .storage_service
-        .build_recall_context(&workspace_root, &stream_input.content)
-        .await
-    {
-        stream_input.recent_messages.push(AgentHistoryMessage {
-            role: AgentHistoryRole::System,
-            content: recall_context,
-        });
+    let memory_config = service.current_memory_config();
+    if memory_config.enabled {
+        let recall_options = storage::RecallBuildOptions {
+            enabled: memory_config.enabled,
+            max_recall_items: memory_config.max_recall_items,
+            max_non_secret_items: memory_config.max_non_secret_items,
+            max_secret_items: memory_config.max_secret_items,
+            secret_similarity_threshold: memory_config.secret_similarity_threshold,
+            require_explicit_secret_intent: memory_config.require_explicit_secret_intent,
+        };
+        if let Ok(Some(recall_context)) = state
+            .storage_service
+            .build_recall_context_with_options(
+                &workspace_root,
+                &stream_input.content,
+                recall_options,
+            )
+            .await
+        {
+            stream_input.recent_messages.push(AgentHistoryMessage {
+                role: AgentHistoryRole::System,
+                content: recall_context,
+            });
+        }
     }
     service
         .chat_stream(task_id.clone(), stream_input, move |event: AgentEvent| {

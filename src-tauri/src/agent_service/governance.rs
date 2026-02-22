@@ -804,6 +804,7 @@ mod tests {
             workspace: Default::default(),
             mcp: McpRuntimeConfig::default(),
             skills: SkillsRuntimeConfig::default(),
+            memory: Default::default(),
             control: Default::default(),
         }
     }
