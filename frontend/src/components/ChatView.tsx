@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Menu, PanelRight, Settings } from 'lucide-react';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { FolderOpen, Menu, PanelRight, Save, Settings } from 'lucide-react';
 import MessageList from './MessageList';
 import ChatInput from './ChatInput';
 import ProtocolPanel from './ProtocolPanel';
@@ -35,9 +36,32 @@ const createTaskId = (): string => {
   return `task-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 };
 
+const DEFAULT_WORKSPACE_DISPLAY = '~/.ai-helper/workspaces/default';
+
+const normalizeWorkspaceRoot = (value: string): string => value.trim();
+
+const workspaceDisplayText = (value: string): string =>
+  value.length > 0 ? value : `自动默认目录 (${DEFAULT_WORKSPACE_DISPLAY})`;
+
+const getErrorMessage = (error: unknown): string => {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  if (typeof error === 'string' && error.trim().length > 0) {
+    return error;
+  }
+  return 'Operation failed. Please retry.';
+};
+
+type WorkspaceFeedback = {
+  type: 'success' | 'error';
+  message: string;
+};
+
 const ChatView: React.FC = () => {
   const {
     config,
+    updateConfig,
     conversations,
     currentConversationId,
     createConversation,
@@ -58,6 +82,7 @@ const ChatView: React.FC = () => {
     deleteConversation,
     retryFromCard,
     hydrate,
+    reloadWorkspaceConversations,
     isHydrated,
   } = useAppStore();
 
@@ -66,6 +91,10 @@ const ChatView: React.FC = () => {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [protocolOpen, setProtocolOpen] = useState(() => !detectCompactLayout());
   const [draftInput, setDraftInput] = useState<InputCard | null>(null);
+  const [workspaceEditorOpen, setWorkspaceEditorOpen] = useState(false);
+  const [workspaceDraft, setWorkspaceDraft] = useState(() => config.workspace.rootDir ?? '');
+  const [workspaceFeedback, setWorkspaceFeedback] = useState<WorkspaceFeedback | null>(null);
+  const [isApplyingWorkspace, setIsApplyingWorkspace] = useState(false);
   const unlistenRef = useRef<(() => void) | null>(null);
   const pendingDeltaByTaskRef = useRef<Map<string, string>>(new Map());
   const deltaFlushRafRef = useRef<number | null>(null);
@@ -73,6 +102,9 @@ const ChatView: React.FC = () => {
   const currentConversation = conversations.find(
     (conversation) => conversation.id === currentConversationId
   );
+  const appliedWorkspaceRoot = normalizeWorkspaceRoot(config.workspace.rootDir ?? '');
+  const workspaceDraftNormalized = normalizeWorkspaceRoot(workspaceDraft);
+  const workspaceChanged = workspaceDraftNormalized !== appliedWorkspaceRoot;
 
   const flushPendingDeltas = useCallback(() => {
     deltaFlushRafRef.current = null;
@@ -150,6 +182,10 @@ const ChatView: React.FC = () => {
   }, [config, isHydrated]);
 
   useEffect(() => {
+    setWorkspaceDraft(config.workspace.rootDir ?? '');
+  }, [config.workspace.rootDir]);
+
+  useEffect(() => {
     if (typeof window === 'undefined') {
       return;
     }
@@ -183,6 +219,10 @@ const ChatView: React.FC = () => {
 
       if (event.key === 'Escape') {
         let handled = false;
+        if (workspaceEditorOpen) {
+          setWorkspaceEditorOpen(false);
+          handled = true;
+        }
         if (settingsOpen) {
           setSettingsOpen(false);
           handled = true;
@@ -224,7 +264,7 @@ const ChatView: React.FC = () => {
 
     window.addEventListener('keydown', handleKeydown);
     return () => window.removeEventListener('keydown', handleKeydown);
-  }, [protocolOpen, settingsOpen, sidebarOpen]);
+  }, [protocolOpen, settingsOpen, sidebarOpen, workspaceEditorOpen]);
 
   const handleAgentEvent = useCallback(
     (event: AgentEvent) => {
@@ -521,6 +561,88 @@ const ChatView: React.FC = () => {
     []
   );
 
+  const handlePickWorkspaceDirectory = useCallback(async () => {
+    try {
+      const defaultPath =
+        workspaceDraftNormalized.length > 0 ? workspaceDraftNormalized : undefined;
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        defaultPath,
+      });
+
+      if (typeof selected === 'string' && selected.trim().length > 0) {
+        setWorkspaceDraft(selected.trim());
+        setWorkspaceFeedback(null);
+      }
+    } catch (error) {
+      setWorkspaceFeedback({
+        type: 'error',
+        message: getErrorMessage(error),
+      });
+    }
+  }, [workspaceDraftNormalized]);
+
+  const handleApplyWorkspace = useCallback(async () => {
+    if (streamingTaskId) {
+      setWorkspaceFeedback({
+        type: 'error',
+        message: 'A session is running. Stop generation before changing workspace.',
+      });
+      return;
+    }
+
+    if (!workspaceChanged) {
+      return;
+    }
+
+    setIsApplyingWorkspace(true);
+    setWorkspaceFeedback(null);
+
+    const nextRootDir = workspaceDraftNormalized;
+    const nextWorkspaceConfig = {
+      ...config.workspace,
+      rootDir: nextRootDir,
+    };
+
+    try {
+      await TauriAPI.updateRuntimeConfig({
+        ...config,
+        workspace: nextWorkspaceConfig,
+      });
+      await reloadWorkspaceConversations();
+      updateConfig({
+        workspace: nextWorkspaceConfig,
+      });
+      setWorkspaceFeedback({
+        type: 'success',
+        message:
+          nextRootDir.length > 0
+            ? 'Workspace directory updated.'
+            : 'Switched to default workspace directory.',
+      });
+    } catch (error) {
+      setWorkspaceFeedback({
+        type: 'error',
+        message: getErrorMessage(error),
+      });
+    } finally {
+      setIsApplyingWorkspace(false);
+    }
+  }, [
+    config,
+    reloadWorkspaceConversations,
+    streamingTaskId,
+    updateConfig,
+    workspaceChanged,
+    workspaceDraftNormalized,
+  ]);
+
+  const handleUseDefaultWorkspace = useCallback(() => {
+    setWorkspaceDraft('');
+    setWorkspaceFeedback(null);
+  }, []);
+
   const isStreaming = streamingTaskId !== null;
 
   return (
@@ -570,52 +692,127 @@ const ChatView: React.FC = () => {
 
         <main className="app-main">
           <header className="topbar">
-            <div className="topbar-left">
-              <button
-                type="button"
-                onClick={() => setSidebarOpen((value) => !value)}
-                className={`icon-btn ${sidebarOpen ? 'is-active' : ''}`}
-                title={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
-                aria-label={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
-              >
-                <Menu size={20} />
-              </button>
+            <div className="topbar-main">
+              <div className="topbar-left">
+                <button
+                  type="button"
+                  onClick={() => setSidebarOpen((value) => !value)}
+                  className={`icon-btn ${sidebarOpen ? 'is-active' : ''}`}
+                  title={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
+                  aria-label={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
+                >
+                  <Menu size={20} />
+                </button>
 
-              <div>
-                <h1 className="topbar-title">{currentConversation?.title || 'AI Desktop Assistant'}</h1>
-                <p className="topbar-subtitle">
-                  {isStreaming
-                    ? 'Streaming response with protocol events...'
-                    : 'Chat on the left, protocol timeline on the right'}
-                </p>
+                <div className="topbar-meta">
+                  <h1 className="topbar-title">{currentConversation?.title || 'AI Desktop Assistant'}</h1>
+                  <p className="topbar-subtitle">
+                    {isStreaming
+                      ? 'Streaming response with protocol events...'
+                      : 'Chat on the left, protocol timeline on the right'}
+                  </p>
+
+                  <div className="workspace-inline">
+                    <span className="workspace-inline-label">Workspace</span>
+                    <code className="workspace-inline-path" title={workspaceDisplayText(appliedWorkspaceRoot)}>
+                      {workspaceDisplayText(appliedWorkspaceRoot)}
+                    </code>
+                    <button
+                      type="button"
+                      className="workspace-inline-toggle"
+                      onClick={() => setWorkspaceEditorOpen((value) => !value)}
+                    >
+                      {workspaceEditorOpen ? '收起' : '修改目录'}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="topbar-actions">
+                <span className={`status-pill ${isStreaming ? 'live' : ''}`}>
+                  {isStreaming ? 'Running' : 'Ready'}
+                </span>
+
+                <button
+                  type="button"
+                  onClick={() => setProtocolOpen((value) => !value)}
+                  className={`icon-btn ${protocolOpen ? 'is-active' : ''}`}
+                  title={protocolOpen ? 'Hide protocol panel' : 'Show protocol panel'}
+                  aria-label={protocolOpen ? 'Hide protocol panel' : 'Show protocol panel'}
+                >
+                  <PanelRight size={20} />
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setSettingsOpen(true)}
+                  className="icon-btn"
+                  title="Settings"
+                  aria-label="Open settings"
+                >
+                  <Settings size={20} />
+                </button>
               </div>
             </div>
 
-            <div className="topbar-actions">
-              <span className={`status-pill ${isStreaming ? 'live' : ''}`}>
-                {isStreaming ? 'Running' : 'Ready'}
-              </span>
+            {workspaceEditorOpen && (
+              <div className="workspace-editor-panel">
+                <div className="workspace-editor-controls">
+                  <input
+                    type="text"
+                    className="workspace-editor-input"
+                    value={workspaceDraft}
+                    onChange={(event) => {
+                      setWorkspaceDraft(event.target.value);
+                      setWorkspaceFeedback(null);
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault();
+                        void handleApplyWorkspace();
+                      }
+                    }}
+                    placeholder={`留空使用默认目录（${DEFAULT_WORKSPACE_DISPLAY}）`}
+                    disabled={isStreaming || isApplyingWorkspace}
+                  />
 
-              <button
-                type="button"
-                onClick={() => setProtocolOpen((value) => !value)}
-                className={`icon-btn ${protocolOpen ? 'is-active' : ''}`}
-                title={protocolOpen ? 'Hide protocol panel' : 'Show protocol panel'}
-                aria-label={protocolOpen ? 'Hide protocol panel' : 'Show protocol panel'}
-              >
-                <PanelRight size={20} />
-              </button>
+                  <div className="workspace-editor-actions">
+                    <button
+                      type="button"
+                      className="btn-ghost"
+                      onClick={() => void handlePickWorkspaceDirectory()}
+                      disabled={isStreaming || isApplyingWorkspace}
+                    >
+                      <FolderOpen size={16} />选择目录
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-ghost"
+                      onClick={handleUseDefaultWorkspace}
+                      disabled={isStreaming || isApplyingWorkspace}
+                    >
+                      使用默认
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-primary"
+                      onClick={() => void handleApplyWorkspace()}
+                      disabled={isStreaming || isApplyingWorkspace || !workspaceChanged}
+                    >
+                      <Save size={16} />
+                      {isApplyingWorkspace ? '应用中...' : '应用'}
+                    </button>
+                  </div>
+                </div>
 
-              <button
-                type="button"
-                onClick={() => setSettingsOpen(true)}
-                className="icon-btn"
-                title="Settings"
-                aria-label="Open settings"
-              >
-                <Settings size={20} />
-              </button>
-            </div>
+                <p className="workspace-editor-note">
+                  运行时文件会写入 {'<workspace>/.ah'}（config、screenshots、tmp、image-recognition）。
+                </p>
+                {workspaceFeedback && (
+                  <p className={`workspace-editor-status ${workspaceFeedback.type}`}>{workspaceFeedback.message}</p>
+                )}
+              </div>
+            )}
           </header>
 
           <div className="workspace">
@@ -652,3 +849,4 @@ const ChatView: React.FC = () => {
 };
 
 export default ChatView;
+

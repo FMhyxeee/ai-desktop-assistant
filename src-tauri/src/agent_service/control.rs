@@ -229,9 +229,7 @@ async fn suggest_conversation_title_by_model(
     );
 
     let messages = vec![
-        Message::system(
-            "You generate conversation titles. Return JSON only: {\"title\":\"...\"}.",
-        ),
+        Message::system("You generate conversation titles. Return JSON only: {\"title\":\"...\"}."),
         Message::user(user_prompt),
     ];
 
@@ -278,7 +276,10 @@ fn heuristic_title_from_text(raw: &str) -> String {
         .take(4)
         .collect::<Vec<_>>()
         .join(" ");
-    let compact = without_lines.split_whitespace().collect::<Vec<_>>().join(" ");
+    let compact = without_lines
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
 
     let sentence = compact
         .split(|c| ['。', '.', '!', '?', ';', '；', '！', '？'].contains(&c))
@@ -425,15 +426,9 @@ fn parse_system_prompt_override(raw: &str) -> Option<String> {
 }
 
 fn is_enable_mcp_intent(text: &str) -> bool {
-    [
-        "enable mcp",
-        "turn on mcp",
-        "开启mcp",
-        "启用mcp",
-        "打开mcp",
-    ]
-    .iter()
-    .any(|pattern| text.contains(pattern))
+    ["enable mcp", "turn on mcp", "开启mcp", "启用mcp", "打开mcp"]
+        .iter()
+        .any(|pattern| text.contains(pattern))
 }
 
 fn is_disable_mcp_intent(text: &str) -> bool {
@@ -487,6 +482,7 @@ mod tests {
             base_url: None,
             max_tokens: None,
             system_prompt: "base prompt".to_string(),
+            workspace: Default::default(),
             mcp: McpRuntimeConfig::default(),
             skills: SkillsRuntimeConfig::default(),
             control: AppControlRuntimeConfig::default(),

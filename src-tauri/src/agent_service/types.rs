@@ -25,6 +25,8 @@ pub struct AgentRuntimeConfig {
     pub base_url: Option<String>,
     pub max_tokens: Option<u32>,
     pub system_prompt: String,
+    #[serde(default)]
+    pub workspace: WorkspaceRuntimeConfig,
     pub mcp: McpRuntimeConfig,
     pub skills: SkillsRuntimeConfig,
     #[serde(default)]
@@ -42,11 +44,19 @@ impl Default for AgentRuntimeConfig {
             base_url: None,
             max_tokens: None,
             system_prompt: "You are a desktop AI assistant.".to_string(),
+            workspace: WorkspaceRuntimeConfig::default(),
             mcp: McpRuntimeConfig::default(),
             skills: SkillsRuntimeConfig::default(),
             control: AppControlRuntimeConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceRuntimeConfig {
+    #[serde(default)]
+    pub root_dir: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

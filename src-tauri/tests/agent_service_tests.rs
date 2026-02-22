@@ -4,6 +4,7 @@ use std::time::Duration;
 use ai_desktop_assistant_lib::agent_service::types::{
     AgentEvent, AgentProvider, AgentRuntimeConfig, AgentStreamInput, McpRuntimeConfig,
     McpServerRuntimeConfig, McpTransportKind, ProtocolEventPayload, SkillsRuntimeConfig,
+    WorkspaceRuntimeConfig,
 };
 use ai_desktop_assistant_lib::agent_service::{
     run_governance_scan_with_config, scan_skills_runtime_config, test_mcp_runtime_config,
@@ -184,12 +185,15 @@ Skill body
     )
     .unwrap();
 
-    let result = scan_skills_runtime_config(SkillsRuntimeConfig {
-        enabled: true,
-        personal_dir: Some(root.to_string_lossy().to_string()),
-        project_dirs: vec![],
-        auto_apply: false,
-    })
+    let result = scan_skills_runtime_config(
+        SkillsRuntimeConfig {
+            enabled: true,
+            personal_dir: Some(root.to_string_lossy().to_string()),
+            project_dirs: vec![],
+            auto_apply: false,
+        },
+        None,
+    )
     .await;
 
     assert!(result.success);
@@ -207,6 +211,7 @@ async fn startup_stream_emits_governance_protocol_event() {
         base_url: None,
         max_tokens: None,
         system_prompt: "local prompt".to_string(),
+        workspace: WorkspaceRuntimeConfig::default(),
         mcp: McpRuntimeConfig::default(),
         skills: SkillsRuntimeConfig::default(),
         control: Default::default(),
@@ -254,6 +259,7 @@ async fn governance_scan_flags_duplicate_mcp_server_names() {
         base_url: None,
         max_tokens: None,
         system_prompt: "local prompt".to_string(),
+        workspace: WorkspaceRuntimeConfig::default(),
         mcp: McpRuntimeConfig::default(),
         skills: SkillsRuntimeConfig::default(),
         control: Default::default(),

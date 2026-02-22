@@ -5,6 +5,7 @@ import {
   type McpRuntimeConfig,
   type McpServerConfig,
   type SkillsRuntimeConfig,
+  type WorkspaceConfig,
 } from '../types';
 
 export interface ProviderPreset {
@@ -145,6 +146,10 @@ export const createDefaultSkillsConfig = (): SkillsRuntimeConfig => ({
   autoApply: false,
 });
 
+export const createDefaultWorkspaceConfig = (): WorkspaceConfig => ({
+  rootDir: '',
+});
+
 export const createDefaultConfig = (provider: AgentProvider = AgentProvider.OpenAi): AppConfig => {
   const preset = getProviderPreset(provider);
   return {
@@ -156,6 +161,7 @@ export const createDefaultConfig = (provider: AgentProvider = AgentProvider.Open
     baseUrl: preset.supportsBaseUrl ? '' : undefined,
     maxTokens: preset.supportsMaxTokens ? 1024 : undefined,
     systemPrompt: preset.defaultSystemPrompt,
+    workspace: createDefaultWorkspaceConfig(),
     mcp: createDefaultMcpConfig(),
     skills: createDefaultSkillsConfig(),
   };
@@ -173,6 +179,7 @@ export const applyProviderDefaults = (config: AppConfig, provider: AgentProvider
     baseUrl: preset.supportsBaseUrl ? '' : undefined,
     maxTokens: preset.supportsMaxTokens ? (config.maxTokens ?? 1024) : undefined,
     systemPrompt: preset.defaultSystemPrompt,
+    workspace: config.workspace,
     mcp: config.mcp,
     skills: config.skills,
   };
@@ -354,6 +361,17 @@ const normalizeSkillsRuntimeConfig = (value: unknown): SkillsRuntimeConfig => {
   };
 };
 
+const normalizeWorkspaceConfig = (value: unknown): WorkspaceConfig => {
+  const defaults = createDefaultWorkspaceConfig();
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return defaults;
+  }
+  const source = value as Record<string, unknown>;
+  return {
+    rootDir: normalizeOptionalText(source.rootDir) ?? defaults.rootDir,
+  };
+};
+
 export const normalizeStoredConfig = (raw: unknown): Partial<AppConfig> => {
   if (!raw || typeof raw !== 'object') {
     return {};
@@ -388,6 +406,7 @@ export const normalizeStoredConfig = (raw: unknown): Partial<AppConfig> => {
     apiKeyEnv,
     apiKey,
     systemPrompt,
+    workspace: normalizeWorkspaceConfig(source.workspace),
     mcp: normalizeMcpRuntimeConfig(source.mcp),
     skills: normalizeSkillsRuntimeConfig(source.skills),
   };

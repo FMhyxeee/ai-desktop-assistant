@@ -4,11 +4,21 @@ import {
   type AgentHistoryMessage,
   type AgentEvent,
   type AppConfig,
+  type Conversation,
   type GovernanceReport,
   type GovernanceUpdateReport,
   type InputCard,
+  type MemoryDeletePersonalRequest,
+  type MemorySearchRequest,
+  type MemorySearchResponse,
+  type MemoryUpsertPersonalNoteRequest,
+  type MemoryUpsertPersonalSecretRequest,
   type McpConfigTestResult,
+  type PersonalMemoryEntry,
+  type PersonalMemoryListResponse,
   type SkillScanResult,
+  type StorageBootstrapRequest,
+  type StorageBootstrapResponse,
 } from '../types';
 
 interface RuntimeMcpServerPayload {
@@ -41,6 +51,10 @@ interface RuntimeSkillsPayload {
   autoApply: boolean;
 }
 
+interface RuntimeWorkspacePayload {
+  rootDir: string;
+}
+
 interface RuntimeConfigPayload {
   provider: string;
   model: string;
@@ -50,6 +64,7 @@ interface RuntimeConfigPayload {
   baseUrl: string | null;
   maxTokens: number | null;
   systemPrompt: string;
+  workspace: RuntimeWorkspacePayload;
   mcp: RuntimeMcpPayload;
   skills: RuntimeSkillsPayload;
 }
@@ -136,6 +151,10 @@ const toRuntimeSkillsPayload = (config: AppConfig): RuntimeSkillsPayload => ({
   autoApply: Boolean(config.skills.autoApply),
 });
 
+const toRuntimeWorkspacePayload = (config: AppConfig): RuntimeWorkspacePayload => ({
+  rootDir: normalizeOptionalText(config.workspace.rootDir) ?? '',
+});
+
 const toRuntimeConfigPayload = (config: AppConfig): RuntimeConfigPayload => {
   const apiKey = normalizeOptionalText(config.apiKey);
   const baseUrl = normalizeOptionalText(config.baseUrl);
@@ -149,6 +168,7 @@ const toRuntimeConfigPayload = (config: AppConfig): RuntimeConfigPayload => {
     baseUrl,
     maxTokens: normalizePositiveInt(config.maxTokens),
     systemPrompt: config.systemPrompt.trim(),
+    workspace: toRuntimeWorkspacePayload(config),
     mcp: toRuntimeMcpPayload(config),
     skills: toRuntimeSkillsPayload(config),
   };
@@ -264,6 +284,7 @@ export class TauriAPI {
     try {
       return await invoke<SkillScanResult>('scan_skills_config', {
         config: toRuntimeSkillsPayload(config),
+        workspace: toRuntimeWorkspacePayload(config),
       });
     } catch (error) {
       console.error('scan_skills_config error:', error);
@@ -308,6 +329,136 @@ export class TauriAPI {
       });
     } catch {
       // Keep console path as the fallback when Tauri command is unavailable.
+    }
+  }
+
+  static async storageBootstrap(
+    request?: StorageBootstrapRequest
+  ): Promise<StorageBootstrapResponse> {
+    try {
+      return await invoke<StorageBootstrapResponse>('storage_bootstrap', {
+        request: request ?? null,
+      });
+    } catch (error) {
+      console.error('storage_bootstrap error:', error);
+      throw new Error(
+        typeof error === 'string' ? error : 'Failed to bootstrap workspace storage'
+      );
+    }
+  }
+
+  static async storageUpsertConversation(conversation: Conversation): Promise<void> {
+    try {
+      await invoke('storage_upsert_conversation', { conversation });
+    } catch (error) {
+      console.error('storage_upsert_conversation error:', error);
+      throw new Error(
+        typeof error === 'string' ? error : 'Failed to upsert conversation'
+      );
+    }
+  }
+
+  static async storageDeleteConversation(conversationId: string): Promise<void> {
+    try {
+      await invoke('storage_delete_conversation', { conversationId });
+    } catch (error) {
+      console.error('storage_delete_conversation error:', error);
+      throw new Error(
+        typeof error === 'string' ? error : 'Failed to delete conversation'
+      );
+    }
+  }
+
+  static async storageSetCurrentConversation(
+    conversationId: string | null
+  ): Promise<void> {
+    try {
+      await invoke('storage_set_current_conversation', { conversationId });
+    } catch (error) {
+      console.error('storage_set_current_conversation error:', error);
+      throw new Error(
+        typeof error === 'string' ? error : 'Failed to persist current conversation'
+      );
+    }
+  }
+
+  static async storageExportConversation(
+    conversationId: string
+  ): Promise<Conversation> {
+    try {
+      return await invoke<Conversation>('storage_export_conversation', {
+        conversationId,
+      });
+    } catch (error) {
+      console.error('storage_export_conversation error:', error);
+      throw new Error(
+        typeof error === 'string' ? error : 'Failed to export conversation'
+      );
+    }
+  }
+
+  static async memorySearch(
+    request: MemorySearchRequest
+  ): Promise<MemorySearchResponse> {
+    try {
+      return await invoke<MemorySearchResponse>('memory_search', { request });
+    } catch (error) {
+      console.error('memory_search error:', error);
+      throw new Error(typeof error === 'string' ? error : 'Failed to search memory');
+    }
+  }
+
+  static async memoryUpsertPersonalNote(
+    request: MemoryUpsertPersonalNoteRequest
+  ): Promise<PersonalMemoryEntry> {
+    try {
+      return await invoke<PersonalMemoryEntry>('memory_upsert_personal_note', {
+        request,
+      });
+    } catch (error) {
+      console.error('memory_upsert_personal_note error:', error);
+      throw new Error(
+        typeof error === 'string' ? error : 'Failed to upsert personal note'
+      );
+    }
+  }
+
+  static async memoryUpsertPersonalSecret(
+    request: MemoryUpsertPersonalSecretRequest
+  ): Promise<PersonalMemoryEntry> {
+    try {
+      return await invoke<PersonalMemoryEntry>('memory_upsert_personal_secret', {
+        request,
+      });
+    } catch (error) {
+      console.error('memory_upsert_personal_secret error:', error);
+      throw new Error(
+        typeof error === 'string' ? error : 'Failed to upsert personal secret'
+      );
+    }
+  }
+
+  static async memoryListPersonal(): Promise<PersonalMemoryListResponse> {
+    try {
+      return await invoke<PersonalMemoryListResponse>('memory_list_personal');
+    } catch (error) {
+      console.error('memory_list_personal error:', error);
+      throw new Error(
+        typeof error === 'string' ? error : 'Failed to list personal memory'
+      );
+    }
+  }
+
+  static async memoryDeletePersonal(
+    request: MemoryDeletePersonalRequest
+  ): Promise<void> {
+    try {
+      await invoke('memory_delete_personal', { request });
+    } catch (error) {
+      console.error('memory_delete_personal error:', error);
+      throw new Error(
+        typeof error === 'string' ? error : 'Failed to delete personal memory'
+      );
     }
   }
 

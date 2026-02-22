@@ -522,21 +522,34 @@ select {
   position: sticky;
   top: 0;
   z-index: 20;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 20px;
-  padding: 14px 22px;
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 12px 22px;
   border-bottom: 1px solid rgba(204, 214, 232, 0.72);
   background: rgba(248, 251, 255, 0.84);
   backdrop-filter: blur(16px);
 }
 
-.topbar-left {
+.topbar-main {
   display: flex;
   align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  min-width: 0;
+}
+
+.topbar-left {
+  display: flex;
+  align-items: flex-start;
   gap: 14px;
   min-width: 0;
+}
+
+.topbar-meta {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
 }
 
 .topbar-title {
@@ -564,6 +577,115 @@ select {
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.workspace-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.workspace-inline-label {
+  margin: 0;
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--ink-500);
+  white-space: nowrap;
+}
+
+.workspace-inline-path {
+  margin: 0;
+  min-width: 0;
+  max-width: min(54vw, 620px);
+  border-radius: 8px;
+  padding: 2px 8px;
+  font-size: 0.72rem;
+  color: var(--ink-700);
+  background: rgba(47, 69, 104, 0.08);
+  border: 1px solid rgba(47, 69, 104, 0.14);
+  font-family: 'IBM Plex Mono', monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.workspace-inline-toggle {
+  border: none;
+  border-radius: 8px;
+  padding: 4px 8px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: var(--ink-700);
+  background: rgba(43, 64, 98, 0.08);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 170ms var(--ease-smooth), color 170ms var(--ease-smooth);
+}
+
+.workspace-inline-toggle:hover {
+  color: var(--ink-900);
+  background: rgba(43, 64, 98, 0.14);
+}
+
+.workspace-editor-panel {
+  display: grid;
+  gap: 8px;
+  border: 1px solid rgba(195, 208, 229, 0.86);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.82);
+  padding: 10px;
+}
+
+.workspace-editor-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.workspace-editor-input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid rgba(179, 194, 217, 0.9);
+  border-radius: 11px;
+  padding: 9px 11px;
+  color: var(--ink-900);
+  background: rgba(252, 254, 255, 0.98);
+  transition: border-color 170ms var(--ease-smooth), box-shadow 170ms var(--ease-smooth);
+}
+
+.workspace-editor-input:focus {
+  outline: none;
+  border-color: rgba(255, 123, 31, 0.72);
+  box-shadow: 0 0 0 3px rgba(255, 123, 31, 0.16);
+}
+
+.workspace-editor-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.workspace-editor-note {
+  margin: 0;
+  font-size: 0.72rem;
+  color: var(--ink-500);
+}
+
+.workspace-editor-status {
+  margin: 0;
+  font-size: 0.74rem;
+}
+
+.workspace-editor-status.success {
+  color: var(--mint);
+}
+
+.workspace-editor-status.error {
+  color: var(--danger);
 }
 
 .status-pill {
@@ -1777,6 +1899,27 @@ select {
     border-radius: 20px;
   }
 
+  .topbar-main {
+    align-items: flex-start;
+  }
+
+  .workspace-inline {
+    flex-wrap: wrap;
+  }
+
+  .workspace-inline-path {
+    max-width: min(66vw, 420px);
+  }
+
+  .workspace-editor-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .workspace-editor-actions {
+    flex-wrap: wrap;
+  }
+
   .mobile-only {
     display: inline-flex;
   }
@@ -1834,6 +1977,28 @@ select {
 
   .topbar {
     padding: 12px 12px;
+  }
+
+  .topbar-main {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+  }
+
+  .workspace-inline-path {
+    max-width: none;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .workspace-editor-actions {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .workspace-editor-actions .btn-primary,
+  .workspace-editor-actions .btn-ghost {
+    justify-content: center;
   }
 
   .status-pill {

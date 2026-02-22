@@ -6,7 +6,7 @@ use super::scan_skills_runtime_config;
 use super::test_mcp_runtime_config;
 use super::types::{
     AgentProvider, AgentRuntimeConfig, GovernanceIssue, GovernanceReport, GovernanceSeverity,
-    McpRuntimeConfig, McpTransportKind, SkillsRuntimeConfig,
+    McpRuntimeConfig, McpTransportKind, SkillsRuntimeConfig, WorkspaceRuntimeConfig,
 };
 
 pub async fn scan_runtime_governance(config: &AgentRuntimeConfig) -> GovernanceReport {
@@ -14,10 +14,28 @@ pub async fn scan_runtime_governance(config: &AgentRuntimeConfig) -> GovernanceR
 
     check_agent_runtime_config(config, &mut issues);
     check_mcp_runtime_config(&config.mcp, &config.model_supports_image_input, &mut issues).await;
-    check_skills_runtime_config(&config.skills, &mut issues).await;
-    check_workspace_consistency(&mut issues);
+    check_skills_runtime_config(&config.skills, &config.workspace, &mut issues).await;
+    check_workspace_consistency(config, &mut issues);
+    check_memory_runtime_dependencies(&mut issues);
 
     finalize_report("workspace+runtime".to_string(), issues)
+}
+
+fn check_memory_runtime_dependencies(issues: &mut Vec<GovernanceIssue>) {
+    if !crate::storage::sqlite_vec_available() {
+        push_issue(
+            issues,
+            GovernanceSeverity::Warning,
+            "memory",
+            "memory_sqlite_vec_unavailable",
+            "sqlite-vec extension is unavailable; memory vector recall is degraded.",
+            None,
+            Some(
+                "Verify sqlite-vec runtime initialization and bundled SQLite compatibility."
+                    .to_string(),
+            ),
+        );
+    }
 }
 
 fn check_agent_runtime_config(config: &AgentRuntimeConfig, issues: &mut Vec<GovernanceIssue>) {
@@ -357,6 +375,7 @@ async fn check_mcp_runtime_config(
 
 async fn check_skills_runtime_config(
     config: &SkillsRuntimeConfig,
+    workspace: &WorkspaceRuntimeConfig,
     issues: &mut Vec<GovernanceIssue>,
 ) {
     if !config.enabled {
@@ -398,7 +417,7 @@ async fn check_skills_runtime_config(
         }
     }
 
-    let scan = scan_skills_runtime_config(config.clone()).await;
+    let scan = scan_skills_runtime_config(config.clone(), Some(workspace.clone())).await;
     for warning in scan.warnings {
         push_issue(
             issues,
@@ -440,7 +459,34 @@ async fn check_skills_runtime_config(
     }
 }
 
-fn check_workspace_consistency(issues: &mut Vec<GovernanceIssue>) {
+fn check_workspace_consistency(config: &AgentRuntimeConfig, issues: &mut Vec<GovernanceIssue>) {
+    let runtime_workspace = super::WorkspaceContext::resolve(&config.workspace);
+    if !runtime_workspace.warnings.is_empty() {
+        push_issue(
+            issues,
+            GovernanceSeverity::Warning,
+            "workspace",
+            "workspace_resolution_fallback",
+            "Workspace resolution required fallback.",
+            Some(runtime_workspace.warnings.join(" | ")),
+            Some("Check workspace.rootDir and filesystem permissions.".to_string()),
+        );
+    }
+
+    if let Err(err) = runtime_workspace.ensure_layout() {
+        push_issue(
+            issues,
+            GovernanceSeverity::Blocker,
+            "workspace",
+            "workspace_ah_unavailable",
+            "Workspace .ah directory tree is unavailable.",
+            Some(err),
+            Some("Ensure workspace path is writable and retry.".to_string()),
+        );
+    }
+
+    check_workspace_gitignore(&runtime_workspace.root_dir, issues);
+
     let current_dir = match std::env::current_dir() {
         Ok(path) => path,
         Err(err) => {
@@ -557,6 +603,58 @@ fn check_workspace_consistency(issues: &mut Vec<GovernanceIssue>) {
             );
         }
     }
+}
+
+fn check_workspace_gitignore(workspace_root: &Path, issues: &mut Vec<GovernanceIssue>) {
+    let Some(repo_root) = find_git_repo_root(workspace_root) else {
+        return;
+    };
+
+    let gitignore_path = repo_root.join(".gitignore");
+    let content = match std::fs::read_to_string(&gitignore_path) {
+        Ok(content) => content,
+        Err(_) => return,
+    };
+
+    if !contains_ah_ignore_rule(&content) {
+        push_issue(
+            issues,
+            GovernanceSeverity::Warning,
+            "workspace",
+            "workspace_gitignore_ah_missing",
+            "Git repository does not ignore .ah/ directory.",
+            Some(format!("path={}", gitignore_path.display())),
+            Some(
+                "Add '.ah/' to .gitignore to avoid committing workspace runtime files.".to_string(),
+            ),
+        );
+    }
+}
+
+fn find_git_repo_root(start: &Path) -> Option<PathBuf> {
+    for ancestor in start.ancestors() {
+        if ancestor.join(".git").exists() {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    None
+}
+
+fn contains_ah_ignore_rule(content: &str) -> bool {
+    content.lines().any(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return false;
+        }
+
+        let normalized = trimmed.replace('\\', "/");
+        normalized == ".ah"
+            || normalized == ".ah/"
+            || normalized == "/.ah"
+            || normalized == "/.ah/"
+            || normalized.contains(".ah/")
+            || normalized.ends_with("/.ah")
+    })
 }
 
 fn resolve_desktop_repo_root(start: &Path) -> Option<PathBuf> {
@@ -703,6 +801,7 @@ mod tests {
             base_url: None,
             max_tokens: None,
             system_prompt: "prompt".to_string(),
+            workspace: Default::default(),
             mcp: McpRuntimeConfig::default(),
             skills: SkillsRuntimeConfig::default(),
             control: Default::default(),
@@ -749,6 +848,26 @@ mod tests {
             .issues
             .iter()
             .any(|issue| issue.code == "agent_model_missing"));
+    }
+
+    #[tokio::test]
+    async fn scan_runtime_governance_warns_when_gitignore_missing_ah_rule() {
+        let temp_root =
+            std::env::temp_dir().join(format!("ai-helper-governance-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(temp_root.join(".git")).expect("should create .git");
+        std::fs::write(temp_root.join(".gitignore"), "target/\nnode_modules/\n")
+            .expect("should write .gitignore");
+
+        let mut config = make_config();
+        config.workspace.root_dir = temp_root.to_string_lossy().to_string();
+
+        let report = scan_runtime_governance(&config).await;
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.code == "workspace_gitignore_ah_missing"));
+
+        let _ = std::fs::remove_dir_all(temp_root);
     }
 
     #[test]

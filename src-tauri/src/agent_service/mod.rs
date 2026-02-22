@@ -39,6 +39,7 @@ use self::types::{
     ProtocolInputImage, ProtocolMcpPromptInfo, ProtocolMcpResourceInfo, ProtocolMcpToolInfo,
     ProtocolOpPayload, ProtocolPromptArgumentInfo, ProtocolPromptContent, ProtocolPromptMessage,
     ProtocolSkillEntry, ProtocolTokenUsage, SkillScanEntry, SkillScanResult, SkillsRuntimeConfig,
+    WorkspaceRuntimeConfig,
 };
 
 struct ActiveTask {
@@ -78,6 +79,140 @@ struct ConfigChangeApproval {
     persist: bool,
 }
 
+const AH_WORKSPACE_DIR_ENV: &str = "AH_WORKSPACE_DIR";
+const AH_DIR_ENV: &str = "AH_DIR";
+const AH_CONFIG_DIR_ENV: &str = "AH_CONFIG_DIR";
+const AH_SCREENSHOTS_DIR_ENV: &str = "AH_SCREENSHOTS_DIR";
+const AH_TMP_DIR_ENV: &str = "AH_TMP_DIR";
+const AH_IMAGE_RECOGNITION_DIR_ENV: &str = "AH_IMAGE_RECOGNITION_DIR";
+
+#[derive(Debug, Clone)]
+struct WorkspaceContext {
+    root_dir: PathBuf,
+    ah_dir: PathBuf,
+    config_dir: PathBuf,
+    screenshots_dir: PathBuf,
+    tmp_dir: PathBuf,
+    image_recognition_dir: PathBuf,
+    warnings: Vec<String>,
+}
+
+impl WorkspaceContext {
+    fn from_root(root_dir: PathBuf) -> Self {
+        let root_dir = normalize_path_lexical(&root_dir);
+        let ah_dir = root_dir.join(".ah");
+        let config_dir = ah_dir.join("config");
+        let screenshots_dir = ah_dir.join("screenshots");
+        let tmp_dir = ah_dir.join("tmp");
+        let image_recognition_dir = ah_dir.join("image-recognition");
+
+        Self {
+            root_dir,
+            ah_dir,
+            config_dir,
+            screenshots_dir,
+            tmp_dir,
+            image_recognition_dir,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn resolve(config: &WorkspaceRuntimeConfig) -> Self {
+        let mut warnings = Vec::new();
+        let configured_root = config.root_dir.trim();
+        let default_root = default_workspace_root();
+        let fallback_cwd =
+            absolute_path(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+        let initial_root = if configured_root.is_empty() {
+            default_root.clone()
+        } else {
+            absolute_path(&PathBuf::from(configured_root))
+        };
+
+        let mut context = Self::from_root(initial_root.clone());
+        if let Err(err) = context.ensure_layout() {
+            if configured_root.is_empty() {
+                warnings.push(format!(
+                    "Failed to initialize default workspace '{}' ({err}); falling back to current directory '{}'.",
+                    initial_root.display(),
+                    fallback_cwd.display()
+                ));
+            } else {
+                warnings.push(format!(
+                    "Failed to initialize configured workspace '{}' ({err}); falling back to default workspace '{}'.",
+                    initial_root.display(),
+                    default_root.display()
+                ));
+            }
+
+            context = Self::from_root(default_root.clone());
+            if let Err(default_err) = context.ensure_layout() {
+                warnings.push(format!(
+                    "Failed to initialize default workspace '{}' ({default_err}); falling back to current directory '{}'.",
+                    default_root.display(),
+                    fallback_cwd.display()
+                ));
+
+                context = Self::from_root(fallback_cwd.clone());
+                if let Err(cwd_err) = context.ensure_layout() {
+                    warnings.push(format!(
+                        "Failed to initialize fallback workspace directories under '{}' ({cwd_err}).",
+                        fallback_cwd.display()
+                    ));
+                }
+            }
+        }
+
+        context.warnings = warnings;
+        context
+    }
+
+    fn ensure_layout(&self) -> Result<(), String> {
+        for dir in [
+            &self.root_dir,
+            &self.ah_dir,
+            &self.config_dir,
+            &self.screenshots_dir,
+            &self.tmp_dir,
+            &self.image_recognition_dir,
+        ] {
+            std::fs::create_dir_all(dir).map_err(|err| {
+                format!("failed to create directory '{}': {}", dir.display(), err)
+            })?;
+        }
+        Ok(())
+    }
+
+    fn root_dir_string(&self) -> String {
+        self.root_dir.to_string_lossy().to_string()
+    }
+
+    fn inject_mcp_env(&self, env: &mut HashMap<String, String>) {
+        env.insert(AH_WORKSPACE_DIR_ENV.to_string(), self.root_dir_string());
+        env.insert(
+            AH_DIR_ENV.to_string(),
+            self.ah_dir.to_string_lossy().to_string(),
+        );
+        env.insert(
+            AH_CONFIG_DIR_ENV.to_string(),
+            self.config_dir.to_string_lossy().to_string(),
+        );
+        env.insert(
+            AH_SCREENSHOTS_DIR_ENV.to_string(),
+            self.screenshots_dir.to_string_lossy().to_string(),
+        );
+        env.insert(
+            AH_TMP_DIR_ENV.to_string(),
+            self.tmp_dir.to_string_lossy().to_string(),
+        );
+        env.insert(
+            AH_IMAGE_RECOGNITION_DIR_ENV.to_string(),
+            self.image_recognition_dir.to_string_lossy().to_string(),
+        );
+    }
+}
+
 #[derive(Clone)]
 pub struct AgentService {
     runner: Arc<dyn Runner>,
@@ -101,8 +236,12 @@ impl AgentService {
     }
 
     pub async fn new_with_config(config: AgentRuntimeConfig) -> Result<Self, AppError> {
+        let workspace = WorkspaceContext::resolve(&config.workspace);
+        for warning in &workspace.warnings {
+            log::warn!("workspace: {}", warning);
+        }
         let runner = AgentLibRunner::new(config.clone())?;
-        let _runtime_resources = build_runtime_resources(&config).await?;
+        let _runtime_resources = build_runtime_resources(&config, &workspace).await?;
         let latest_governance_report = Some(governance::scan_runtime_governance(&config).await);
         Ok(Self {
             runner: Arc::new(runner),
@@ -383,16 +522,26 @@ impl AgentService {
             });
         }
 
-        let runtime_resources = build_runtime_resources(&effective_config).await?;
+        let workspace_context = WorkspaceContext::resolve(&effective_config.workspace);
+        for warning in &workspace_context.warnings {
+            seq += 1;
+            emit(AgentEvent::ProtocolEvent {
+                task_id: task_id.clone(),
+                seq,
+                payload: ProtocolEventPayload::Warning {
+                    message: warning.clone(),
+                },
+            });
+        }
+
+        let runtime_resources =
+            build_runtime_resources(&effective_config, &workspace_context).await?;
         let model = build_model_client(&effective_config)?;
-        let default_cwd = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .to_string_lossy()
-            .to_string();
+        let default_cwd = workspace_context.root_dir_string();
         let session_config = SessionConfig {
             model: Some(model),
             default_model: effective_config.model.clone(),
-            default_cwd: Some(default_cwd),
+            default_cwd: Some(default_cwd.clone()),
             default_approval_policy: Some(ApprovalPolicy::NeverAsk),
             mcp_manager: runtime_resources.mcp_manager.clone(),
             tool_executor: runtime_resources.tool_executor.clone(),
@@ -413,6 +562,7 @@ impl AgentService {
             &input,
             &effective_config,
             runtime_resources.mcp_manager.clone(),
+            &workspace_context,
         )
         .await;
         let (op, op_payload, is_command_input) = build_stream_op(
@@ -420,6 +570,7 @@ impl AgentService {
             &effective_config,
             prepared_payload.model_payload_text,
             prompt_directives,
+            &workspace_context.root_dir,
         );
 
         for warning in prepared_payload.warnings {
@@ -444,6 +595,7 @@ impl AgentService {
         let task_key = task_id.clone();
         let task_id_for_worker = task_id.clone();
         let worker_handle = handle;
+        let workspace_root_for_protocol = workspace_context.root_dir.clone();
 
         let join_handle = tauri::async_runtime::spawn(async move {
             let mut seq = seq;
@@ -491,7 +643,9 @@ impl AgentService {
                     }
                 };
 
-                if let Some(payload) = map_protocol_event(&event) {
+                if let Some(payload) =
+                    map_protocol_event(&event, Some(&workspace_root_for_protocol))
+                {
                     seq += 1;
                     emit(AgentEvent::ProtocolEvent {
                         task_id: task_id_for_worker.clone(),
@@ -693,6 +847,13 @@ impl AgentService {
         Ok(governance::scan_runtime_governance(&config).await)
     }
 
+    pub fn current_workspace_root(&self) -> PathBuf {
+        if let Some(config) = self.runtime_config.as_ref() {
+            return WorkspaceContext::resolve(&config.workspace).root_dir;
+        }
+        WorkspaceContext::resolve(&WorkspaceRuntimeConfig::default()).root_dir
+    }
+
     pub async fn cancel(&self, task_id: &str) -> Result<(), AppError> {
         let mut pending = self.pending_config_requests.lock().await;
         let request_ids = pending
@@ -856,6 +1017,9 @@ pub async fn test_mcp_runtime_config(config: McpRuntimeConfig) -> McpConfigTestR
         };
     }
 
+    let workspace_context = WorkspaceContext::resolve(&WorkspaceRuntimeConfig::default());
+    let fallback_base_dir =
+        absolute_path(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let mut server_results = Vec::new();
     let default_timeout_secs = config.default_timeout_secs.unwrap_or(30).max(1);
     let max_retries = config.max_retries.unwrap_or(3);
@@ -875,7 +1039,12 @@ pub async fn test_mcp_runtime_config(config: McpRuntimeConfig) -> McpConfigTestR
             continue;
         }
 
-        let server_config = match map_runtime_mcp_server_config(server, default_timeout_secs) {
+        let server_config = match map_runtime_mcp_server_config(
+            server,
+            default_timeout_secs,
+            &workspace_context,
+            &fallback_base_dir,
+        ) {
             Ok(value) => value,
             Err(err) => {
                 server_results.push(McpServerTestResult {
@@ -944,7 +1113,10 @@ pub async fn test_mcp_runtime_config(config: McpRuntimeConfig) -> McpConfigTestR
     }
 }
 
-pub async fn scan_skills_runtime_config(config: SkillsRuntimeConfig) -> SkillScanResult {
+pub async fn scan_skills_runtime_config(
+    config: SkillsRuntimeConfig,
+    workspace: Option<WorkspaceRuntimeConfig>,
+) -> SkillScanResult {
     if !config.enabled {
         return SkillScanResult {
             success: true,
@@ -954,10 +1126,15 @@ pub async fn scan_skills_runtime_config(config: SkillsRuntimeConfig) -> SkillSca
         };
     }
 
-    let skill_config = map_runtime_skill_config(&config);
+    let workspace_runtime = workspace.unwrap_or_default();
+    let workspace_context = WorkspaceContext::resolve(&workspace_runtime);
+    let fallback_base_dir =
+        absolute_path(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let skill_config = map_runtime_skill_config(&config, &workspace_context, &fallback_base_dir);
     let mut warnings = Vec::new();
     let mut skills = Vec::new();
     let loader = SkillLoader::new();
+    warnings.extend(workspace_context.warnings.clone());
 
     if let Some(personal_dir) = &skill_config.personal_dir {
         match loader
@@ -1033,8 +1210,15 @@ pub async fn scan_skills_runtime_config(config: SkillsRuntimeConfig) -> SkillSca
 
 async fn build_runtime_resources(
     config: &AgentRuntimeConfig,
+    workspace_context: &WorkspaceContext,
 ) -> Result<RuntimeResources, AppError> {
-    let skill_config = map_runtime_skill_config(&config.skills);
+    workspace_context
+        .ensure_layout()
+        .map_err(AppError::InvalidConfig)?;
+    let fallback_base_dir =
+        absolute_path(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let skill_config =
+        map_runtime_skill_config(&config.skills, workspace_context, &fallback_base_dir);
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(ShellTool::new()));
     registry.register(Arc::new(FileSystemTool::new()));
@@ -1055,7 +1239,12 @@ async fn build_runtime_resources(
                 continue;
             }
 
-            let server_config = map_runtime_mcp_server_config(server, default_timeout_secs)?;
+            let server_config = map_runtime_mcp_server_config(
+                server,
+                default_timeout_secs,
+                workspace_context,
+                &fallback_base_dir,
+            )?;
             manager
                 .add_server_with_config(server_config)
                 .await
@@ -1064,15 +1253,19 @@ async fn build_runtime_resources(
 
         let tools = manager.get_all_tools().await;
         for (server_name, tool_def, client) in tools {
+            let call_name = tool_def.name.to_string();
+            let schema = Value::Object((*tool_def.input_schema).clone());
+            let contract = McpToolContract::compile(&server_name, &call_name, &schema);
             let tool = PrefixedMcpTool::new(
                 server_name,
-                tool_def.name.to_string(),
+                call_name,
                 tool_def
                     .description
                     .as_deref()
                     .unwrap_or_default()
                     .to_string(),
-                Value::Object((*tool_def.input_schema).clone()),
+                schema,
+                contract,
                 client,
             );
             registry.register(Arc::new(tool));
@@ -1087,8 +1280,14 @@ async fn build_runtime_resources(
     })
 }
 
-fn map_runtime_skill_config(config: &SkillsRuntimeConfig) -> SkillConfig {
-    let personal_dir = normalize_optional(config.personal_dir.clone()).map(PathBuf::from);
+fn map_runtime_skill_config(
+    config: &SkillsRuntimeConfig,
+    workspace_context: &WorkspaceContext,
+    fallback_base_dir: &Path,
+) -> SkillConfig {
+    let personal_dir = normalize_optional(config.personal_dir.clone()).map(|value| {
+        resolve_preferred_path(&value, &workspace_context.root_dir, fallback_base_dir)
+    });
     let project_dirs = config
         .project_dirs
         .iter()
@@ -1097,7 +1296,11 @@ fn map_runtime_skill_config(config: &SkillsRuntimeConfig) -> SkillConfig {
             if trimmed.is_empty() {
                 None
             } else {
-                Some(PathBuf::from(trimmed))
+                Some(resolve_preferred_path(
+                    trimmed,
+                    &workspace_context.root_dir,
+                    fallback_base_dir,
+                ))
             }
         })
         .collect::<Vec<_>>();
@@ -1113,12 +1316,16 @@ fn map_runtime_skill_config(config: &SkillsRuntimeConfig) -> SkillConfig {
 fn map_runtime_mcp_server_config(
     server: &McpServerRuntimeConfig,
     default_timeout_secs: u64,
+    workspace_context: &WorkspaceContext,
+    fallback_base_dir: &Path,
 ) -> Result<AgentMcpServerConfig, AppError> {
     let name = normalize_optional(Some(server.name.clone()))
         .ok_or_else(|| AppError::InvalidConfig("MCP server name cannot be empty".to_string()))?;
     let transport = map_runtime_transport(server.transport)?;
     let endpoint = normalize_optional(server.endpoint.clone()).unwrap_or_default();
-    let command = normalize_optional(server.command.clone());
+    let command = normalize_optional(server.command.clone()).map(|value| {
+        rewrite_mcp_command_or_arg(&value, &workspace_context.root_dir, fallback_base_dir)
+    });
     let args = server
         .args
         .iter()
@@ -1127,12 +1334,18 @@ fn map_runtime_mcp_server_config(
             if trimmed.is_empty() {
                 None
             } else {
-                Some(trimmed.to_string())
+                Some(rewrite_mcp_command_or_arg(
+                    trimmed,
+                    &workspace_context.root_dir,
+                    fallback_base_dir,
+                ))
             }
         })
         .collect::<Vec<_>>();
     let auth = map_runtime_mcp_auth(server.auth.as_ref(), &name)?;
     let tls = map_runtime_mcp_tls(server.tls.as_ref());
+    let mut env = normalize_map(&server.env);
+    workspace_context.inject_mcp_env(&mut env);
 
     Ok(AgentMcpServerConfig {
         name,
@@ -1145,7 +1358,7 @@ fn map_runtime_mcp_server_config(
         tls,
         timeout: Duration::from_secs(server.timeout_secs.unwrap_or(default_timeout_secs).max(1)),
         enabled: server.enabled,
-        env: normalize_map(&server.env),
+        env,
     })
 }
 
@@ -1312,6 +1525,138 @@ fn normalize_map(input: &HashMap<String, String>) -> HashMap<String, String> {
         .collect()
 }
 
+fn default_workspace_root() -> PathBuf {
+    let home = if cfg!(windows) {
+        std::env::var("USERPROFILE")
+            .ok()
+            .or_else(|| std::env::var("HOME").ok())
+    } else {
+        std::env::var("HOME")
+            .ok()
+            .or_else(|| std::env::var("USERPROFILE").ok())
+    };
+
+    if let Some(home_dir) = home {
+        return normalize_path_lexical(
+            &PathBuf::from(home_dir)
+                .join(".ai-helper")
+                .join("workspaces")
+                .join("default"),
+        );
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    normalize_path_lexical(&cwd.join(".ai-helper").join("workspaces").join("default"))
+}
+
+fn absolute_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return normalize_path_lexical(path);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        return normalize_path_lexical(&cwd.join(path));
+    }
+    normalize_path_lexical(path)
+}
+
+fn normalize_path_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    normalized
+}
+
+fn resolve_preferred_path(raw: &str, workspace_root: &Path, fallback_base: &Path) -> PathBuf {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return absolute_path(workspace_root);
+    }
+
+    let raw_path = PathBuf::from(trimmed);
+    if raw_path.is_absolute() {
+        return absolute_path(&raw_path);
+    }
+
+    let workspace_candidate = absolute_path(&workspace_root.join(trimmed));
+    if workspace_candidate.exists() {
+        return workspace_candidate;
+    }
+
+    let fallback_candidate = absolute_path(&fallback_base.join(trimmed));
+    if fallback_candidate.exists() {
+        return fallback_candidate;
+    }
+
+    workspace_candidate
+}
+
+fn resolve_existing_path(
+    raw: &str,
+    workspace_root: &Path,
+    fallback_base: &Path,
+) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let raw_path = PathBuf::from(trimmed);
+    if raw_path.is_absolute() {
+        return Some(absolute_path(&raw_path));
+    }
+
+    let workspace_candidate = absolute_path(&workspace_root.join(trimmed));
+    if workspace_candidate.exists() {
+        return Some(workspace_candidate);
+    }
+
+    let fallback_candidate = absolute_path(&fallback_base.join(trimmed));
+    if fallback_candidate.exists() {
+        return Some(fallback_candidate);
+    }
+
+    None
+}
+
+fn looks_like_path_token(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.contains("://") {
+        return false;
+    }
+
+    trimmed.starts_with("./")
+        || trimmed.starts_with(".\\")
+        || trimmed.starts_with("../")
+        || trimmed.starts_with("..\\")
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+}
+
+fn rewrite_mcp_command_or_arg(raw: &str, workspace_root: &Path, fallback_base: &Path) -> String {
+    let trimmed = raw.trim();
+    if !looks_like_path_token(trimmed) {
+        return trimmed.to_string();
+    }
+
+    if let Some(resolved) = resolve_existing_path(trimmed, workspace_root, fallback_base) {
+        return resolved.to_string_lossy().to_string();
+    }
+
+    trimmed.to_string()
+}
+
 fn skill_home_dir() -> Option<PathBuf> {
     if let Ok(home) = std::env::var("USERPROFILE") {
         return Some(PathBuf::from(home));
@@ -1319,12 +1664,755 @@ fn skill_home_dir() -> Option<PathBuf> {
     std::env::var("HOME").ok().map(PathBuf::from)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpPathFieldKind {
+    Generic,
+    Image,
+}
+
+#[derive(Debug, Clone)]
+struct McpSchemaPathRule {
+    path: Vec<String>,
+    kind: McpPathFieldKind,
+}
+
+#[derive(Debug, Clone)]
+struct McpToolContract {
+    public_name: String,
+    server_name: String,
+    call_name: String,
+    is_image_tool: bool,
+    schema_rules: Vec<McpSchemaPathRule>,
+}
+
+impl McpToolContract {
+    fn compile(server_name: &str, call_name: &str, schema: &Value) -> Self {
+        let mut schema_rules = Vec::new();
+        collect_schema_path_rules(schema, &mut Vec::new(), &mut schema_rules);
+        dedupe_schema_rules(&mut schema_rules);
+
+        Self {
+            public_name: format!("mcp:{server_name}:{call_name}"),
+            server_name: server_name.to_string(),
+            call_name: call_name.to_string(),
+            is_image_tool: is_image_tool_name(call_name),
+            schema_rules,
+        }
+    }
+
+    fn path_kind_for(&self, path: &[String]) -> Option<McpPathFieldKind> {
+        self.schema_rules
+            .iter()
+            .find(|rule| path_matches_rule(path, &rule.path))
+            .map(|rule| rule.kind)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct McpPathNormalizationReport {
+    rewritten_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct McpPathGatewayContext {
+    workspace_root: PathBuf,
+    image_recognition_dir: PathBuf,
+    screenshots_dir: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct McpPathGatewayReject {
+    field_path: String,
+    reason: String,
+}
+
+struct McpPathGateway;
+
+impl McpPathGateway {
+    fn from_tool_context(ctx: &ToolContext) -> Result<McpPathGatewayContext, AgentError> {
+        let Some(cwd) = ctx.cwd.as_deref().map(str::trim) else {
+            return Err(AgentError::Tool(
+                "mcp_path_gateway_rejected: missing tool context cwd".to_string(),
+            ));
+        };
+        if cwd.is_empty() {
+            return Err(AgentError::Tool(
+                "mcp_path_gateway_rejected: empty tool context cwd".to_string(),
+            ));
+        }
+
+        let workspace_root = absolute_path(Path::new(cwd));
+        Ok(McpPathGatewayContext {
+            image_recognition_dir: workspace_root.join(".ah").join("image-recognition"),
+            screenshots_dir: workspace_root.join(".ah").join("screenshots"),
+            workspace_root,
+        })
+    }
+}
+
+fn normalize_mcp_tool_args(
+    contract: &McpToolContract,
+    args: Map<String, Value>,
+    ctx: &ToolContext,
+) -> Result<Map<String, Value>, AgentError> {
+    normalize_mcp_tool_args_with_report(contract, args, ctx).map(|(value, _)| value)
+}
+
+fn normalize_mcp_tool_args_with_report(
+    contract: &McpToolContract,
+    mut args: Map<String, Value>,
+    ctx: &ToolContext,
+) -> Result<(Map<String, Value>, McpPathNormalizationReport), AgentError> {
+    let gateway = McpPathGateway::from_tool_context(ctx)?;
+    let mut report = McpPathNormalizationReport::default();
+
+    for (field_name, value) in args.iter_mut() {
+        let field_path = vec![field_name.clone()];
+        normalize_mcp_tool_arg_value(
+            contract,
+            &gateway,
+            value,
+            &field_path,
+            &mut report,
+        )
+        .map_err(|reject| {
+            log::warn!(
+                "mcp_path_gateway rejected arguments | tool={} server={} rejected_field={} reason={}",
+                contract.public_name,
+                contract.server_name,
+                reject.field_path,
+                reject.reason
+            );
+            AgentError::Tool(format!(
+                "mcp_path_gateway_rejected: field '{}' for tool '{}' ({})",
+                reject.field_path, contract.public_name, reject.reason
+            ))
+        })?;
+    }
+
+    Ok((args, report))
+}
+
+fn normalize_mcp_tool_arg_value(
+    contract: &McpToolContract,
+    gateway: &McpPathGatewayContext,
+    value: &mut Value,
+    current_path: &[String],
+    report: &mut McpPathNormalizationReport,
+) -> Result<(), McpPathGatewayReject> {
+    match value {
+        Value::Object(map) => {
+            for (key, item) in map {
+                let mut next_path = current_path.to_vec();
+                next_path.push(key.clone());
+                normalize_mcp_tool_arg_value(contract, gateway, item, &next_path, report)?;
+            }
+            Ok(())
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_mcp_tool_arg_value(contract, gateway, item, current_path, report)?;
+            }
+            Ok(())
+        }
+        Value::String(text) => {
+            let original = text.clone();
+            let current_key = current_path.last().map(String::as_str).unwrap_or_default();
+            if let Some(normalized) =
+                normalize_mcp_path_string(contract, gateway, current_path, current_key, &original)?
+            {
+                if normalized != original {
+                    *text = normalized;
+                    report.rewritten_count += 1;
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn normalize_mcp_path_string(
+    contract: &McpToolContract,
+    gateway: &McpPathGatewayContext,
+    current_path: &[String],
+    current_key: &str,
+    raw_value: &str,
+) -> Result<Option<String>, McpPathGatewayReject> {
+    let raw_trimmed = raw_value.trim();
+    if raw_trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let hint_kind = contract.path_kind_for(current_path);
+    let key_path_like = is_path_like_field_name(current_key);
+    let key_image_like = is_explicit_image_field_name(current_key);
+    let value_path_like = looks_like_path_value(raw_trimmed);
+    let value_image_basename = looks_like_image_basename(raw_trimmed);
+
+    let is_image_field = matches!(hint_kind, Some(McpPathFieldKind::Image))
+        || key_image_like
+        || (contract.is_image_tool && value_image_basename);
+    let is_path_field = hint_kind.is_some()
+        || key_path_like
+        || value_path_like
+        || (contract.is_image_tool && value_image_basename);
+
+    if !is_path_field {
+        return Ok(None);
+    }
+    if raw_trimmed.starts_with("data:") {
+        return Err(McpPathGatewayReject {
+            field_path: format_field_path(current_path),
+            reason: "data URL is not allowed for path field; expected local absolute path"
+                .to_string(),
+        });
+    }
+
+    let resolved = resolve_mcp_path_value(raw_trimmed, is_image_field, gateway, current_path)?;
+    validate_mcp_path_value(
+        &resolved.path,
+        is_image_field,
+        gateway,
+        current_path,
+        raw_trimmed,
+        resolved.requires_existence_check,
+    )?;
+
+    Ok(Some(resolved.path.to_string_lossy().to_string()))
+}
+
+struct ResolvedMcpPath {
+    path: PathBuf,
+    requires_existence_check: bool,
+}
+
+fn resolve_mcp_path_value(
+    raw_trimmed: &str,
+    is_image_field: bool,
+    gateway: &McpPathGatewayContext,
+    current_path: &[String],
+) -> Result<ResolvedMcpPath, McpPathGatewayReject> {
+    let raw_path = PathBuf::from(raw_trimmed);
+    if raw_path.is_absolute() {
+        return Ok(ResolvedMcpPath {
+            path: absolute_path(&raw_path),
+            requires_existence_check: is_image_field,
+        });
+    }
+
+    if looks_like_path_token(raw_trimmed) {
+        return Ok(ResolvedMcpPath {
+            path: absolute_path(&gateway.workspace_root.join(raw_trimmed)),
+            requires_existence_check: is_image_field,
+        });
+    }
+
+    if is_image_field {
+        let resolved = resolve_unique_image_path(raw_trimmed, gateway).map_err(|reason| {
+            McpPathGatewayReject {
+                field_path: format_field_path(current_path),
+                reason,
+            }
+        })?;
+        return Ok(ResolvedMcpPath {
+            path: resolved,
+            requires_existence_check: true,
+        });
+    }
+
+    let candidate = absolute_path(&gateway.workspace_root.join(raw_trimmed));
+    if !candidate.exists() {
+        return Err(McpPathGatewayReject {
+            field_path: format_field_path(current_path),
+            reason: format!(
+                "path '{}' was resolved to '{}' but does not exist",
+                raw_trimmed,
+                candidate.display()
+            ),
+        });
+    }
+    Ok(ResolvedMcpPath {
+        path: candidate,
+        requires_existence_check: true,
+    })
+}
+
+fn validate_mcp_path_value(
+    candidate: &Path,
+    is_image_field: bool,
+    gateway: &McpPathGatewayContext,
+    current_path: &[String],
+    raw_value: &str,
+    require_exists: bool,
+) -> Result<(), McpPathGatewayReject> {
+    let absolute_candidate = absolute_path(candidate);
+    let workspace_root = absolute_path(&gateway.workspace_root);
+    let image_recognition_dir = absolute_path(&gateway.image_recognition_dir);
+    let screenshots_dir = absolute_path(&gateway.screenshots_dir);
+
+    if is_image_field {
+        if require_exists && !absolute_candidate.exists() {
+            return Err(McpPathGatewayReject {
+                field_path: format_field_path(current_path),
+                reason: format!(
+                    "image path '{}' resolved to '{}' but file does not exist",
+                    raw_value,
+                    absolute_candidate.display()
+                ),
+            });
+        }
+        let allowed = is_path_within(&absolute_candidate, &image_recognition_dir)
+            || is_path_within(&absolute_candidate, &screenshots_dir);
+        if !allowed {
+            return Err(McpPathGatewayReject {
+                field_path: format_field_path(current_path),
+                reason: format!(
+                    "image path '{}' resolved to '{}' outside allowed dirs ('{}' or '{}')",
+                    raw_value,
+                    absolute_candidate.display(),
+                    image_recognition_dir.display(),
+                    screenshots_dir.display()
+                ),
+            });
+        }
+        return Ok(());
+    }
+
+    if !is_path_within(&absolute_candidate, &workspace_root) {
+        return Err(McpPathGatewayReject {
+            field_path: format_field_path(current_path),
+            reason: format!(
+                "path '{}' resolved to '{}' outside workspace '{}'",
+                raw_value,
+                absolute_candidate.display(),
+                workspace_root.display()
+            ),
+        });
+    }
+
+    Ok(())
+}
+
+fn resolve_unique_image_path(
+    raw_value: &str,
+    gateway: &McpPathGatewayContext,
+) -> Result<PathBuf, String> {
+    let mut candidates = Vec::<PathBuf>::new();
+    let normalized = raw_value.trim().to_ascii_lowercase();
+    let normalized_stem = Path::new(raw_value.trim())
+        .file_stem()
+        .and_then(|item| item.to_str())
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    for dir in [&gateway.image_recognition_dir, &gateway.screenshots_dir] {
+        collect_matching_image_paths(dir, &normalized, &normalized_stem, &mut candidates).map_err(
+            |err| {
+                format!(
+                    "failed to search image directory '{}': {}",
+                    dir.display(),
+                    err
+                )
+            },
+        )?;
+    }
+
+    candidates.sort();
+    candidates.dedup();
+    if candidates.is_empty() && is_generic_image_reference(raw_value) {
+        let mut fallback_candidates = Vec::<PathBuf>::new();
+        for dir in [&gateway.image_recognition_dir, &gateway.screenshots_dir] {
+            collect_all_file_paths(dir, &mut fallback_candidates).map_err(|err| {
+                format!(
+                    "failed to search fallback image directory '{}': {}",
+                    dir.display(),
+                    err
+                )
+            })?;
+        }
+
+        fallback_candidates.sort();
+        fallback_candidates.dedup();
+        if fallback_candidates.len() == 1 {
+            return Ok(absolute_path(&fallback_candidates[0]));
+        }
+    }
+
+    match candidates.len() {
+        1 => Ok(candidates[0].clone()),
+        0 => Err(format!(
+            "image '{}' was not found in '{}' or '{}'",
+            raw_value,
+            gateway.image_recognition_dir.display(),
+            gateway.screenshots_dir.display()
+        )),
+        _ => Err(format!(
+            "image '{}' is ambiguous: {} matches found",
+            raw_value,
+            candidates.len()
+        )),
+    }
+}
+
+fn is_generic_image_reference(raw_value: &str) -> bool {
+    let trimmed = raw_value.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || (trimmed.len() > 1 && trimmed.as_bytes()[1] == b':')
+    {
+        return false;
+    }
+
+    let path = Path::new(trimmed);
+    let stem = path
+        .file_stem()
+        .and_then(|item| item.to_str())
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let ext = path
+        .extension()
+        .and_then(|item| item.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let has_image_ext = ext.is_empty()
+        || matches!(
+            ext.as_str(),
+            "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff" | "tif" | "svg"
+        );
+    if !has_image_ext {
+        return false;
+    }
+
+    stem == "image"
+        || stem.starts_with("image-")
+        || stem.starts_with("image_")
+        || stem == "img"
+        || stem.starts_with("screenshot")
+        || stem.starts_with("screen")
+        || stem.starts_with("photo")
+        || stem.starts_with("picture")
+}
+
+fn collect_matching_image_paths(
+    root_dir: &Path,
+    normalized_raw: &str,
+    normalized_stem: &str,
+    out: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
+    if !root_dir.exists() {
+        return Ok(());
+    }
+
+    let mut stack = vec![root_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry_result in std::fs::read_dir(&dir)? {
+            let entry = entry_result?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !path.is_file() || !has_image_extension(&path) {
+                continue;
+            }
+
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let file_name_lower = file_name.to_ascii_lowercase();
+            let file_stem_lower = Path::new(file_name)
+                .file_stem()
+                .and_then(|item| item.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+
+            let matched = file_name_lower == normalized_raw
+                || (!normalized_stem.is_empty() && file_stem_lower == normalized_stem)
+                || (!normalized_stem.is_empty()
+                    && file_stem_lower.starts_with(&format!("{normalized_stem}-")));
+
+            if matched {
+                out.push(absolute_path(&path));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_all_file_paths(root_dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    if !root_dir.exists() {
+        return Ok(());
+    }
+
+    let mut stack = vec![root_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry_result in std::fs::read_dir(&dir)? {
+            let entry = entry_result?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.is_file() {
+                out.push(absolute_path(&path));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn has_image_extension(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|item| item.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff" | "tif" | "svg"
+    )
+}
+
+fn is_path_within(candidate: &Path, root: &Path) -> bool {
+    let candidate = absolute_path(candidate);
+    let root = absolute_path(root);
+    candidate.starts_with(&root)
+}
+
+fn format_field_path(path: &[String]) -> String {
+    path.iter()
+        .map(|segment| segment.trim())
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn collect_schema_path_rules(
+    schema: &Value,
+    current_path: &mut Vec<String>,
+    out: &mut Vec<McpSchemaPathRule>,
+) {
+    let Some(schema_object) = schema.as_object() else {
+        return;
+    };
+
+    if let Some(properties) = schema_object.get("properties").and_then(Value::as_object) {
+        for (key, child_schema) in properties {
+            current_path.push(key.clone());
+            if let Some(kind) = classify_schema_path_field(key, child_schema) {
+                out.push(McpSchemaPathRule {
+                    path: current_path.clone(),
+                    kind,
+                });
+            }
+            collect_schema_path_rules(child_schema, current_path, out);
+            current_path.pop();
+        }
+    }
+
+    if let Some(items) = schema_object.get("items") {
+        collect_schema_path_rules(items, current_path, out);
+    }
+
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(variants) = schema_object.get(key).and_then(Value::as_array) {
+            for variant in variants {
+                collect_schema_path_rules(variant, current_path, out);
+            }
+        }
+    }
+}
+
+fn dedupe_schema_rules(rules: &mut Vec<McpSchemaPathRule>) {
+    let mut deduped = Vec::<McpSchemaPathRule>::new();
+
+    for rule in rules.drain(..) {
+        if let Some(existing) = deduped
+            .iter_mut()
+            .find(|item| path_matches_rule(&item.path, &rule.path))
+        {
+            if rule.kind == McpPathFieldKind::Image {
+                existing.kind = McpPathFieldKind::Image;
+            }
+            continue;
+        }
+        deduped.push(rule);
+    }
+
+    *rules = deduped;
+}
+
+fn path_matches_rule(current_path: &[String], rule_path: &[String]) -> bool {
+    current_path.len() == rule_path.len()
+        && current_path
+            .iter()
+            .zip(rule_path.iter())
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn classify_schema_path_field(key: &str, schema: &Value) -> Option<McpPathFieldKind> {
+    let normalized_key = key.trim().to_ascii_lowercase();
+    let description = schema
+        .as_object()
+        .and_then(|value| value.get("description"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let title = schema
+        .as_object()
+        .and_then(|value| value.get("title"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let metadata = format!("{description} {title}");
+
+    let key_image_hint = is_explicit_image_field_name(&normalized_key);
+    let key_path_hint = is_path_like_field_name(&normalized_key);
+    let metadata_path_hint = metadata.contains("path")
+        || metadata.contains("filepath")
+        || metadata.contains("file path")
+        || metadata.contains("local file")
+        || metadata.contains("absolute path")
+        || metadata.contains("full path");
+    let metadata_image_hint = metadata.contains("image") || metadata.contains("img");
+    let image_hint = key_image_hint || (metadata_image_hint && metadata_path_hint);
+    let path_hint = key_path_hint || metadata_path_hint;
+
+    if image_hint {
+        return Some(McpPathFieldKind::Image);
+    }
+    if path_hint {
+        return Some(McpPathFieldKind::Generic);
+    }
+    None
+}
+
+fn is_image_tool_name(tool_name: &str) -> bool {
+    let normalized = tool_name.trim().to_ascii_lowercase();
+    normalized.contains("analyze_image")
+        || normalized.contains("ocr")
+        || normalized.contains("vision")
+}
+
+fn is_path_like_field_name(key: &str) -> bool {
+    let normalized = key.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "path"
+            | "paths"
+            | "filepath"
+            | "file_path"
+            | "file"
+            | "files"
+            | "input_file"
+            | "output_file"
+            | "image"
+            | "image_path"
+            | "images"
+    ) || normalized.contains("path")
+        || normalized.ends_with("_file")
+        || normalized.ends_with("_files")
+        || normalized.ends_with("_filepath")
+        || normalized.ends_with("_file_path")
+        || normalized.starts_with("file_")
+        || normalized.starts_with("image_")
+        || normalized.ends_with("_image")
+        || normalized.ends_with("_image_path")
+}
+
+fn is_explicit_image_field_name(key: &str) -> bool {
+    let normalized = key.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "image"
+            | "images"
+            | "image_path"
+            | "image_source"
+            | "source_image"
+            | "input_image"
+            | "output_image"
+            | "image_file"
+            | "img"
+    ) || normalized.starts_with("image_")
+        || normalized.starts_with("img_")
+        || normalized.ends_with("_image")
+        || normalized.ends_with("_image_path")
+        || normalized.ends_with("_image_file")
+        || normalized.ends_with("_img")
+}
+
+fn looks_like_path_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.contains('\n')
+        || trimmed.contains('\r')
+        || trimmed.contains("://")
+    {
+        return false;
+    }
+    if trimmed.starts_with("./")
+        || trimmed.starts_with(".\\")
+        || trimmed.starts_with("../")
+        || trimmed.starts_with("..\\")
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('\\')
+    {
+        return true;
+    }
+    if trimmed.len() > 1 && trimmed.as_bytes()[1] == b':' {
+        return true;
+    }
+
+    let has_separator = trimmed.contains('/') || trimmed.contains('\\');
+    if has_separator {
+        return !trimmed.contains(' ') && !trimmed.contains('{') && !trimmed.contains('}');
+    }
+
+    looks_like_image_basename(trimmed)
+}
+
+fn looks_like_image_basename(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains('/')
+        || trimmed.contains('\\')
+        || (trimmed.len() > 1 && trimmed.as_bytes()[1] == b':')
+    {
+        return false;
+    }
+
+    let ext = Path::new(trimmed)
+        .extension()
+        .and_then(|item| item.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if ext.is_empty() {
+        return trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.');
+    }
+
+    matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff" | "tif" | "svg"
+    )
+}
+
 #[derive(Debug, Clone)]
 struct PrefixedMcpTool {
     public_name: String,
+    server_name: String,
     call_name: String,
     description: String,
     schema: Value,
+    contract: McpToolContract,
     client: Arc<McpClient>,
 }
 
@@ -1334,13 +2422,16 @@ impl PrefixedMcpTool {
         call_name: String,
         description: String,
         schema: Value,
+        contract: McpToolContract,
         client: Arc<McpClient>,
     ) -> Self {
         Self {
             public_name: format!("mcp:{server_name}:{call_name}"),
+            server_name,
             call_name,
             description,
             schema,
+            contract,
             client,
         }
     }
@@ -1356,7 +2447,7 @@ impl Tool for PrefixedMcpTool {
         }
     }
 
-    async fn execute(&self, args: Value, _ctx: &ToolContext) -> AgentResult<ToolResult> {
+    async fn execute(&self, args: Value, ctx: &ToolContext) -> AgentResult<ToolResult> {
         let arguments = match args {
             Value::Object(arguments) => arguments,
             _ => {
@@ -1365,13 +2456,24 @@ impl Tool for PrefixedMcpTool {
                 ));
             }
         };
+        let (normalized_arguments, report) =
+            normalize_mcp_tool_args_with_report(&self.contract, arguments, ctx)?;
+        if report.rewritten_count > 0 {
+            log::info!(
+                "mcp_path_gateway normalized arguments | tool={} server={} call_name={} rewritten_count={}",
+                self.public_name,
+                self.server_name,
+                self.contract.call_name,
+                report.rewritten_count
+            );
+        }
 
         let result = self
             .client
             .call_tool(CallToolRequestParams {
                 meta: None,
                 name: self.call_name.clone().into(),
-                arguments: Some(arguments),
+                arguments: Some(normalized_arguments),
                 task: None,
             })
             .await
@@ -1466,7 +2568,57 @@ fn current_time_millis() -> u64 {
         .unwrap_or_default()
 }
 
-fn map_protocol_event(event: &Event) -> Option<ProtocolEventPayload> {
+fn normalize_tool_call_requested_args_for_display(
+    tool: &str,
+    args: &Value,
+    workspace_root: Option<&Path>,
+) -> Value {
+    let Some(workspace_root) = workspace_root else {
+        return args.clone();
+    };
+    if !tool.starts_with("mcp:") {
+        return args.clone();
+    }
+    let Some(arguments) = args.as_object().cloned() else {
+        return args.clone();
+    };
+
+    let tool_name = tool.trim();
+    let stripped = tool_name.trim_start_matches("mcp:");
+    let Some((server_name, call_name)) = stripped.split_once(':') else {
+        return args.clone();
+    };
+
+    let contract = McpToolContract {
+        public_name: tool_name.to_string(),
+        server_name: server_name.trim().to_string(),
+        call_name: call_name.trim().to_string(),
+        is_image_tool: is_image_tool_name(call_name),
+        schema_rules: Vec::new(),
+    };
+    let workspace_root = absolute_path(workspace_root).to_string_lossy().to_string();
+    let ctx = ToolContext {
+        cwd: Some(workspace_root.clone()),
+        sandbox_root: Some(workspace_root),
+    };
+
+    match normalize_mcp_tool_args(&contract, arguments, &ctx) {
+        Ok(normalized) => Value::Object(normalized),
+        Err(err) => {
+            log::debug!(
+                "mcp_path_gateway preview normalization failed | tool={} reason={}",
+                tool_name,
+                err
+            );
+            args.clone()
+        }
+    }
+}
+
+fn map_protocol_event(
+    event: &Event,
+    workspace_root: Option<&Path>,
+) -> Option<ProtocolEventPayload> {
     match event {
         Event::TurnStarted { turn_id } => Some(ProtocolEventPayload::TurnStarted {
             turn_id: turn_id.clone(),
@@ -1480,7 +2632,7 @@ fn map_protocol_event(event: &Event) -> Option<ProtocolEventPayload> {
         }),
         Event::ToolCallRequested { tool, args } => Some(ProtocolEventPayload::ToolCallRequested {
             tool: tool.clone(),
-            args: args.clone(),
+            args: normalize_tool_call_requested_args_for_display(tool, args, workspace_root),
         }),
         Event::ToolCallResult { tool, result } => Some(ProtocolEventPayload::ToolCallResult {
             tool: tool.clone(),
@@ -1625,6 +2777,7 @@ async fn prepare_image_fallback_payload(
     input: &AgentStreamInput,
     config: &AgentRuntimeConfig,
     mcp_manager: Option<Arc<McpManager>>,
+    workspace_context: &WorkspaceContext,
 ) -> PreparedImageFallbackPayload {
     let mut prepared = PreparedImageFallbackPayload::default();
 
@@ -1632,11 +2785,30 @@ async fn prepare_image_fallback_payload(
         return prepared;
     };
 
-    if input.images.is_empty() || config.model_supports_image_input {
+    if input.images.is_empty() {
         return prepared;
     }
 
-    let fallback_note_text = append_image_note(&text, &input.images);
+    let mut persisted_local_paths = Vec::with_capacity(input.images.len());
+    for image in &input.images {
+        match persist_image_for_recognition(image, &workspace_context.image_recognition_dir) {
+            Ok(path) => persisted_local_paths.push(Some(path.to_string_lossy().to_string())),
+            Err(err) => {
+                prepared.warnings.push(format!(
+                    "Failed to persist image '{}' to local path for recognition: {}",
+                    image.name, err
+                ));
+                persisted_local_paths.push(None);
+            }
+        }
+    }
+
+    if config.model_supports_image_input {
+        return prepared;
+    }
+
+    let fallback_note_text =
+        append_image_note_with_local_paths(&text, &input.images, &persisted_local_paths);
     let image_recognition = &config.mcp.image_recognition;
     if !image_recognition.enabled {
         prepared
@@ -1701,21 +2873,14 @@ async fn prepare_image_fallback_payload(
 
     let mut recognized_sections = Vec::<(String, String)>::new();
 
-    for image in &input.images {
-        let local_path = match persist_image_for_recognition(image) {
-            Ok(path) => Some(path.to_string_lossy().to_string()),
-            Err(err) => {
-                prepared.warnings.push(format!(
-                    "Failed to persist image '{}' to local path for recognition: {}",
-                    image.name, err
-                ));
-                None
-            }
-        };
+    for (index, image) in input.images.iter().enumerate() {
+        let local_path = persisted_local_paths
+            .get(index)
+            .and_then(|item| item.as_deref());
         let rendered_template = render_image_recognition_args_template(
             &Value::Object(args_template.clone()),
             image,
-            local_path.as_deref(),
+            local_path,
         );
         let arguments = match rendered_template {
             Value::Object(arguments) => arguments,
@@ -1728,16 +2893,22 @@ async fn prepare_image_fallback_payload(
             }
         };
         let mut arguments_value = Value::Object(arguments);
-        if let Some(local_path_value) = local_path.as_deref() {
-            let rewritten = rewrite_image_like_arguments_to_local_path(
+        if let Some(local_path_value) = local_path {
+            let rewritten_image_like = rewrite_image_like_arguments_to_local_path(
                 &mut arguments_value,
                 &image.name,
                 local_path_value,
             );
-            if rewritten > 0 {
+            let rewritten_filename_refs = rewrite_filename_references_to_local_path(
+                &mut arguments_value,
+                &image.name,
+                local_path_value,
+            );
+            let rewritten_total = rewritten_image_like + rewritten_filename_refs;
+            if rewritten_total > 0 {
                 prepared.warnings.push(format!(
                     "Rewrote {} image argument field(s) to local path for '{}': {}",
-                    rewritten, image.name, local_path_value
+                    rewritten_total, image.name, local_path_value
                 ));
             }
         }
@@ -1867,7 +3038,10 @@ fn extract_base64_data_from_data_url(data_url: &str) -> Option<String> {
         .map(|(_, payload)| payload.to_string())
 }
 
-fn persist_image_for_recognition(image: &AgentInputImage) -> Result<PathBuf, String> {
+fn persist_image_for_recognition(
+    image: &AgentInputImage,
+    directory: &Path,
+) -> Result<PathBuf, String> {
     let base64_payload = extract_base64_data_from_data_url(&image.data_url)
         .ok_or_else(|| "invalid data url: missing payload".to_string())?;
     let normalized_payload = base64_payload
@@ -1879,12 +3053,11 @@ fn persist_image_for_recognition(image: &AgentInputImage) -> Result<PathBuf, Str
         .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(&normalized_payload))
         .map_err(|err| format!("base64 decode failed: {}", err))?;
 
-    let directory = image_fallback_directory();
-    std::fs::create_dir_all(&directory)
+    std::fs::create_dir_all(directory)
         .map_err(|err| format!("failed to create image fallback directory: {}", err))?;
 
     let safe_stem = sanitize_image_file_stem(&image.name);
-    let extension = extension_from_mime_type(&image.mime_type);
+    let extension = extension_for_persisted_image(image);
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
@@ -1899,12 +3072,6 @@ fn persist_image_for_recognition(image: &AgentInputImage) -> Result<PathBuf, Str
     std::fs::write(&path, image_bytes)
         .map_err(|err| format!("failed to write image fallback file: {}", err))?;
     Ok(path)
-}
-
-fn image_fallback_directory() -> PathBuf {
-    std::env::temp_dir()
-        .join("ai-desktop-assistant")
-        .join("image-recognition")
 }
 
 fn sanitize_image_file_stem(name: &str) -> String {
@@ -1930,16 +3097,42 @@ fn sanitize_image_file_stem(name: &str) -> String {
     }
 }
 
-fn extension_from_mime_type(mime_type: &str) -> &'static str {
-    match mime_type {
-        "image/png" => "png",
-        "image/jpeg" | "image/jpg" => "jpg",
-        "image/webp" => "webp",
-        "image/gif" => "gif",
-        "image/bmp" => "bmp",
-        "image/tiff" => "tiff",
-        _ => "bin",
+fn extension_for_persisted_image(image: &AgentInputImage) -> String {
+    if let Some(mapped) = extension_from_mime_type(&image.mime_type) {
+        return mapped.to_string();
     }
+    if let Some(from_name) = extension_from_filename(&image.name) {
+        return from_name;
+    }
+    "bin".to_string()
+}
+
+fn extension_from_mime_type(mime_type: &str) -> Option<&'static str> {
+    match mime_type {
+        "image/png" => Some("png"),
+        "image/jpeg" | "image/jpg" => Some("jpg"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        "image/bmp" => Some("bmp"),
+        "image/tiff" => Some("tiff"),
+        "image/svg+xml" => Some("svg"),
+        _ => None,
+    }
+}
+
+fn extension_from_filename(name: &str) -> Option<String> {
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|item| item.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff" | "tif" | "svg"
+    ) {
+        return Some(ext);
+    }
+    None
 }
 
 fn rewrite_image_like_arguments_to_local_path(
@@ -1992,6 +3185,15 @@ fn is_bare_image_filename_value(value: &str, original_name: &str) -> bool {
         return true;
     }
 
+    let original_stem = Path::new(original_name.trim())
+        .file_stem()
+        .and_then(|item| item.to_str())
+        .unwrap_or_default()
+        .trim();
+    if !original_stem.is_empty() && trimmed.eq_ignore_ascii_case(original_stem) {
+        return true;
+    }
+
     // Bare filename should not include path separators or a drive prefix.
     let has_separator = trimmed.contains('/') || trimmed.contains('\\');
     let has_drive_prefix = trimmed.len() > 1 && trimmed.as_bytes()[1] == b':';
@@ -2009,6 +3211,32 @@ fn is_bare_image_filename_value(value: &str, original_name: &str) -> bool {
         ext.as_str(),
         "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff" | "tif"
     )
+}
+
+fn rewrite_filename_references_to_local_path(
+    value: &mut Value,
+    original_name: &str,
+    local_path: &str,
+) -> usize {
+    match value {
+        Value::Object(map) => map
+            .values_mut()
+            .map(|item| rewrite_filename_references_to_local_path(item, original_name, local_path))
+            .sum(),
+        Value::Array(items) => items
+            .iter_mut()
+            .map(|item| rewrite_filename_references_to_local_path(item, original_name, local_path))
+            .sum(),
+        Value::String(text) => {
+            if is_bare_image_filename_value(text, original_name) {
+                *text = local_path.to_string();
+                1
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
 }
 
 fn extract_text_from_call_tool_result(result: &Value) -> Option<String> {
@@ -2099,6 +3327,7 @@ fn build_stream_op(
     config: &AgentRuntimeConfig,
     prepared_model_payload_text: Option<String>,
     prompt_directives: Option<PromptDirectives>,
+    workspace_root: &Path,
 ) -> (Op, ProtocolOpPayload, bool) {
     match parse_slash_input(&input.content) {
         ParsedStreamInput::Command(command) => (
@@ -2109,7 +3338,7 @@ fn build_stream_op(
             true,
         ),
         ParsedStreamInput::Text(text) => {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let cwd = workspace_root.to_path_buf();
             let protocol_images = input
                 .images
                 .iter()
@@ -2208,14 +3437,29 @@ fn encode_multimodal_text(text: &str, images: &[AgentInputImage]) -> String {
 }
 
 fn append_image_note(text: &str, images: &[AgentInputImage]) -> String {
+    append_image_note_with_local_paths(text, images, &[])
+}
+
+fn append_image_note_with_local_paths(
+    text: &str,
+    images: &[AgentInputImage],
+    local_paths: &[Option<String>],
+) -> String {
     let mut lines = Vec::new();
     if !text.is_empty() {
         lines.push(text.to_string());
         lines.push(String::new());
     }
     lines.push("User attached image files:".to_string());
-    for image in images {
-        lines.push(format!("- {} ({})", image.name, image.mime_type));
+    for (index, image) in images.iter().enumerate() {
+        if let Some(path) = local_paths.get(index).and_then(|item| item.as_deref()) {
+            lines.push(format!(
+                "- {} ({}) | local_path={}",
+                image.name, image.mime_type, path
+            ));
+        } else {
+            lines.push(format!("- {} ({})", image.name, image.mime_type));
+        }
     }
     lines.join("\n")
 }
@@ -2223,6 +3467,19 @@ fn append_image_note(text: &str, images: &[AgentInputImage]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn tool_context_for_workspace(workspace_root: &Path) -> ToolContext {
+        let cwd = absolute_path(workspace_root).to_string_lossy().to_string();
+        ToolContext {
+            cwd: Some(cwd.clone()),
+            sandbox_root: Some(cwd),
+        }
+    }
 
     #[test]
     fn slash_prefixed_text_becomes_command() {
@@ -2245,7 +3502,8 @@ mod tests {
             recent_messages: Vec::new(),
         };
         let config = AgentRuntimeConfig::default();
-        let (op, payload, is_command) = build_stream_op(&input, &config, None, None);
+        let (op, payload, is_command) =
+            build_stream_op(&input, &config, None, None, Path::new("."));
 
         assert!(is_command);
         assert!(matches!(
@@ -2272,7 +3530,8 @@ mod tests {
             recent_messages: Vec::new(),
         };
         let config = AgentRuntimeConfig::default();
-        let (op, payload, is_command) = build_stream_op(&input, &config, None, None);
+        let (op, payload, is_command) =
+            build_stream_op(&input, &config, None, None, Path::new("."));
 
         assert!(!is_command);
         match op {
@@ -2315,8 +3574,13 @@ mod tests {
         let mut config = AgentRuntimeConfig::default();
         config.model_supports_image_input = false;
 
-        let (op, _payload, _is_command) =
-            build_stream_op(&input, &config, Some("prepared text".to_string()), None);
+        let (op, _payload, _is_command) = build_stream_op(
+            &input,
+            &config,
+            Some("prepared text".to_string()),
+            None,
+            Path::new("."),
+        );
 
         match op {
             Op::UserTurn { items, .. } => match &items[0] {
@@ -2324,6 +3588,29 @@ mod tests {
                 _ => panic!("expected text item"),
             },
             _ => panic!("expected user turn op"),
+        }
+    }
+
+    #[test]
+    fn build_stream_op_uses_workspace_cwd_for_payload() {
+        let input = AgentStreamInput {
+            content: "hello".to_string(),
+            images: Vec::new(),
+            conversation_id: None,
+            recent_messages: Vec::new(),
+        };
+        let config = AgentRuntimeConfig::default();
+        let workspace_root = absolute_path(&unique_temp_dir("workspace-cwd"));
+
+        let (_op, payload, is_command) =
+            build_stream_op(&input, &config, None, None, &workspace_root);
+
+        assert!(!is_command);
+        match payload {
+            ProtocolOpPayload::UserTurn { cwd, .. } => {
+                assert_eq!(cwd, workspace_root.to_string_lossy().to_string());
+            }
+            _ => panic!("expected user turn payload"),
         }
     }
 
@@ -2391,11 +3678,647 @@ mod tests {
         assert_eq!(args["nested"]["file_path"], "C:\\temp\\image-123.png");
     }
 
+    #[test]
+    fn rewrite_filename_references_to_local_path_updates_non_image_like_key() {
+        let mut args = serde_json::json!({
+            "input": "image.png",
+            "nested": {
+                "source": "image"
+            }
+        });
+
+        let rewritten = rewrite_filename_references_to_local_path(
+            &mut args,
+            "image.png",
+            "C:\\temp\\image-123.png",
+        );
+
+        assert_eq!(rewritten, 2);
+        assert_eq!(args["input"], "C:\\temp\\image-123.png");
+        assert_eq!(args["nested"]["source"], "C:\\temp\\image-123.png");
+    }
+
+    #[test]
+    fn is_bare_image_filename_value_accepts_original_stem() {
+        assert!(is_bare_image_filename_value("image", "image.png"));
+        assert!(is_bare_image_filename_value("IMAGE", "image.png"));
+    }
+
+    #[test]
+    fn normalize_mcp_tool_args_rewrites_analyze_image_filename_to_absolute_path() {
+        let workspace = unique_temp_dir("mcp-path-gateway-image-single");
+        let image_dir = workspace.join(".ah").join("image-recognition");
+        fs::create_dir_all(&image_dir).expect("should create image-recognition dir");
+        let image_path = image_dir.join("demo.png");
+        fs::write(&image_path, "img").expect("should write image file");
+
+        let contract = McpToolContract::compile(
+            "zai-mcp-server",
+            "analyze_image",
+            &serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "image": { "type": "string", "description": "Image file path" }
+                }
+            }),
+        );
+        let ctx = tool_context_for_workspace(&workspace);
+        let args = serde_json::json!({ "image": "demo.png" })
+            .as_object()
+            .cloned()
+            .expect("args should be object");
+
+        let normalized =
+            normalize_mcp_tool_args(&contract, args, &ctx).expect("normalization should succeed");
+        let expected = absolute_path(&image_path).to_string_lossy().to_string();
+        assert_eq!(
+            normalized.get("image").and_then(Value::as_str),
+            Some(expected.as_str())
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn normalize_mcp_tool_args_rejects_when_image_filename_not_found() {
+        let workspace = unique_temp_dir("mcp-path-gateway-image-missing");
+        fs::create_dir_all(workspace.join(".ah").join("image-recognition"))
+            .expect("should create image-recognition dir");
+
+        let contract = McpToolContract::compile(
+            "zai-mcp-server",
+            "analyze_image",
+            &serde_json::json!({
+                "type": "object",
+                "properties": { "image": { "type": "string" } }
+            }),
+        );
+        let ctx = tool_context_for_workspace(&workspace);
+        let args = serde_json::json!({ "image": "missing.png" })
+            .as_object()
+            .cloned()
+            .expect("args should be object");
+
+        let err =
+            normalize_mcp_tool_args(&contract, args, &ctx).expect_err("normalization should fail");
+        assert!(err.to_string().contains("mcp_path_gateway_rejected"));
+        assert!(err.to_string().contains("not found"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn normalize_mcp_tool_args_rejects_ambiguous_image_filename() {
+        let workspace = unique_temp_dir("mcp-path-gateway-image-ambiguous");
+        let image_dir = workspace.join(".ah").join("image-recognition");
+        let screenshots_dir = workspace.join(".ah").join("screenshots");
+        fs::create_dir_all(&image_dir).expect("should create image-recognition dir");
+        fs::create_dir_all(&screenshots_dir).expect("should create screenshots dir");
+        fs::write(image_dir.join("dup.png"), "img").expect("should write image file");
+        fs::write(screenshots_dir.join("dup.png"), "img").expect("should write screenshot file");
+
+        let contract = McpToolContract::compile(
+            "zai-mcp-server",
+            "analyze_image",
+            &serde_json::json!({
+                "type": "object",
+                "properties": { "image": { "type": "string" } }
+            }),
+        );
+        let ctx = tool_context_for_workspace(&workspace);
+        let args = serde_json::json!({ "image": "dup.png" })
+            .as_object()
+            .cloned()
+            .expect("args should be object");
+
+        let err =
+            normalize_mcp_tool_args(&contract, args, &ctx).expect_err("normalization should fail");
+        assert!(err.to_string().contains("ambiguous"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn normalize_mcp_tool_args_rewrites_non_standard_key_for_image_tool() {
+        let workspace = unique_temp_dir("mcp-path-gateway-image-nonstandard-key");
+        let image_dir = workspace.join(".ah").join("image-recognition");
+        fs::create_dir_all(&image_dir).expect("should create image-recognition dir");
+        let image_path = image_dir.join("vision.png");
+        fs::write(&image_path, "img").expect("should write image file");
+
+        let contract = McpToolContract::compile(
+            "zai-mcp-server",
+            "vision_scan",
+            &serde_json::json!({
+                "type": "object",
+                "properties": { "input": { "type": "string" } }
+            }),
+        );
+        let ctx = tool_context_for_workspace(&workspace);
+        let args = serde_json::json!({ "input": "vision.png" })
+            .as_object()
+            .cloned()
+            .expect("args should be object");
+
+        let normalized =
+            normalize_mcp_tool_args(&contract, args, &ctx).expect("normalization should succeed");
+        let expected = absolute_path(&image_path).to_string_lossy().to_string();
+        assert_eq!(
+            normalized.get("input").and_then(Value::as_str),
+            Some(expected.as_str())
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn normalize_mcp_tool_args_does_not_treat_prompt_field_as_image_path() {
+        let workspace = unique_temp_dir("mcp-path-gateway-image-prompt-not-path");
+        let image_dir = workspace.join(".ah").join("image-recognition");
+        fs::create_dir_all(&image_dir).expect("should create image-recognition dir");
+        fs::write(image_dir.join("image.png"), "img").expect("should write image file");
+
+        let contract = McpToolContract::compile(
+            "zai-mcp-server",
+            "analyze_image",
+            &serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "image_source": { "type": "string", "description": "Image file path to analyze." },
+                    "prompt": { "type": "string", "description": "Prompt text for image analysis." }
+                }
+            }),
+        );
+        let ctx = tool_context_for_workspace(&workspace);
+        let prompt_text = "Please describe all visible details in this image.";
+        let args = serde_json::json!({
+            "image_source": "image.png",
+            "prompt": prompt_text
+        })
+        .as_object()
+        .cloned()
+        .expect("args should be object");
+
+        let normalized =
+            normalize_mcp_tool_args(&contract, args, &ctx).expect("normalization should succeed");
+        assert_eq!(
+            normalized.get("prompt").and_then(Value::as_str),
+            Some(prompt_text)
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn normalize_mcp_tool_args_falls_back_to_single_generic_image_candidate() {
+        let workspace = unique_temp_dir("mcp-path-gateway-image-single-fallback");
+        let image_dir = workspace.join(".ah").join("image-recognition");
+        fs::create_dir_all(&image_dir).expect("should create image-recognition dir");
+        let image_path = image_dir.join("capture-raw.bin");
+        fs::write(&image_path, "img").expect("should write fallback image file");
+
+        let contract = McpToolContract::compile(
+            "zai-mcp-server",
+            "analyze_image",
+            &serde_json::json!({
+                "type": "object",
+                "properties": { "image_source": { "type": "string" } }
+            }),
+        );
+        let ctx = tool_context_for_workspace(&workspace);
+        let args = serde_json::json!({ "image_source": "image.png" })
+            .as_object()
+            .cloned()
+            .expect("args should be object");
+
+        let normalized =
+            normalize_mcp_tool_args(&contract, args, &ctx).expect("normalization should succeed");
+        assert_eq!(
+            normalized.get("image_source").and_then(Value::as_str),
+            Some(absolute_path(&image_path).to_string_lossy().as_ref())
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn normalize_mcp_tool_args_resolves_relative_path_to_workspace_absolute() {
+        let workspace = unique_temp_dir("mcp-path-gateway-relative");
+        fs::create_dir_all(&workspace).expect("should create workspace dir");
+
+        let contract = McpToolContract::compile(
+            "zai-mcp-server",
+            "read_file",
+            &serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } }
+            }),
+        );
+        let ctx = tool_context_for_workspace(&workspace);
+        let args = serde_json::json!({ "path": "./a/b.png" })
+            .as_object()
+            .cloned()
+            .expect("args should be object");
+
+        let normalized =
+            normalize_mcp_tool_args(&contract, args, &ctx).expect("normalization should succeed");
+        let expected = absolute_path(&workspace.join("a").join("b.png"))
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(
+            normalized.get("path").and_then(Value::as_str),
+            Some(expected.as_str())
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn normalize_mcp_tool_args_rejects_absolute_path_outside_workspace() {
+        let workspace = unique_temp_dir("mcp-path-gateway-outside-workspace");
+        let outside_dir = unique_temp_dir("mcp-path-gateway-outside-source");
+        fs::create_dir_all(&workspace).expect("should create workspace dir");
+        fs::create_dir_all(&outside_dir).expect("should create outside dir");
+        let outside_path = outside_dir.join("outside.txt");
+        fs::write(&outside_path, "x").expect("should write outside file");
+
+        let contract = McpToolContract::compile(
+            "zai-mcp-server",
+            "read_file",
+            &serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } }
+            }),
+        );
+        let ctx = tool_context_for_workspace(&workspace);
+        let args = serde_json::json!({ "path": outside_path.to_string_lossy().to_string() })
+            .as_object()
+            .cloned()
+            .expect("args should be object");
+
+        let err =
+            normalize_mcp_tool_args(&contract, args, &ctx).expect_err("normalization should fail");
+        assert!(err.to_string().contains("outside workspace"));
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(outside_dir);
+    }
+
+    #[test]
+    fn normalize_mcp_tool_args_does_not_rewrite_non_path_text() {
+        let workspace = unique_temp_dir("mcp-path-gateway-non-path-text");
+        fs::create_dir_all(&workspace).expect("should create workspace dir");
+
+        let contract = McpToolContract::compile(
+            "zai-mcp-server",
+            "search_docs",
+            &serde_json::json!({
+                "type": "object",
+                "properties": { "query": { "type": "string" } }
+            }),
+        );
+        let ctx = tool_context_for_workspace(&workspace);
+        let args = serde_json::json!({ "query": "user guide / troubleshooting steps" })
+            .as_object()
+            .cloned()
+            .expect("args should be object");
+
+        let normalized =
+            normalize_mcp_tool_args(&contract, args, &ctx).expect("normalization should succeed");
+        assert_eq!(
+            normalized.get("query").and_then(Value::as_str),
+            Some("user guide / troubleshooting steps")
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn normalize_mcp_tool_args_handles_backslash_relative_path() {
+        let workspace = unique_temp_dir("mcp-path-gateway-backslash-path");
+        fs::create_dir_all(&workspace).expect("should create workspace dir");
+
+        let contract = McpToolContract::compile(
+            "zai-mcp-server",
+            "read_file",
+            &serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } }
+            }),
+        );
+        let ctx = tool_context_for_workspace(&workspace);
+        let args = serde_json::json!({ "path": "folder\\file.txt" })
+            .as_object()
+            .cloned()
+            .expect("args should be object");
+
+        let normalized =
+            normalize_mcp_tool_args(&contract, args, &ctx).expect("normalization should succeed");
+        let path = normalized
+            .get("path")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .expect("path should be string");
+        assert!(path.is_absolute());
+        assert!(path.starts_with(absolute_path(&workspace)));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn normalize_mcp_tool_args_rewrites_nested_array_path_fields() {
+        let workspace = unique_temp_dir("mcp-path-gateway-nested-array");
+        fs::create_dir_all(&workspace).expect("should create workspace dir");
+
+        let contract = McpToolContract::compile(
+            "zai-mcp-server",
+            "bulk_read",
+            &serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "files": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" }
+                            }
+                        }
+                    }
+                }
+            }),
+        );
+        let ctx = tool_context_for_workspace(&workspace);
+        let args = serde_json::json!({
+            "files": [
+                { "path": "./a.txt" },
+                { "path": "./b.txt" }
+            ]
+        })
+        .as_object()
+        .cloned()
+        .expect("args should be object");
+
+        let normalized =
+            normalize_mcp_tool_args(&contract, args, &ctx).expect("normalization should succeed");
+        let first = normalized["files"][0]["path"]
+            .as_str()
+            .expect("first path should be string");
+        let second = normalized["files"][1]["path"]
+            .as_str()
+            .expect("second path should be string");
+
+        assert_eq!(
+            first,
+            absolute_path(&workspace.join("a.txt"))
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(
+            second,
+            absolute_path(&workspace.join("b.txt"))
+                .to_string_lossy()
+                .as_ref()
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn normalize_mcp_tool_args_rejects_image_path_outside_ah_dirs() {
+        let workspace = unique_temp_dir("mcp-path-gateway-image-outside-ah");
+        let image_dir = workspace.join("images");
+        fs::create_dir_all(&image_dir).expect("should create image dir");
+        let outside_image = image_dir.join("outside.png");
+        fs::write(&outside_image, "img").expect("should write image file");
+
+        let contract = McpToolContract::compile(
+            "zai-mcp-server",
+            "analyze_image",
+            &serde_json::json!({
+                "type": "object",
+                "properties": { "image": { "type": "string" } }
+            }),
+        );
+        let ctx = tool_context_for_workspace(&workspace);
+        let args = serde_json::json!({ "image": outside_image.to_string_lossy().to_string() })
+            .as_object()
+            .cloned()
+            .expect("args should be object");
+
+        let err =
+            normalize_mcp_tool_args(&contract, args, &ctx).expect_err("normalization should fail");
+        assert!(err.to_string().contains("outside allowed dirs"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn tool_call_requested_preview_normalizes_image_source_for_display() {
+        let workspace = unique_temp_dir("mcp-path-gateway-preview-display");
+        let image_dir = workspace.join(".ah").join("image-recognition");
+        fs::create_dir_all(&image_dir).expect("should create image-recognition dir");
+        let image_path = image_dir.join("image.png");
+        fs::write(&image_path, "img").expect("should write image file");
+
+        let raw_args = serde_json::json!({
+            "image_source": "image.png",
+            "prompt": "describe image"
+        });
+
+        let preview = normalize_tool_call_requested_args_for_display(
+            "mcp:zai-mcp-server:analyze_image",
+            &raw_args,
+            Some(&workspace),
+        );
+
+        assert_eq!(
+            preview["image_source"].as_str(),
+            Some(absolute_path(&image_path).to_string_lossy().as_ref())
+        );
+        assert_eq!(preview["prompt"].as_str(), Some("describe image"));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn map_protocol_event_normalizes_tool_call_requested_payload_for_display() {
+        let workspace = unique_temp_dir("mcp-path-gateway-map-protocol-event");
+        let image_dir = workspace.join(".ah").join("image-recognition");
+        fs::create_dir_all(&image_dir).expect("should create image-recognition dir");
+        let image_path = image_dir.join("image.png");
+        fs::write(&image_path, "img").expect("should write image file");
+
+        let event = Event::ToolCallRequested {
+            tool: "mcp:zai-mcp-server:analyze_image".to_string(),
+            args: serde_json::json!({
+                "image_source": "image.png",
+                "prompt": "describe image"
+            }),
+        };
+
+        let payload = map_protocol_event(&event, Some(&workspace)).expect("payload should exist");
+        match payload {
+            ProtocolEventPayload::ToolCallRequested { tool, args } => {
+                assert_eq!(tool, "mcp:zai-mcp-server:analyze_image");
+                assert_eq!(
+                    args["image_source"].as_str(),
+                    Some(absolute_path(&image_path).to_string_lossy().as_ref())
+                );
+                assert_eq!(args["prompt"].as_str(), Some("describe image"));
+            }
+            _ => panic!("expected tool_call_requested payload"),
+        }
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn default_workspace_root_uses_expected_suffix() {
+        let root = default_workspace_root();
+        assert!(root.is_absolute());
+        assert!(root.ends_with(Path::new(".ai-helper").join("workspaces").join("default")));
+    }
+
+    #[test]
+    fn workspace_context_falls_back_when_configured_path_is_file() {
+        let temp_dir = unique_temp_dir("workspace-invalid");
+        fs::create_dir_all(&temp_dir).expect("should create temp dir");
+        let file_path = temp_dir.join("not-a-directory");
+        fs::write(&file_path, "x").expect("should create file");
+
+        let config = WorkspaceRuntimeConfig {
+            root_dir: file_path.to_string_lossy().to_string(),
+        };
+        let context = WorkspaceContext::resolve(&config);
+
+        assert!(!context.warnings.is_empty());
+        assert_ne!(context.root_dir, absolute_path(&file_path));
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn workspace_context_creates_ah_directories() {
+        let root = unique_temp_dir("workspace-layout");
+        let config = WorkspaceRuntimeConfig {
+            root_dir: root.to_string_lossy().to_string(),
+        };
+
+        let context = WorkspaceContext::resolve(&config);
+        assert!(context.ah_dir.exists());
+        assert!(context.config_dir.exists());
+        assert!(context.screenshots_dir.exists());
+        assert!(context.tmp_dir.exists());
+        assert!(context.image_recognition_dir.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn map_runtime_mcp_server_config_injects_workspace_env_and_rewrites_paths() {
+        let root = unique_temp_dir("workspace-mcp");
+        fs::create_dir_all(root.join("scripts")).expect("should create scripts dir");
+        fs::create_dir_all(root.join("data")).expect("should create data dir");
+        fs::write(root.join("scripts").join("mcp.cmd"), "@echo off")
+            .expect("should create command");
+
+        let context = WorkspaceContext::from_root(root.clone());
+        context
+            .ensure_layout()
+            .expect("workspace layout should exist");
+
+        let server = McpServerRuntimeConfig {
+            name: "demo".to_string(),
+            enabled: true,
+            command: Some("./scripts/mcp.cmd".to_string()),
+            args: vec!["./data".to_string(), "--safe".to_string()],
+            ..Default::default()
+        };
+
+        let mapped = map_runtime_mcp_server_config(&server, 30, &context, Path::new("."))
+            .expect("mapping should succeed");
+
+        let command = mapped.command.unwrap_or_default();
+        assert!(command.contains("scripts"));
+        assert!(mapped.args[0].contains("data"));
+        assert_eq!(
+            mapped.env.get(AH_WORKSPACE_DIR_ENV).map(String::as_str),
+            Some(context.root_dir.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            mapped
+                .env
+                .get(AH_IMAGE_RECOGNITION_DIR_ENV)
+                .map(String::as_str),
+            Some(context.image_recognition_dir.to_string_lossy().as_ref())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_preferred_path_uses_fallback_when_workspace_missing() {
+        let workspace = unique_temp_dir("workspace-primary");
+        let fallback = unique_temp_dir("workspace-fallback");
+        fs::create_dir_all(fallback.join("skills").join("project"))
+            .expect("should create fallback path");
+
+        let resolved = resolve_preferred_path("skills/project", &workspace, &fallback);
+        assert!(resolved.starts_with(&fallback));
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(fallback);
+    }
+
+    #[test]
+    fn persist_image_for_recognition_writes_inside_workspace_path() {
+        let image_dir = unique_temp_dir("workspace-image");
+        fs::create_dir_all(&image_dir).expect("should create image dir");
+        let image = AgentInputImage {
+            name: "sample.png".to_string(),
+            mime_type: "image/png".to_string(),
+            data_url: "data:image/png;base64,AAAA".to_string(),
+            size_bytes: 4,
+        };
+
+        let saved =
+            persist_image_for_recognition(&image, &image_dir).expect("image should be persisted");
+        assert!(saved.starts_with(&image_dir));
+        assert!(saved.exists());
+
+        let _ = fs::remove_dir_all(image_dir);
+    }
+
+    #[test]
+    fn persist_image_for_recognition_uses_filename_extension_when_mime_unknown() {
+        let image_dir = unique_temp_dir("workspace-image-ext-fallback");
+        fs::create_dir_all(&image_dir).expect("should create image dir");
+        let image = AgentInputImage {
+            name: "capture.png".to_string(),
+            mime_type: "application/octet-stream".to_string(),
+            data_url: "data:image/png;base64,AAAA".to_string(),
+            size_bytes: 4,
+        };
+
+        let saved =
+            persist_image_for_recognition(&image, &image_dir).expect("image should be persisted");
+        assert_eq!(
+            saved
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(str::to_ascii_lowercase),
+            Some("png".to_string())
+        );
+
+        let _ = fs::remove_dir_all(image_dir);
+    }
+
     #[tokio::test]
     async fn build_runtime_resources_without_mcp_registers_builtin_tools() {
         let config = AgentRuntimeConfig::default();
 
-        let runtime = build_runtime_resources(&config)
+        let workspace_context = WorkspaceContext::resolve(&config.workspace);
+        let runtime = build_runtime_resources(&config, &workspace_context)
             .await
             .expect("runtime resources should build");
 
@@ -2435,12 +4358,53 @@ mod tests {
         config.mcp.image_recognition.enabled = true;
         config.mcp.image_recognition.server_name = "demo".to_string();
         config.mcp.image_recognition.tool_name = "ocr".to_string();
+        let workspace = unique_temp_dir("image-fallback-note-with-local-path");
+        config.workspace.root_dir = workspace.to_string_lossy().to_string();
 
-        let prepared = prepare_image_fallback_payload(&input, &config, None).await;
+        let workspace_context = WorkspaceContext::resolve(&config.workspace);
+        let prepared =
+            prepare_image_fallback_payload(&input, &config, None, &workspace_context).await;
         let payload_text = prepared.model_payload_text.unwrap_or_default();
 
         assert!(payload_text.contains("User attached image files:"));
+        assert!(payload_text.contains("local_path="));
         assert!(!prepared.warnings.is_empty());
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn prepare_image_fallback_payload_persists_images_even_when_model_supports_image_input() {
+        let input = AgentStreamInput {
+            content: "look at this".to_string(),
+            images: vec![AgentInputImage {
+                name: "image.png".to_string(),
+                mime_type: "image/png".to_string(),
+                data_url: "data:image/png;base64,AAAA".to_string(),
+                size_bytes: 4,
+            }],
+            conversation_id: None,
+            recent_messages: Vec::new(),
+        };
+
+        let mut config = AgentRuntimeConfig::default();
+        config.model_supports_image_input = true;
+        let workspace = unique_temp_dir("image-fallback-persist-when-mm-on");
+        config.workspace.root_dir = workspace.to_string_lossy().to_string();
+
+        let workspace_context = WorkspaceContext::resolve(&config.workspace);
+        let prepared =
+            prepare_image_fallback_payload(&input, &config, None, &workspace_context).await;
+
+        assert!(prepared.model_payload_text.is_none());
+        assert!(workspace_context.image_recognition_dir.exists());
+        let saved_files = std::fs::read_dir(&workspace_context.image_recognition_dir)
+            .expect("should read image-recognition dir")
+            .filter_map(Result::ok)
+            .count();
+        assert!(saved_files > 0);
+
+        let _ = fs::remove_dir_all(workspace);
     }
 }
 
@@ -2502,6 +4466,20 @@ fn load_runtime_config() -> AgentRuntimeConfig {
     }
     if let Ok(system_prompt) = std::env::var("AGENT_SYSTEM_PROMPT") {
         config.system_prompt = system_prompt;
+    }
+    if let Ok(workspace_root) = std::env::var("AGENT_WORKSPACE_ROOT") {
+        config.workspace.root_dir = workspace_root;
+    }
+
+    if let Ok(workspace_config_json) = std::env::var("AGENT_WORKSPACE_CONFIG_JSON") {
+        match serde_json::from_str::<WorkspaceRuntimeConfig>(&workspace_config_json) {
+            Ok(workspace_config) => {
+                config.workspace = workspace_config;
+            }
+            Err(err) => {
+                log::warn!("failed to parse AGENT_WORKSPACE_CONFIG_JSON: {}", err);
+            }
+        }
     }
 
     if let Ok(mcp_config_json) = std::env::var("AGENT_MCP_CONFIG_JSON") {

@@ -7,6 +7,7 @@ import type {
   AppConfig,
   Conversation,
   InputCard,
+  LegacySessionSnapshot,
   Message,
   ProtocolCard,
   ProtocolCardLevel,
@@ -64,12 +65,15 @@ interface AppState {
 
   isHydrated: boolean;
   hydrate: () => Promise<void>;
+  reloadWorkspaceConversations: () => Promise<void>;
 
   exportConversation: (conversationId: string) => void;
 }
 
 const defaultConfig: AppConfig = createDefaultConfig();
-const STORAGE_SCHEMA_VERSION = 2;
+const CONFIG_STORE_KEY = 'config';
+const LEGACY_CONVERSATIONS_STORE_KEY = 'conversations';
+const LEGACY_CURRENT_CONVERSATION_STORE_KEY = 'currentConversationId';
 
 const DEFAULT_CONVERSATION_TITLE = '新对话';
 const MAX_TITLE_LENGTH = 50;
@@ -242,6 +246,30 @@ const normalizeConversation = (conversation: Conversation): Conversation => ({
       }))
     : [],
 });
+
+const readLegacySessionSnapshot = async (): Promise<LegacySessionSnapshot | null> => {
+  const [storedConversations, storedCurrentConversationId] = await Promise.all([
+    TauriAPI.getStore<Conversation[]>(LEGACY_CONVERSATIONS_STORE_KEY, []),
+    TauriAPI.getStore<string | null>(LEGACY_CURRENT_CONVERSATION_STORE_KEY, null),
+  ]);
+  const conversations = Array.isArray(storedConversations)
+    ? storedConversations.map(normalizeConversation)
+    : [];
+  if (conversations.length === 0 && !storedCurrentConversationId) {
+    return null;
+  }
+  return {
+    conversations,
+    currentConversationId: storedCurrentConversationId,
+  };
+};
+
+const clearLegacyConversationStore = async (): Promise<void> => {
+  await Promise.all([
+    TauriAPI.deleteStore(LEGACY_CONVERSATIONS_STORE_KEY),
+    TauriAPI.deleteStore(LEGACY_CURRENT_CONVERSATION_STORE_KEY),
+  ]);
+};
 
 export const useAppStore = create<AppState>((set, get) => ({
   config: defaultConfig,
@@ -757,10 +785,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
 
     try {
-      const [storedConfig, storedSchemaVersion] = await Promise.all([
-        TauriAPI.getStore<Partial<AppConfig>>('config', {}),
-        TauriAPI.getStore<number>('storage_schema_version', 0),
-      ]);
+      const storedConfig = await TauriAPI.getStore<Partial<AppConfig>>(CONFIG_STORE_KEY, {});
 
       const normalizedStoredConfig = normalizeStoredConfig(storedConfig);
       const hydratedConfig: AppConfig = {
@@ -768,40 +793,44 @@ export const useAppStore = create<AppState>((set, get) => ({
         ...normalizedStoredConfig,
       };
 
-      if (storedSchemaVersion !== STORAGE_SCHEMA_VERSION) {
-        await Promise.all([
-          TauriAPI.deleteStore('conversations'),
-          TauriAPI.deleteStore('currentConversationId'),
-          TauriAPI.setStore('storage_schema_version', STORAGE_SCHEMA_VERSION),
-        ]);
-
-        set({
-          config: hydratedConfig,
-          conversations: [],
-          currentConversationId: null,
-          activeStream: null,
-          activeProtocolStreamingCard: null,
-          streamingTaskId: null,
-          isHydrated: true,
-        });
-        return;
+      try {
+        await TauriAPI.updateRuntimeConfig(hydratedConfig);
+      } catch (error) {
+        logger.error('Failed to sync runtime config before storage bootstrap', { error });
       }
 
-      const [storedConversations, storedCurrentConversationId] = await Promise.all([
-        TauriAPI.getStore<Conversation[]>('conversations', []),
-        TauriAPI.getStore<string | null>('currentConversationId', null),
-      ]);
+      const legacySnapshot = await readLegacySessionSnapshot();
+      const bootstrapResponse = await TauriAPI.storageBootstrap(
+        legacySnapshot
+          ? {
+              legacy: legacySnapshot,
+            }
+          : undefined
+      );
 
-      const conversations = Array.isArray(storedConversations)
-        ? storedConversations.map(normalizeConversation)
+      const conversations = Array.isArray(bootstrapResponse.conversations)
+        ? bootstrapResponse.conversations.map(normalizeConversation)
         : [];
+      const hasCurrentConversation = conversations.some(
+        (conversation) => conversation.id === bootstrapResponse.currentConversationId
+      );
+      const resolvedCurrentConversationId = hasCurrentConversation
+        ? (bootstrapResponse.currentConversationId ?? null)
+        : (conversations[0]?.id ?? null);
 
-      const hasCurrentConversation = conversations.some((conversation) => conversation.id === storedCurrentConversationId);
+      if (legacySnapshot) {
+        await clearLegacyConversationStore();
+      }
+
+      lastPersistedConversationUpdatedAt = new Map(
+        conversations.map((conversation) => [conversation.id, conversation.updatedAt])
+      );
+      lastPersistedCurrentConversationId = resolvedCurrentConversationId;
 
       set({
         config: hydratedConfig,
         conversations,
-        currentConversationId: hasCurrentConversation ? storedCurrentConversationId : (conversations[0]?.id ?? null),
+        currentConversationId: resolvedCurrentConversationId,
         activeStream: null,
         activeProtocolStreamingCard: null,
         streamingTaskId: null,
@@ -812,34 +841,57 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ isHydrated: true });
     }
   },
+  reloadWorkspaceConversations: async () => {
+    try {
+      const bootstrapResponse = await TauriAPI.storageBootstrap();
+      const conversations = Array.isArray(bootstrapResponse.conversations)
+        ? bootstrapResponse.conversations.map(normalizeConversation)
+        : [];
+      const hasCurrentConversation = conversations.some(
+        (conversation) => conversation.id === bootstrapResponse.currentConversationId
+      );
+      const resolvedCurrentConversationId = hasCurrentConversation
+        ? (bootstrapResponse.currentConversationId ?? null)
+        : (conversations[0]?.id ?? null);
+      lastPersistedConversationUpdatedAt = new Map(
+        conversations.map((conversation) => [conversation.id, conversation.updatedAt])
+      );
+      lastPersistedCurrentConversationId = resolvedCurrentConversationId;
+      set({
+        conversations,
+        currentConversationId: resolvedCurrentConversationId,
+        activeStream: null,
+        activeProtocolStreamingCard: null,
+        streamingTaskId: null,
+        lastError: null,
+      });
+    } catch (error) {
+      logger.error('Failed to reload workspace conversations', { error });
+      throw error;
+    }
+  },
 
   exportConversation: (conversationId) => {
-    const conversation = get().conversations.find((item) => item.id === conversationId);
-    if (!conversation) {
-      return;
-    }
-
-    const data = JSON.stringify(conversation, null, 2);
-    const blob = new Blob([data], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `conversation-${conversationId}.json`;
-    link.click();
-    URL.revokeObjectURL(url);
+    void (async () => {
+      try {
+        const conversation = await TauriAPI.storageExportConversation(conversationId);
+        const data = JSON.stringify(conversation, null, 2);
+        const blob = new Blob([data], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `conversation-${conversationId}.json`;
+        link.click();
+        URL.revokeObjectURL(url);
+      } catch (error) {
+        logger.error('Failed to export conversation from storage', {
+          error,
+          conversationId,
+        });
+      }
+    })();
   },
 }));
-
-export const saveToTauriStore = (config: AppConfig, conversations: Conversation[], currentConversationId: string | null) => {
-  void TauriAPI.setStore('storage_schema_version', STORAGE_SCHEMA_VERSION);
-  void TauriAPI.setStore('config', config);
-  void TauriAPI.setStore('conversations', conversations);
-  if (currentConversationId) {
-    void TauriAPI.setStore('currentConversationId', currentConversationId);
-  } else {
-    void TauriAPI.deleteStore('currentConversationId');
-  }
-};
 
 const PERSIST_DEBOUNCE_MS = 250;
 const PERSIST_STREAMING_DEBOUNCE_MS = 1200;
@@ -852,6 +904,79 @@ interface PersistSnapshot {
 
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 let pendingPersistSnapshot: PersistSnapshot | null = null;
+let pendingStorageSnapshot: PersistSnapshot | null = null;
+let storageSyncInFlight = false;
+let lastPersistedConversationUpdatedAt = new Map<string, number>();
+let lastPersistedCurrentConversationId: string | null = null;
+
+const syncSnapshotToStorage = async (snapshot: PersistSnapshot) => {
+  try {
+    await TauriAPI.setStore(CONFIG_STORE_KEY, snapshot.config);
+  } catch (error) {
+    logger.error('Failed to persist config', { error });
+  }
+
+  const nextConversationIds = new Set(snapshot.conversations.map((conversation) => conversation.id));
+
+  for (const conversationId of lastPersistedConversationUpdatedAt.keys()) {
+    if (nextConversationIds.has(conversationId)) {
+      continue;
+    }
+    try {
+      await TauriAPI.storageDeleteConversation(conversationId);
+      lastPersistedConversationUpdatedAt.delete(conversationId);
+    } catch (error) {
+      logger.error('Failed to delete conversation from storage', {
+        error,
+        conversationId,
+      });
+    }
+  }
+
+  for (const conversation of snapshot.conversations) {
+    const previousUpdatedAt = lastPersistedConversationUpdatedAt.get(conversation.id);
+    if (previousUpdatedAt === conversation.updatedAt) {
+      continue;
+    }
+    try {
+      await TauriAPI.storageUpsertConversation(conversation);
+      lastPersistedConversationUpdatedAt.set(conversation.id, conversation.updatedAt);
+    } catch (error) {
+      logger.error('Failed to upsert conversation into storage', {
+        error,
+        conversationId: conversation.id,
+      });
+    }
+  }
+
+  if (lastPersistedCurrentConversationId !== snapshot.currentConversationId) {
+    try {
+      await TauriAPI.storageSetCurrentConversation(snapshot.currentConversationId);
+      lastPersistedCurrentConversationId = snapshot.currentConversationId;
+    } catch (error) {
+      logger.error('Failed to persist current conversation id', { error });
+    }
+  }
+};
+
+const flushPendingStorageSnapshot = () => {
+  if (storageSyncInFlight) {
+    return;
+  }
+  storageSyncInFlight = true;
+
+  void (async () => {
+    while (pendingStorageSnapshot) {
+      const nextSnapshot = pendingStorageSnapshot;
+      pendingStorageSnapshot = null;
+      await syncSnapshotToStorage(nextSnapshot);
+    }
+    storageSyncInFlight = false;
+    if (pendingStorageSnapshot) {
+      flushPendingStorageSnapshot();
+    }
+  })();
+};
 
 const schedulePersistToTauriStore = (snapshot: PersistSnapshot, delayMs: number) => {
   pendingPersistSnapshot = snapshot;
@@ -867,7 +992,8 @@ const schedulePersistToTauriStore = (snapshot: PersistSnapshot, delayMs: number)
       return;
     }
     pendingPersistSnapshot = null;
-    saveToTauriStore(nextSnapshot.config, nextSnapshot.conversations, nextSnapshot.currentConversationId);
+    pendingStorageSnapshot = nextSnapshot;
+    flushPendingStorageSnapshot();
   }, delayMs);
 };
 

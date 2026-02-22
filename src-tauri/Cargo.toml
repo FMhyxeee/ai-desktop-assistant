@@ -24,12 +24,20 @@ log = "0.4"
 tauri = { version = "2.1.0", features = [] }
 tauri-plugin-log = "2.0.0-rc"
 tauri-plugin-store = "2.0.0"
+tauri-plugin-dialog = "2.0.0"
 thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 agent-lib = { path = "../../agent-lib" }
 async-trait = "0.1"
 tokio = { version = "1", features = ["time"] }
 base64 = "0.22"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sqlite-vec = "0.1.7-alpha.10"
+sha2 = "0.10"
+rand = "0.8"
+aes-gcm = "0.10"
+keyring = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

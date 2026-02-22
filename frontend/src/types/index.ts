@@ -325,6 +325,10 @@ export interface SkillsRuntimeConfig {
   autoApply: boolean;
 }
 
+export interface WorkspaceConfig {
+  rootDir: string;
+}
+
 export interface AppConfig {
   provider: AgentProvider;
   model: string;
@@ -334,6 +338,7 @@ export interface AppConfig {
   baseUrl?: string;
   maxTokens?: number;
   systemPrompt: string;
+  workspace: WorkspaceConfig;
   mcp: McpRuntimeConfig;
   skills: SkillsRuntimeConfig;
 }
@@ -393,4 +398,77 @@ export interface TauriResponse<T = unknown> {
   success?: boolean;
   data?: T;
   error?: string;
+}
+
+export interface LegacySessionSnapshot {
+  conversations: Conversation[];
+  currentConversationId?: string | null;
+}
+
+export interface StorageBootstrapRequest {
+  legacy?: LegacySessionSnapshot | null;
+}
+
+export interface StorageBootstrapResponse {
+  conversations: Conversation[];
+  currentConversationId?: string | null;
+  migratedLegacy: boolean;
+}
+
+export type MemorySearchScope = 'workspace' | 'global' | 'both';
+
+export interface MemorySearchRequest {
+  query: string;
+  scope?: MemorySearchScope;
+  limit?: number;
+  includeSecrets?: boolean;
+}
+
+export interface MemorySearchEntry {
+  source: string;
+  kind: string;
+  memoryId?: number | null;
+  conversationId?: string | null;
+  messageId?: string | null;
+  label: string;
+  snippet: string;
+  score: number;
+  secret: boolean;
+}
+
+export interface MemorySearchResponse {
+  results: MemorySearchEntry[];
+  sqliteVecAvailable: boolean;
+}
+
+export interface MemoryUpsertPersonalNoteRequest {
+  label: string;
+  descriptorText: string;
+  scope?: string;
+}
+
+export interface MemoryUpsertPersonalSecretRequest {
+  label: string;
+  descriptorText: string;
+  secretText: string;
+  scope?: string;
+}
+
+export interface PersonalMemoryEntry {
+  id: number;
+  kind: string;
+  label: string;
+  descriptorText: string;
+  scope: string;
+  createdAt: number;
+  updatedAt: number;
+  hasSecret: boolean;
+}
+
+export interface PersonalMemoryListResponse {
+  items: PersonalMemoryEntry[];
+}
+
+export interface MemoryDeletePersonalRequest {
+  id: number;
 }

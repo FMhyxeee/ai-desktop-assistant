@@ -145,6 +145,9 @@ const normalizeConfigForSave = (config: AppConfig): AppConfig => ({
   baseUrl: (config.baseUrl ?? '').trim(),
   maxTokens: normalizePositiveInt(config.maxTokens),
   systemPrompt: config.systemPrompt.trim(),
+  workspace: {
+    rootDir: (normalizeText(config.workspace.rootDir) ?? ''),
+  },
   mcp: {
     ...config.mcp,
     defaultTimeoutSecs: normalizePositiveInt(config.mcp.defaultTimeoutSecs),
