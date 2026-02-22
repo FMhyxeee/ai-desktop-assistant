@@ -2,7 +2,7 @@ mod control;
 mod governance;
 pub mod types;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -536,6 +536,45 @@ impl AgentService {
 
         let runtime_resources =
             build_runtime_resources(&effective_config, &workspace_context).await?;
+        let guidance_snapshot = collect_stage2_guidance_snapshot(&runtime_resources).await;
+        let guidance_focus =
+            build_stage2_guidance_focus(&input.content, &runtime_resources, &guidance_snapshot);
+        let guidance_context = build_stage2_guidance_context(
+            &workspace_context,
+            &runtime_resources,
+            &guidance_snapshot,
+            &guidance_focus,
+        );
+        prompt_directives = Some(merge_prompt_directives_with_guidance(
+            &effective_config,
+            prompt_directives,
+            &guidance_context,
+        ));
+        seq += 1;
+        emit(AgentEvent::ProtocolEvent {
+            task_id: task_id.clone(),
+            seq,
+            payload: ProtocolEventPayload::Warning {
+                message: guidance_context_summary(
+                    &workspace_context,
+                    &runtime_resources,
+                    &guidance_snapshot,
+                    &guidance_focus,
+                ),
+            },
+        });
+        seq += 1;
+        emit(AgentEvent::ProtocolEvent {
+            task_id: task_id.clone(),
+            seq,
+            payload: ProtocolEventPayload::Warning {
+                message: guidance_context_audit(
+                    &runtime_resources,
+                    &guidance_snapshot,
+                    &guidance_focus,
+                ),
+            },
+        });
         let model = build_model_client(&effective_config)?;
         let default_cwd = workspace_context.root_dir_string();
         let session_config = SessionConfig {
@@ -1002,6 +1041,7 @@ struct RuntimeResources {
     mcp_manager: Option<Arc<McpManager>>,
     tool_executor: Option<Arc<ToolExecutor>>,
     skill_config: SkillConfig,
+    mcp_tool_contracts: Vec<McpToolContract>,
 }
 
 pub async fn run_governance_scan_with_config(config: AgentRuntimeConfig) -> GovernanceReport {
@@ -1226,6 +1266,7 @@ async fn build_runtime_resources(
     registry.register(Arc::new(CodeExecTool::new()));
 
     let mut mcp_manager = None;
+    let mut mcp_tool_contracts = Vec::<McpToolContract>::new();
     if config.mcp.enabled {
         let default_timeout_secs = config.mcp.default_timeout_secs.unwrap_or(30).max(1);
         let max_retries = config.mcp.max_retries.unwrap_or(3);
@@ -1256,6 +1297,7 @@ async fn build_runtime_resources(
             let call_name = tool_def.name.to_string();
             let schema = Value::Object((*tool_def.input_schema).clone());
             let contract = McpToolContract::compile(&server_name, &call_name, &schema);
+            mcp_tool_contracts.push(contract.clone());
             let tool = PrefixedMcpTool::new(
                 server_name,
                 call_name,
@@ -1277,7 +1319,1025 @@ async fn build_runtime_resources(
         mcp_manager,
         tool_executor: Some(Arc::new(ToolExecutor::new(registry))),
         skill_config,
+        mcp_tool_contracts,
     })
+}
+
+#[derive(Debug, Clone, Default)]
+struct Stage2GuidanceSnapshot {
+    mcp_servers: Vec<Stage2McpServerSnapshot>,
+    skills: Vec<Stage2SkillSnapshot>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct Stage2McpServerSnapshot {
+    server_name: String,
+    tool_count: usize,
+    resource_count: usize,
+    prompt_count: usize,
+    resource_names: Vec<String>,
+    prompts: Vec<Stage2McpPromptSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct Stage2McpPromptSnapshot {
+    name: String,
+    arguments: Vec<Stage2McpPromptArgumentSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+struct Stage2McpPromptArgumentSnapshot {
+    name: String,
+    description: String,
+    required: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Stage2GuidanceFocus {
+    selected_contract_names: BTreeSet<String>,
+    selected_server_names: BTreeSet<String>,
+    selected_prompt_keys: BTreeSet<String>,
+    signals: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct Stage2SkillSnapshot {
+    name: String,
+    source: String,
+    path: String,
+}
+
+async fn collect_stage2_guidance_snapshot(
+    runtime_resources: &RuntimeResources,
+) -> Stage2GuidanceSnapshot {
+    let (mcp_servers, mut warnings) =
+        collect_stage2_mcp_runtime_snapshot(runtime_resources.mcp_manager.clone()).await;
+    let (skills, mut skill_warnings) =
+        collect_stage2_skills_runtime_snapshot(&runtime_resources.skill_config).await;
+    warnings.append(&mut skill_warnings);
+    Stage2GuidanceSnapshot {
+        mcp_servers,
+        skills,
+        warnings,
+    }
+}
+
+fn build_stage2_guidance_focus(
+    user_input: &str,
+    runtime_resources: &RuntimeResources,
+    snapshot: &Stage2GuidanceSnapshot,
+) -> Stage2GuidanceFocus {
+    let normalized = user_input.trim().to_ascii_lowercase();
+    let mut focus = Stage2GuidanceFocus::default();
+    let image_intent = contains_any(
+        &normalized,
+        &[
+            "image",
+            "img",
+            "picture",
+            "screenshot",
+            "ocr",
+            "vision",
+            "图片",
+            "图像",
+            "截图",
+            "识别",
+        ],
+    );
+    let path_intent = contains_any(
+        &normalized,
+        &[
+            "path",
+            "file",
+            "folder",
+            "directory",
+            "workspace",
+            "cwd",
+            "路径",
+            "文件",
+            "目录",
+            "工作区",
+        ],
+    );
+    let prompt_intent = contains_any(&normalized, &["prompt", "提示词", "模板"]);
+    let resource_intent = contains_any(&normalized, &["resource", "资源", "uri"]);
+    let skills_intent = contains_any(&normalized, &["skill", "skills", "技能"]);
+
+    if image_intent {
+        focus.signals.insert("image_intent".to_string());
+    }
+    if path_intent {
+        focus.signals.insert("path_intent".to_string());
+    }
+    if prompt_intent {
+        focus.signals.insert("prompt_intent".to_string());
+    }
+    if resource_intent {
+        focus.signals.insert("resource_intent".to_string());
+    }
+    if skills_intent {
+        focus.signals.insert("skills_intent".to_string());
+    }
+
+    for contract in &runtime_resources.mcp_tool_contracts {
+        if normalized.contains(&contract.server_name.to_ascii_lowercase())
+            || normalized.contains(&contract.call_name.to_ascii_lowercase())
+            || normalized.contains(&contract.public_name.to_ascii_lowercase())
+        {
+            focus
+                .selected_contract_names
+                .insert(contract.public_name.clone());
+            focus
+                .selected_server_names
+                .insert(contract.server_name.clone());
+            continue;
+        }
+
+        if image_intent && contract_matches_image_intent(contract) {
+            focus
+                .selected_contract_names
+                .insert(contract.public_name.clone());
+            focus
+                .selected_server_names
+                .insert(contract.server_name.clone());
+            continue;
+        }
+
+        if path_intent && contract_matches_path_intent(contract) {
+            focus
+                .selected_contract_names
+                .insert(contract.public_name.clone());
+            focus
+                .selected_server_names
+                .insert(contract.server_name.clone());
+        }
+    }
+
+    for server in &snapshot.mcp_servers {
+        let server_key = server.server_name.to_ascii_lowercase();
+        if normalized.contains(&server_key) {
+            focus
+                .selected_server_names
+                .insert(server.server_name.clone());
+            continue;
+        }
+        if resource_intent && server.resource_count > 0 {
+            focus
+                .selected_server_names
+                .insert(server.server_name.clone());
+            continue;
+        }
+        if prompt_intent && server.prompt_count > 0 {
+            focus
+                .selected_server_names
+                .insert(server.server_name.clone());
+            continue;
+        }
+    }
+
+    for server in &snapshot.mcp_servers {
+        for prompt in &server.prompts {
+            let prompt_key = stage2_prompt_key(&server.server_name, &prompt.name);
+            if normalized.contains(&prompt.name.to_ascii_lowercase()) {
+                focus.selected_prompt_keys.insert(prompt_key.clone());
+                focus
+                    .selected_server_names
+                    .insert(server.server_name.clone());
+                continue;
+            }
+
+            let prompt_image_intent = prompt
+                .arguments
+                .iter()
+                .any(stage2_prompt_argument_matches_image_intent);
+            let prompt_path_intent = prompt
+                .arguments
+                .iter()
+                .any(stage2_prompt_argument_matches_path_intent);
+
+            if image_intent && prompt_image_intent {
+                focus.selected_prompt_keys.insert(prompt_key.clone());
+                focus
+                    .selected_server_names
+                    .insert(server.server_name.clone());
+                continue;
+            }
+            if path_intent && prompt_path_intent {
+                focus.selected_prompt_keys.insert(prompt_key.clone());
+                focus
+                    .selected_server_names
+                    .insert(server.server_name.clone());
+                continue;
+            }
+            if prompt_intent && !prompt.arguments.is_empty() {
+                focus.selected_prompt_keys.insert(prompt_key.clone());
+                focus
+                    .selected_server_names
+                    .insert(server.server_name.clone());
+            }
+        }
+    }
+
+    if focus.selected_contract_names.is_empty() {
+        let mut fallback = runtime_resources
+            .mcp_tool_contracts
+            .iter()
+            .filter(|contract| {
+                contract_matches_image_intent(contract) || contract_matches_path_intent(contract)
+            })
+            .collect::<Vec<_>>();
+        if fallback.is_empty() {
+            fallback = runtime_resources
+                .mcp_tool_contracts
+                .iter()
+                .collect::<Vec<_>>();
+        }
+        for contract in fallback.into_iter().take(8) {
+            focus
+                .selected_contract_names
+                .insert(contract.public_name.clone());
+            focus
+                .selected_server_names
+                .insert(contract.server_name.clone());
+        }
+    }
+
+    if focus.selected_server_names.is_empty() {
+        for server in snapshot.mcp_servers.iter().take(4) {
+            focus
+                .selected_server_names
+                .insert(server.server_name.clone());
+        }
+    }
+
+    if focus.selected_prompt_keys.is_empty() {
+        for server in snapshot
+            .mcp_servers
+            .iter()
+            .filter(|server| focus.selected_server_names.contains(&server.server_name))
+        {
+            for prompt in server.prompts.iter().take(6) {
+                focus
+                    .selected_prompt_keys
+                    .insert(stage2_prompt_key(&server.server_name, &prompt.name));
+            }
+        }
+    }
+
+    focus
+}
+
+fn contains_any(text: &str, keywords: &[&str]) -> bool {
+    keywords.iter().any(|keyword| text.contains(keyword))
+}
+
+fn contract_matches_image_intent(contract: &McpToolContract) -> bool {
+    contract.is_image_tool
+        || contract
+            .schema_rules
+            .iter()
+            .any(|rule| rule.kind == McpPathFieldKind::Image)
+}
+
+fn contract_matches_path_intent(contract: &McpToolContract) -> bool {
+    contract
+        .schema_rules
+        .iter()
+        .any(|rule| rule.kind == McpPathFieldKind::Generic)
+}
+
+fn stage2_prompt_argument_matches_image_intent(argument: &Stage2McpPromptArgumentSnapshot) -> bool {
+    let name = argument.name.to_ascii_lowercase();
+    let description = argument.description.to_ascii_lowercase();
+    let desc_image_hint = description.contains("image")
+        || description.contains("img")
+        || description.contains("图片")
+        || description.contains("图像");
+    let desc_path_hint = description.contains("path")
+        || description.contains("file")
+        || description.contains("uri")
+        || description.contains("source")
+        || description.contains("路径")
+        || description.contains("文件");
+    is_explicit_image_field_name(&name) || (desc_image_hint && desc_path_hint)
+}
+
+fn stage2_prompt_argument_matches_path_intent(argument: &Stage2McpPromptArgumentSnapshot) -> bool {
+    let name = argument.name.to_ascii_lowercase();
+    let description = argument.description.to_ascii_lowercase();
+    is_path_like_field_name(&name)
+        || description.contains("path")
+        || description.contains("file")
+        || description.contains("uri")
+        || description.contains("路径")
+        || description.contains("文件")
+}
+
+fn stage2_prompt_key(server_name: &str, prompt_name: &str) -> String {
+    format!("{}:{}", server_name.trim(), prompt_name.trim())
+}
+
+async fn collect_stage2_mcp_runtime_snapshot(
+    mcp_manager: Option<Arc<McpManager>>,
+) -> (Vec<Stage2McpServerSnapshot>, Vec<String>) {
+    let Some(manager) = mcp_manager else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let mut snapshots = Vec::<Stage2McpServerSnapshot>::new();
+    let mut warnings = Vec::<String>::new();
+    let list_timeout = std::cmp::min(
+        manager.default_timeout().unwrap_or(Duration::from_secs(5)),
+        Duration::from_secs(8),
+    );
+
+    for (server_name, client, tools) in manager.get_all_servers().await {
+        let (resource_count, resource_names) =
+            match timeout(list_timeout, client.list_resources()).await {
+                Ok(Ok(resources)) => {
+                    let names = resources
+                        .iter()
+                        .map(|resource| {
+                            let name = resource.name.trim();
+                            if name.is_empty() {
+                                resource.uri.trim().to_string()
+                            } else {
+                                name.to_string()
+                            }
+                        })
+                        .filter(|name| !name.is_empty())
+                        .collect::<Vec<_>>();
+                    (resources.len(), names)
+                }
+                Ok(Err(err)) => {
+                    warnings.push(format!(
+                        "guidance mcp resources failed for server '{}': {}",
+                        server_name, err
+                    ));
+                    (0, Vec::new())
+                }
+                Err(_) => {
+                    warnings.push(format!(
+                        "guidance mcp resources timed out for server '{}' after {:?}",
+                        server_name, list_timeout
+                    ));
+                    (0, Vec::new())
+                }
+            };
+
+        let (prompt_count, prompts) = match timeout(list_timeout, client.list_prompts()).await {
+            Ok(Ok(prompts)) => {
+                let prompt_snapshots = prompts
+                    .into_iter()
+                    .filter_map(|prompt| {
+                        let prompt_name = prompt.name.trim().to_string();
+                        if prompt_name.is_empty() {
+                            return None;
+                        }
+                        let arguments = prompt
+                            .arguments
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter_map(|argument| {
+                                let arg_name = argument.name.trim().to_string();
+                                if arg_name.is_empty() {
+                                    return None;
+                                }
+                                Some(Stage2McpPromptArgumentSnapshot {
+                                    name: arg_name,
+                                    description: argument
+                                        .description
+                                        .unwrap_or_default()
+                                        .trim()
+                                        .to_string(),
+                                    required: argument.required.unwrap_or(false),
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        Some(Stage2McpPromptSnapshot {
+                            name: prompt_name,
+                            arguments,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                (prompt_snapshots.len(), prompt_snapshots)
+            }
+            Ok(Err(err)) => {
+                warnings.push(format!(
+                    "guidance mcp prompts failed for server '{}': {}",
+                    server_name, err
+                ));
+                (0, Vec::new())
+            }
+            Err(_) => {
+                warnings.push(format!(
+                    "guidance mcp prompts timed out for server '{}' after {:?}",
+                    server_name, list_timeout
+                ));
+                (0, Vec::new())
+            }
+        };
+
+        snapshots.push(Stage2McpServerSnapshot {
+            server_name,
+            tool_count: tools.len(),
+            resource_count,
+            prompt_count,
+            resource_names,
+            prompts,
+        });
+    }
+
+    snapshots.sort_by(|left, right| left.server_name.cmp(&right.server_name));
+    (snapshots, warnings)
+}
+
+async fn collect_stage2_skills_runtime_snapshot(
+    skill_config: &SkillConfig,
+) -> (Vec<Stage2SkillSnapshot>, Vec<String>) {
+    if !skill_config.enabled {
+        return (Vec::new(), Vec::new());
+    }
+
+    let loader = SkillLoader::new();
+    let mut snapshots = Vec::<Stage2SkillSnapshot>::new();
+    let mut warnings = Vec::<String>::new();
+
+    if let Some(personal_dir) = &skill_config.personal_dir {
+        collect_stage2_skills_from_directory(
+            &loader,
+            personal_dir,
+            SkillSource::Personal,
+            &mut snapshots,
+            &mut warnings,
+        )
+        .await;
+    } else if let Some(home) = skill_home_dir() {
+        collect_stage2_skills_from_directory(
+            &loader,
+            &home.join(".cursor").join("skills"),
+            SkillSource::Personal,
+            &mut snapshots,
+            &mut warnings,
+        )
+        .await;
+    }
+
+    if skill_config.project_dirs.is_empty() {
+        collect_stage2_skills_from_directory(
+            &loader,
+            &PathBuf::from(".cursor").join("skills"),
+            SkillSource::Project,
+            &mut snapshots,
+            &mut warnings,
+        )
+        .await;
+    } else {
+        for dir in &skill_config.project_dirs {
+            collect_stage2_skills_from_directory(
+                &loader,
+                dir,
+                SkillSource::Project,
+                &mut snapshots,
+                &mut warnings,
+            )
+            .await;
+        }
+    }
+
+    snapshots.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then(left.source.cmp(&right.source))
+            .then(left.path.cmp(&right.path))
+    });
+    snapshots.dedup_by(|left, right| left.path == right.path);
+    (snapshots, warnings)
+}
+
+async fn collect_stage2_skills_from_directory(
+    loader: &SkillLoader,
+    dir: &Path,
+    source: SkillSource,
+    snapshots: &mut Vec<Stage2SkillSnapshot>,
+    warnings: &mut Vec<String>,
+) {
+    let source_label = source.as_label().to_string();
+    match loader.load_from_directory(dir, &source).await {
+        Ok(skills) => {
+            for skill in skills {
+                snapshots.push(Stage2SkillSnapshot {
+                    name: skill.metadata.name,
+                    source: source_label.clone(),
+                    path: skill.path.to_string_lossy().to_string(),
+                });
+            }
+        }
+        Err(err) => warnings.push(format!(
+            "guidance skills scan failed for '{}' ({}) : {}",
+            source_label,
+            dir.display(),
+            err
+        )),
+    }
+}
+
+fn build_stage2_guidance_context(
+    workspace_context: &WorkspaceContext,
+    runtime_resources: &RuntimeResources,
+    snapshot: &Stage2GuidanceSnapshot,
+    focus: &Stage2GuidanceFocus,
+) -> String {
+    let mut lines = Vec::<String>::new();
+    lines.push("[Guidance agent context]".to_string());
+    lines.push(format!(
+        "- Workspace root (authoritative cwd): {}",
+        workspace_context.root_dir.display()
+    ));
+    lines.push(format!(
+        "- AH runtime dir: {}",
+        workspace_context.ah_dir.display()
+    ));
+    lines.push(format!(
+        "- AH screenshots dir: {}",
+        workspace_context.screenshots_dir.display()
+    ));
+    lines.push(format!(
+        "- AH image recognition dir: {}",
+        workspace_context.image_recognition_dir.display()
+    ));
+    lines.push(
+        "- MCP path rules: use absolute local paths only. Never put natural language into path-like fields."
+            .to_string(),
+    );
+    lines.push(format!(
+        "- Image path guard: image fields must resolve under '{}' or '{}'.",
+        workspace_context.image_recognition_dir.display(),
+        workspace_context.screenshots_dir.display()
+    ));
+
+    if !focus.signals.is_empty() {
+        lines.push(format!(
+            "- Guidance focus signals: {}",
+            focus.signals.iter().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    let contract_lines =
+        build_guidance_contract_lines(&runtime_resources.mcp_tool_contracts, focus);
+    if contract_lines.is_empty() {
+        lines.push("- MCP contracts: no path-like MCP contracts detected.".to_string());
+    } else {
+        lines.push("- MCP contracts with path-like fields:".to_string());
+        lines.extend(contract_lines.into_iter().map(|line| format!("  {line}")));
+    }
+
+    if snapshot.mcp_servers.is_empty() {
+        lines.push("- MCP runtime inventory: no connected servers.".to_string());
+    } else {
+        lines.push("- MCP runtime inventory:".to_string());
+        for server in snapshot
+            .mcp_servers
+            .iter()
+            .filter(|server| {
+                focus.selected_server_names.is_empty()
+                    || focus.selected_server_names.contains(&server.server_name)
+            })
+            .take(8)
+        {
+            let prompt_names = server
+                .prompts
+                .iter()
+                .map(|prompt| prompt.name.clone())
+                .collect::<Vec<_>>();
+            lines.push(format!(
+                "  - {} | tools={} | resources={} [{}] | prompts={} [{}]",
+                server.server_name,
+                server.tool_count,
+                server.resource_count,
+                format_guidance_name_list(&server.resource_names, 6),
+                server.prompt_count,
+                format_guidance_name_list(&prompt_names, 6)
+            ));
+        }
+    }
+
+    let tool_template_lines = build_guidance_tool_argument_template_lines(
+        workspace_context,
+        &runtime_resources.mcp_tool_contracts,
+        focus,
+    );
+    if tool_template_lines.is_empty() {
+        lines.push("- MCP tool argument templates: none".to_string());
+    } else {
+        lines.push("- MCP tool argument templates:".to_string());
+        lines.extend(
+            tool_template_lines
+                .into_iter()
+                .map(|line| format!("  {line}")),
+        );
+    }
+
+    let prompt_template_lines =
+        build_guidance_prompt_argument_template_lines(workspace_context, snapshot, focus);
+    if prompt_template_lines.is_empty() {
+        lines.push("- MCP prompt argument templates: none".to_string());
+    } else {
+        lines.push("- MCP prompt argument templates:".to_string());
+        lines.extend(
+            prompt_template_lines
+                .into_iter()
+                .map(|line| format!("  {line}")),
+        );
+    }
+
+    if runtime_resources.skill_config.enabled {
+        let personal = runtime_resources
+            .skill_config
+            .personal_dir
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<default>".to_string());
+        let projects = if runtime_resources.skill_config.project_dirs.is_empty() {
+            "<default>".to_string()
+        } else {
+            runtime_resources
+                .skill_config
+                .project_dirs
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        lines.push(format!("- Skills enabled: true (personal={personal})"));
+        lines.push(format!("- Skills project dirs: {projects}"));
+        if snapshot.skills.is_empty() {
+            lines.push("- Skills discovered at runtime: none".to_string());
+        } else {
+            lines.push(format!(
+                "- Skills discovered at runtime: {}",
+                snapshot.skills.len()
+            ));
+            for skill in snapshot.skills.iter().take(12) {
+                lines.push(format!(
+                    "  - {} [{}] ({})",
+                    skill.name, skill.source, skill.path
+                ));
+            }
+            if snapshot.skills.len() > 12 {
+                lines.push(format!(
+                    "  - ... and {} more skills",
+                    snapshot.skills.len() - 12
+                ));
+            }
+        }
+    } else {
+        lines.push("- Skills enabled: false".to_string());
+    }
+
+    if !snapshot.warnings.is_empty() {
+        lines.push("- Guidance collection warnings:".to_string());
+        for warning in snapshot.warnings.iter().take(8) {
+            lines.push(format!("  - {warning}"));
+        }
+        if snapshot.warnings.len() > 8 {
+            lines.push(format!(
+                "  - ... and {} more warnings",
+                snapshot.warnings.len() - 8
+            ));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn format_guidance_name_list(items: &[String], limit: usize) -> String {
+    if items.is_empty() {
+        return "none".to_string();
+    }
+    let mut preview = items
+        .iter()
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+        .take(limit)
+        .collect::<Vec<_>>();
+    if preview.is_empty() {
+        return "none".to_string();
+    }
+    if items.len() > limit {
+        preview.push(format!("+{} more", items.len() - limit));
+    }
+    preview.join(", ")
+}
+
+fn build_guidance_tool_argument_template_lines(
+    workspace_context: &WorkspaceContext,
+    contracts: &[McpToolContract],
+    focus: &Stage2GuidanceFocus,
+) -> Vec<String> {
+    let mut lines = Vec::<String>::new();
+    for contract in contracts.iter().take(30) {
+        if !focus.selected_contract_names.is_empty()
+            && !focus
+                .selected_contract_names
+                .contains(&contract.public_name)
+        {
+            continue;
+        }
+        let mut template = BTreeSet::<(String, String)>::new();
+        for rule in &contract.schema_rules {
+            let field = format_field_path(&rule.path);
+            if field.is_empty() {
+                continue;
+            }
+            let value = match rule.kind {
+                McpPathFieldKind::Image => guidance_image_path_template(workspace_context),
+                McpPathFieldKind::Generic => guidance_workspace_path_template(workspace_context),
+            };
+            template.insert((field, value));
+        }
+
+        if template.is_empty() && contract.is_image_tool {
+            template.insert((
+                "image_source".to_string(),
+                guidance_image_path_template(workspace_context),
+            ));
+        }
+        if template.is_empty() {
+            continue;
+        }
+
+        lines.push(format!(
+            "- {} -> {}",
+            contract.public_name,
+            format_guidance_template_object(&template)
+        ));
+    }
+    lines
+}
+
+fn build_guidance_prompt_argument_template_lines(
+    workspace_context: &WorkspaceContext,
+    snapshot: &Stage2GuidanceSnapshot,
+    focus: &Stage2GuidanceFocus,
+) -> Vec<String> {
+    let mut lines = Vec::<String>::new();
+    for server in snapshot.mcp_servers.iter().take(20) {
+        if !focus.selected_server_names.is_empty()
+            && !focus.selected_server_names.contains(&server.server_name)
+        {
+            continue;
+        }
+        for prompt in server.prompts.iter().take(20) {
+            let prompt_key = stage2_prompt_key(&server.server_name, &prompt.name);
+            if !focus.selected_prompt_keys.is_empty()
+                && !focus.selected_prompt_keys.contains(&prompt_key)
+            {
+                continue;
+            }
+            if prompt.arguments.is_empty() {
+                continue;
+            }
+
+            let mut template = BTreeSet::<(String, String)>::new();
+            for arg in &prompt.arguments {
+                let value = guidance_prompt_argument_template_value(workspace_context, arg);
+                template.insert((arg.name.clone(), value));
+            }
+            if template.is_empty() {
+                continue;
+            }
+
+            lines.push(format!(
+                "- {}:{} -> {}",
+                server.server_name,
+                prompt.name,
+                format_guidance_template_object(&template)
+            ));
+            if lines.len() >= 20 {
+                return lines;
+            }
+        }
+    }
+    lines
+}
+
+fn guidance_prompt_argument_template_value(
+    workspace_context: &WorkspaceContext,
+    argument: &Stage2McpPromptArgumentSnapshot,
+) -> String {
+    let normalized_name = argument.name.trim().to_ascii_lowercase();
+    let normalized_desc = argument.description.trim().to_ascii_lowercase();
+    let description_image_hint =
+        normalized_desc.contains("image") || normalized_desc.contains("img");
+    let description_path_hint = normalized_desc.contains("path")
+        || normalized_desc.contains("file")
+        || normalized_desc.contains("uri")
+        || normalized_desc.contains("source");
+    let looks_like_image = is_explicit_image_field_name(&normalized_name)
+        || (description_image_hint && description_path_hint);
+    if looks_like_image {
+        return guidance_image_path_template(workspace_context);
+    }
+
+    let looks_like_path = is_path_like_field_name(&normalized_name)
+        || normalized_desc.contains("path")
+        || normalized_desc.contains("file");
+    if looks_like_path {
+        return guidance_workspace_path_template(workspace_context);
+    }
+
+    if argument.required {
+        "<text-required>".to_string()
+    } else {
+        "<text-optional>".to_string()
+    }
+}
+
+fn guidance_image_path_template(workspace_context: &WorkspaceContext) -> String {
+    format!(
+        "{}\\<image-file>",
+        workspace_context
+            .image_recognition_dir
+            .to_string_lossy()
+            .to_string()
+    )
+}
+
+fn guidance_workspace_path_template(workspace_context: &WorkspaceContext) -> String {
+    format!(
+        "{}\\<relative-path>",
+        workspace_context.root_dir.to_string_lossy().to_string()
+    )
+}
+
+fn format_guidance_template_object(template: &BTreeSet<(String, String)>) -> String {
+    let mut map = Map::new();
+    for (key, value) in template {
+        if key.trim().is_empty() {
+            continue;
+        }
+        map.insert(key.clone(), Value::String(value.clone()));
+    }
+    Value::Object(map).to_string()
+}
+
+fn build_guidance_contract_lines(
+    contracts: &[McpToolContract],
+    focus: &Stage2GuidanceFocus,
+) -> Vec<String> {
+    let mut lines = Vec::<String>::new();
+    for contract in contracts {
+        if !focus.selected_contract_names.is_empty()
+            && !focus
+                .selected_contract_names
+                .contains(&contract.public_name)
+        {
+            continue;
+        }
+        let mut image_fields = BTreeSet::<String>::new();
+        let mut generic_fields = BTreeSet::<String>::new();
+        for rule in &contract.schema_rules {
+            let field = format_field_path(&rule.path);
+            if field.is_empty() {
+                continue;
+            }
+            match rule.kind {
+                McpPathFieldKind::Image => {
+                    image_fields.insert(field);
+                }
+                McpPathFieldKind::Generic => {
+                    generic_fields.insert(field);
+                }
+            }
+        }
+
+        if image_fields.is_empty() && generic_fields.is_empty() && !contract.is_image_tool {
+            continue;
+        }
+
+        let image_text = if image_fields.is_empty() {
+            "none".to_string()
+        } else {
+            image_fields.into_iter().collect::<Vec<_>>().join(", ")
+        };
+        let generic_text = if generic_fields.is_empty() {
+            "none".to_string()
+        } else {
+            generic_fields.into_iter().collect::<Vec<_>>().join(", ")
+        };
+
+        lines.push(format!(
+            "- {} | image_tool={} | image_fields=[{}] | path_fields=[{}]",
+            contract.public_name, contract.is_image_tool, image_text, generic_text
+        ));
+    }
+
+    lines
+}
+
+fn merge_prompt_directives_with_guidance(
+    config: &AgentRuntimeConfig,
+    prompt_directives: Option<PromptDirectives>,
+    guidance_context: &str,
+) -> PromptDirectives {
+    let mut directives = prompt_directives.unwrap_or(PromptDirectives {
+        developer_instructions: Some(control::assemble_developer_instructions(config, None)),
+        user_instructions: None,
+    });
+
+    let base_developer = directives
+        .developer_instructions
+        .clone()
+        .unwrap_or_else(|| control::assemble_developer_instructions(config, None));
+    directives.developer_instructions = Some(format!("{base_developer}\n\n{guidance_context}"));
+    directives
+}
+
+fn guidance_context_summary(
+    workspace_context: &WorkspaceContext,
+    runtime_resources: &RuntimeResources,
+    snapshot: &Stage2GuidanceSnapshot,
+    focus: &Stage2GuidanceFocus,
+) -> String {
+    format!(
+        "Guidance context injected: workspace='{}', mcp_contracts={}/{}, mcp_servers={}/{}, prompts={}, skills_discovered={}, warnings={}",
+        workspace_context.root_dir.display(),
+        focus.selected_contract_names.len(),
+        runtime_resources.mcp_tool_contracts.len(),
+        focus.selected_server_names.len(),
+        snapshot.mcp_servers.len(),
+        focus.selected_prompt_keys.len(),
+        snapshot.skills.len().min(12),
+        snapshot.warnings.len()
+    )
+}
+
+fn guidance_context_audit(
+    runtime_resources: &RuntimeResources,
+    snapshot: &Stage2GuidanceSnapshot,
+    focus: &Stage2GuidanceFocus,
+) -> String {
+    let mut payload = Map::new();
+    payload.insert(
+        "event".to_string(),
+        Value::String("guidance_injected".to_string()),
+    );
+    payload.insert(
+        "signals".to_string(),
+        Value::Array(
+            focus
+                .signals
+                .iter()
+                .map(|item| Value::String(item.clone()))
+                .collect(),
+        ),
+    );
+    payload.insert(
+        "selected_contracts".to_string(),
+        Value::Array(
+            focus
+                .selected_contract_names
+                .iter()
+                .map(|item| Value::String(item.clone()))
+                .collect(),
+        ),
+    );
+    payload.insert(
+        "selected_servers".to_string(),
+        Value::Array(
+            focus
+                .selected_server_names
+                .iter()
+                .map(|item| Value::String(item.clone()))
+                .collect(),
+        ),
+    );
+    payload.insert(
+        "selected_prompts".to_string(),
+        Value::Array(
+            focus
+                .selected_prompt_keys
+                .iter()
+                .take(16)
+                .map(|item| Value::String(item.clone()))
+                .collect(),
+        ),
+    );
+    payload.insert(
+        "contracts_total".to_string(),
+        Value::from(runtime_resources.mcp_tool_contracts.len() as u64),
+    );
+    payload.insert(
+        "servers_total".to_string(),
+        Value::from(snapshot.mcp_servers.len() as u64),
+    );
+    payload.insert(
+        "warnings_count".to_string(),
+        Value::from(snapshot.warnings.len() as u64),
+    );
+    format!("GuidanceAudit {}", Value::Object(payload))
 }
 
 fn map_runtime_skill_config(
@@ -4254,6 +5314,293 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_stage2_guidance_context_includes_workspace_and_mcp_contracts() {
+        let root = unique_temp_dir("guidance-context");
+        let workspace_context = WorkspaceContext::from_root(root.clone());
+        workspace_context
+            .ensure_layout()
+            .expect("workspace layout should exist");
+
+        let contract = McpToolContract::compile(
+            "zai-mcp-server",
+            "analyze_image",
+            &serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "image_source": { "type": "string", "description": "Image file path." },
+                    "prompt": { "type": "string", "description": "Prompt text for image analysis." },
+                    "metadata_path": { "type": "string", "description": "metadata file path" }
+                }
+            }),
+        );
+        let runtime_resources = RuntimeResources {
+            mcp_manager: None,
+            tool_executor: None,
+            skill_config: SkillConfig {
+                enabled: true,
+                personal_dir: Some(root.join("skills").join("personal")),
+                project_dirs: vec![root.join("skills").join("project")],
+                auto_apply: false,
+            },
+            mcp_tool_contracts: vec![contract],
+        };
+        let guidance_snapshot = Stage2GuidanceSnapshot {
+            mcp_servers: vec![Stage2McpServerSnapshot {
+                server_name: "zai-mcp-server".to_string(),
+                tool_count: 3,
+                resource_count: 2,
+                prompt_count: 1,
+                resource_names: vec!["workspace://repo/readme".to_string()],
+                prompts: vec![Stage2McpPromptSnapshot {
+                    name: "analyze_image".to_string(),
+                    arguments: vec![
+                        Stage2McpPromptArgumentSnapshot {
+                            name: "image_source".to_string(),
+                            description: "Local image path".to_string(),
+                            required: true,
+                        },
+                        Stage2McpPromptArgumentSnapshot {
+                            name: "prompt".to_string(),
+                            description: "Prompt text for image analysis.".to_string(),
+                            required: true,
+                        },
+                    ],
+                }],
+            }],
+            skills: vec![Stage2SkillSnapshot {
+                name: "workspace-helper".to_string(),
+                source: "project".to_string(),
+                path: root
+                    .join(".cursor")
+                    .join("skills")
+                    .join("workspace-helper")
+                    .join("SKILL.md")
+                    .to_string_lossy()
+                    .to_string(),
+            }],
+            warnings: vec!["sample guidance warning".to_string()],
+        };
+        let focus = Stage2GuidanceFocus::default();
+
+        let guidance = build_stage2_guidance_context(
+            &workspace_context,
+            &runtime_resources,
+            &guidance_snapshot,
+            &focus,
+        );
+        assert!(guidance.contains(workspace_context.root_dir.to_string_lossy().as_ref()));
+        assert!(guidance.contains("mcp:zai-mcp-server:analyze_image"));
+        assert!(guidance.contains("image_source"));
+        assert!(guidance.contains("metadata_path"));
+        assert!(!guidance.contains("prompt]"));
+        assert!(guidance.contains("zai-mcp-server"));
+        assert!(guidance.contains("MCP tool argument templates"));
+        assert!(guidance.contains("MCP prompt argument templates"));
+        assert!(guidance.contains("image_source"));
+        assert!(guidance.contains("<text-required>"));
+        assert!(guidance.contains("workspace-helper"));
+        assert!(guidance.contains("sample guidance warning"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_stage2_guidance_focus_selects_image_contracts_and_prompts() {
+        let contract_image = McpToolContract::compile(
+            "zai-mcp-server",
+            "analyze_image",
+            &serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "image_source": { "type": "string", "description": "Image file path." },
+                    "prompt": { "type": "string", "description": "Prompt text for image analysis." }
+                }
+            }),
+        );
+        let contract_generic = McpToolContract::compile(
+            "workspace-tools",
+            "read_file",
+            &serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "workspace file path" }
+                }
+            }),
+        );
+        let runtime_resources = RuntimeResources {
+            mcp_manager: None,
+            tool_executor: None,
+            skill_config: SkillConfig {
+                enabled: false,
+                personal_dir: None,
+                project_dirs: Vec::new(),
+                auto_apply: false,
+            },
+            mcp_tool_contracts: vec![contract_image, contract_generic],
+        };
+        let snapshot = Stage2GuidanceSnapshot {
+            mcp_servers: vec![Stage2McpServerSnapshot {
+                server_name: "zai-mcp-server".to_string(),
+                tool_count: 1,
+                resource_count: 0,
+                prompt_count: 1,
+                resource_names: Vec::new(),
+                prompts: vec![Stage2McpPromptSnapshot {
+                    name: "analyze_image".to_string(),
+                    arguments: vec![
+                        Stage2McpPromptArgumentSnapshot {
+                            name: "image_source".to_string(),
+                            description: "Absolute image file path".to_string(),
+                            required: true,
+                        },
+                        Stage2McpPromptArgumentSnapshot {
+                            name: "prompt".to_string(),
+                            description: "Analysis prompt text".to_string(),
+                            required: true,
+                        },
+                    ],
+                }],
+            }],
+            skills: Vec::new(),
+            warnings: Vec::new(),
+        };
+
+        let focus = build_stage2_guidance_focus(
+            "请帮我分析 image.png 的截图内容",
+            &runtime_resources,
+            &snapshot,
+        );
+        assert!(focus.signals.contains("image_intent"));
+        assert!(focus
+            .selected_contract_names
+            .contains("mcp:zai-mcp-server:analyze_image"));
+        assert!(focus
+            .selected_prompt_keys
+            .contains("zai-mcp-server:analyze_image"));
+    }
+
+    #[test]
+    fn build_stage2_guidance_context_filters_contracts_and_prompts_by_focus() {
+        let root = unique_temp_dir("guidance-focus");
+        let workspace_context = WorkspaceContext::from_root(root.clone());
+        workspace_context
+            .ensure_layout()
+            .expect("workspace layout should exist");
+
+        let contract_image = McpToolContract::compile(
+            "zai-mcp-server",
+            "analyze_image",
+            &serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "image_source": { "type": "string", "description": "Image file path." }
+                }
+            }),
+        );
+        let contract_file = McpToolContract::compile(
+            "workspace-tools",
+            "read_file",
+            &serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "workspace file path" }
+                }
+            }),
+        );
+        let runtime_resources = RuntimeResources {
+            mcp_manager: None,
+            tool_executor: None,
+            skill_config: SkillConfig {
+                enabled: false,
+                personal_dir: None,
+                project_dirs: Vec::new(),
+                auto_apply: false,
+            },
+            mcp_tool_contracts: vec![contract_image, contract_file],
+        };
+        let snapshot = Stage2GuidanceSnapshot {
+            mcp_servers: vec![
+                Stage2McpServerSnapshot {
+                    server_name: "zai-mcp-server".to_string(),
+                    tool_count: 1,
+                    resource_count: 0,
+                    prompt_count: 1,
+                    resource_names: Vec::new(),
+                    prompts: vec![Stage2McpPromptSnapshot {
+                        name: "analyze_image".to_string(),
+                        arguments: vec![Stage2McpPromptArgumentSnapshot {
+                            name: "image_source".to_string(),
+                            description: "Absolute image file path".to_string(),
+                            required: true,
+                        }],
+                    }],
+                },
+                Stage2McpServerSnapshot {
+                    server_name: "workspace-tools".to_string(),
+                    tool_count: 1,
+                    resource_count: 0,
+                    prompt_count: 1,
+                    resource_names: Vec::new(),
+                    prompts: vec![Stage2McpPromptSnapshot {
+                        name: "read_file".to_string(),
+                        arguments: vec![Stage2McpPromptArgumentSnapshot {
+                            name: "path".to_string(),
+                            description: "workspace path".to_string(),
+                            required: true,
+                        }],
+                    }],
+                },
+            ],
+            skills: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let mut focus = Stage2GuidanceFocus::default();
+        focus
+            .selected_contract_names
+            .insert("mcp:zai-mcp-server:analyze_image".to_string());
+        focus
+            .selected_server_names
+            .insert("zai-mcp-server".to_string());
+        focus
+            .selected_prompt_keys
+            .insert("zai-mcp-server:analyze_image".to_string());
+        focus.signals.insert("image_intent".to_string());
+
+        let guidance = build_stage2_guidance_context(
+            &workspace_context,
+            &runtime_resources,
+            &snapshot,
+            &focus,
+        );
+        assert!(guidance.contains("mcp:zai-mcp-server:analyze_image"));
+        assert!(!guidance.contains("mcp:workspace-tools:read_file"));
+        assert!(guidance.contains("zai-mcp-server:analyze_image"));
+        assert!(!guidance.contains("workspace-tools:read_file"));
+        assert!(guidance.contains("Guidance focus signals: image_intent"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn merge_prompt_directives_with_guidance_appends_context() {
+        let config = AgentRuntimeConfig::default();
+        let directives = Some(PromptDirectives {
+            developer_instructions: Some("base instructions".to_string()),
+            user_instructions: None,
+        });
+
+        let merged = merge_prompt_directives_with_guidance(
+            &config,
+            directives,
+            "[Guidance]\nworkspace=demo",
+        );
+        let developer = merged.developer_instructions.unwrap_or_default();
+        assert!(developer.contains("base instructions"));
+        assert!(developer.contains("[Guidance]"));
+        assert!(developer.contains("workspace=demo"));
     }
 
     #[test]
