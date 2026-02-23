@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use log::{debug, info};
 
 use agent_lib::guide_prompt::{
     guide_agent_system_prompt, runtime_control_system_prompt, title_generator_system_prompt,
@@ -169,12 +170,29 @@ pub async fn suggest_conversation_title(
     input: &ControlInput,
     model: Option<Arc<dyn ModelClient>>,
 ) -> Option<String> {
-    if let Some(model) = model {
+    debug!(
+        "Suggesting conversation title: user_input={}, num_recent_messages={}",
+        input.user_input,
+        input.recent_messages.len()
+    );
+
+    let title = if let Some(model) = model {
         if let Some(title) = suggest_conversation_title_by_model(input, model).await {
+            info!("Generated title by model: {}", title);
             return Some(title);
         }
+        suggest_conversation_title_by_rules(input)
+    } else {
+        suggest_conversation_title_by_rules(input)
+    };
+
+    if let Some(ref t) = title {
+        info!("Generated conversation title (method=rules): {}", t);
+    } else {
+        debug!("Failed to generate conversation title");
     }
-    suggest_conversation_title_by_rules(input)
+
+    title
 }
 
 pub fn assemble_developer_instructions(
@@ -218,6 +236,7 @@ async fn suggest_conversation_title_by_model(
 
 fn suggest_conversation_title_by_rules(input: &ControlInput) -> Option<String> {
     let merged = if input.recent_messages.is_empty() {
+        debug!("No recent messages, using only user input for title");
         input.user_input.clone()
     } else {
         let mut parts = input
@@ -231,10 +250,19 @@ fn suggest_conversation_title_by_rules(input: &ControlInput) -> Option<String> {
             .collect::<Vec<_>>();
         parts.reverse();
         parts.push(input.user_input.clone());
-        parts.join(" ")
+        let joined = parts.join(" ");
+        debug!(
+            "Generated merged text from recent messages and user input: num_parts={}, merged_length={}",
+            parts.len(),
+            joined.len()
+        );
+        joined
     };
 
-    normalize_title(Some(heuristic_title_from_text(&merged)))
+    let heuristic = heuristic_title_from_text(&merged);
+    debug!("Generated heuristic title: {}", heuristic);
+
+    normalize_title(Some(heuristic))
 }
 
 fn heuristic_title_from_text(raw: &str) -> String {

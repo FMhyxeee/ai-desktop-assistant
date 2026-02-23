@@ -174,7 +174,7 @@ const normalizeConfigForSave = (config: AppConfig): AppConfig => ({
 });
 
 const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
-  const { config, updateConfig, streamingTaskId } = useAppStore();
+  const { config, updateConfig, streamingTaskIds } = useAppStore();
 
   const [tab, setTab] = React.useState<SettingsTab>('model');
   const [localConfig, setLocalConfig] = React.useState(config);
@@ -220,7 +220,7 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
   }, [config, isOpen]);
 
   const preset = getProviderPreset(localConfig.provider);
-  const hasStreaming = Boolean(streamingTaskId);
+  const hasStreaming = streamingTaskIds.size > 0;
   const disableSave =
     isSaving || isTestingModel || isTestingMcp || isScanningSkills || isRunningGovernance || hasStreaming;
 
