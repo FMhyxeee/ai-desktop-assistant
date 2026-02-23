@@ -1,5 +1,5 @@
-use std::fs;
 use std::ffi::OsStr;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Once};
 
@@ -445,10 +445,7 @@ impl StorageService {
             validate_storage_path_segment(conversation_id, "conversation id")?;
         let conn = open_workspace_connection(workspace_root)?;
         load_single_conversation(&conn, workspace_root, &safe_conversation_id)?.ok_or_else(|| {
-            StorageError::NotFound(format!(
-                "conversation '{}' not found",
-                safe_conversation_id
-            ))
+            StorageError::NotFound(format!("conversation '{}' not found", safe_conversation_id))
         })
     }
 
@@ -546,9 +543,7 @@ fn conversation_assets_root_dir(workspace_root: &Path) -> PathBuf {
 
 fn validate_storage_path_segment(value: &str, field_name: &str) -> Result<String, StorageError> {
     if value.trim().is_empty() {
-        return Err(StorageError::InvalidInput(format!(
-            "{field_name} is empty"
-        )));
+        return Err(StorageError::InvalidInput(format!("{field_name} is empty")));
     }
     if value != value.trim() {
         return Err(StorageError::InvalidInput(format!(
@@ -591,7 +586,9 @@ fn resolve_workspace_asset_absolute_path(
 ) -> Result<PathBuf, StorageError> {
     let trimmed = asset_path.trim();
     if trimmed.is_empty() {
-        return Err(StorageError::InvalidInput("asset path is empty".to_string()));
+        return Err(StorageError::InvalidInput(
+            "asset path is empty".to_string(),
+        ));
     }
 
     let relative = Path::new(trimmed);
@@ -2131,35 +2128,30 @@ mod tests {
         let workspace = TempWorkspace::new("asset-path-guard");
 
         let valid_relative = ".ah/assets/conversations/conv-1/msg-1/img-1.png";
-        let resolved =
-            resolve_workspace_asset_absolute_path(&workspace.root, valid_relative).expect("valid path should resolve");
+        let resolved = resolve_workspace_asset_absolute_path(&workspace.root, valid_relative)
+            .expect("valid path should resolve");
         assert_eq!(resolved, workspace.root.join(valid_relative));
 
-        assert!(
-            resolve_workspace_asset_absolute_path(
-                &workspace.root,
-                ".ah/assets/conversations/../outside.png"
-            )
-            .is_err()
-        );
-        assert!(
-            resolve_workspace_asset_absolute_path(&workspace.root, "assets/conversations/a.png")
-                .is_err()
-        );
-        assert!(
-            resolve_workspace_asset_absolute_path(&workspace.root, "../outside.png").is_err()
-        );
-        assert!(
-            resolve_workspace_asset_absolute_path(
-                &workspace.root,
-                &workspace
-                    .root
-                    .join("outside.png")
-                    .to_string_lossy()
-                    .to_string()
-            )
-            .is_err()
-        );
+        assert!(resolve_workspace_asset_absolute_path(
+            &workspace.root,
+            ".ah/assets/conversations/../outside.png"
+        )
+        .is_err());
+        assert!(resolve_workspace_asset_absolute_path(
+            &workspace.root,
+            "assets/conversations/a.png"
+        )
+        .is_err());
+        assert!(resolve_workspace_asset_absolute_path(&workspace.root, "../outside.png").is_err());
+        assert!(resolve_workspace_asset_absolute_path(
+            &workspace.root,
+            &workspace
+                .root
+                .join("outside.png")
+                .to_string_lossy()
+                .to_string()
+        )
+        .is_err());
     }
 
     #[tokio::test]

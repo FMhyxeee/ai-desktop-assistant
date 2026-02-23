@@ -155,6 +155,9 @@ const ChatInput: React.FC<ChatInputProps> = ({
     const normalizedContent = parsedInput.normalizedContent;
     const hasText = normalizedContent.length > 0;
     const hasImages = images.length > 0;
+    const commandHead = (parsedInput.command ?? '').split(/\s+/, 1)[0]?.toLowerCase() ?? '';
+    const commandKind =
+      commandHead === 'proc' ? 'proc' : commandHead === 'sub' ? 'sub' : 'shell';
 
     if ((!hasText && !hasImages) || disabled || isReadingImages) {
       return;
@@ -165,7 +168,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
       return;
     }
 
-    if (parsedInput.isCommand) {
+    if (parsedInput.isCommand && commandKind === 'shell') {
       const confirmed = window.confirm(
         `Confirm shell command execution?\n\n${parsedInput.command ?? ''}`
       );
@@ -196,6 +199,9 @@ const ChatInput: React.FC<ChatInputProps> = ({
 
   const parsedInput = parseSlashInput(input);
   const hasSendableInput = parsedInput.normalizedContent.length > 0 || images.length > 0;
+  const commandHead = (parsedInput.command ?? '').split(/\s+/, 1)[0]?.toLowerCase() ?? '';
+  const commandKind =
+    commandHead === 'proc' ? 'proc' : commandHead === 'sub' ? 'sub' : 'shell';
 
   return (
     <div className="composer-wrap">
@@ -253,7 +259,7 @@ const ChatInput: React.FC<ChatInputProps> = ({
           onChange={(event) => setInput(event.target.value)}
           onKeyDown={handleKeyDown}
           onPaste={handlePaste}
-          placeholder="Type a message... (/command to run shell, // to send text starting with /)"
+          placeholder="Type a message... (/shell, /proc start|list|logs|stop, /sub explore|plan, // to escape)"
           disabled={disabled}
           rows={1}
           className="composer-input"
@@ -265,7 +271,11 @@ const ChatInput: React.FC<ChatInputProps> = ({
               {isStreaming
                 ? 'Streaming response in progress...'
                 : parsedInput.isCommand
-                  ? 'Command mode: will trigger run_user_shell_command'
+                  ? commandKind === 'proc'
+                    ? 'Process mode: /proc start <cmd> | list | logs <id> [lines] | stop <id>'
+                    : commandKind === 'sub'
+                      ? 'Sub-agent mode: /sub explore <input> | /sub plan <input>'
+                      : 'Shell mode: will trigger run_user_shell_command'
                   : 'Message mode: will trigger user_turn'}
             </span>
             <span className="composer-count">{input.length}</span>

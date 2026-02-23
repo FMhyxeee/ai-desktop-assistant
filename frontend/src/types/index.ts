@@ -107,7 +107,6 @@ export interface GovernanceUpdateReport {
 export type PatchDecisionSource = 'rule' | 'model_fallback';
 
 export interface ProtocolRuntimeConfigPatch {
-  systemPrompt?: string | null;
   mcp?: McpRuntimeConfig | null;
   skills?: SkillsRuntimeConfig | null;
 }
@@ -193,6 +192,15 @@ export interface ProtocolGuidanceOutput {
   warnings: string[];
 }
 
+export interface ProtocolProcessInfo {
+  id: string;
+  command: string;
+  pid?: number | null;
+  status: string;
+  startedAtUnixMs: number;
+  exitCode?: number | null;
+}
+
 export type AgentHistoryRole = 'user' | 'assistant' | 'system';
 
 export interface AgentHistoryMessage {
@@ -216,6 +224,15 @@ export type ProtocolOpPayload =
   | {
       type: 'run_user_shell_command';
       command: string;
+    }
+  | {
+      type: 'proc_command';
+      command: string;
+    }
+  | {
+      type: 'run_sub_agent';
+      mode: string;
+      input: string;
     }
   | {
       type: 'interrupt';
@@ -249,6 +266,32 @@ export type ProtocolEventPayload =
   | {
       type: 'run_user_shell_command';
       command: string;
+    }
+  | {
+      type: 'process_started';
+      process: ProtocolProcessInfo;
+    }
+  | {
+      type: 'process_list';
+      processes: ProtocolProcessInfo[];
+    }
+  | {
+      type: 'process_logs';
+      process_id: string;
+      logs: string[];
+    }
+  | {
+      type: 'process_stopped';
+      process: ProtocolProcessInfo;
+    }
+  | {
+      type: 'process_error';
+      action: string;
+      message: string;
+    }
+  | {
+      type: 'think_status';
+      active: boolean;
     }
   | {
       type: 'warning';
@@ -307,6 +350,26 @@ export type ProtocolEventPayload =
       skill_name: string;
       file_path: string;
       content: string;
+    }
+  | {
+      type: 'sub_agent_started';
+      mode: string;
+      input: string;
+    }
+  | {
+      type: 'sub_agent_progress';
+      mode: string;
+      message: string;
+    }
+  | {
+      type: 'sub_agent_completed';
+      mode: string;
+      output: string;
+    }
+  | {
+      type: 'sub_agent_failed';
+      mode: string;
+      error: string;
     }
   | {
       type: 'governance_report';
@@ -424,7 +487,6 @@ export interface AppConfig {
   apiKey?: string;
   baseUrl?: string;
   maxTokens?: number;
-  systemPrompt: string;
   workspace: WorkspaceConfig;
   mcp: McpRuntimeConfig;
   skills: SkillsRuntimeConfig;

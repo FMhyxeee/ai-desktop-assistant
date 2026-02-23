@@ -1,5 +1,6 @@
 mod control;
 mod governance;
+mod process_manager;
 pub mod types;
 
 use std::collections::{BTreeSet, HashMap};
@@ -17,7 +18,8 @@ use agent_lib::model::provider::{
 };
 use agent_lib::model::{Message, ModelClient, TokenUsage};
 use agent_lib::protocol::{
-    ApprovalPolicy, Op, PromptDirectives, ReasoningSummary, SandboxPolicy, UserInputItem,
+    ApprovalPolicy, Op, PromptDirectives, ReasoningSummary, SandboxPolicy, SubAgentMode,
+    UserInputItem,
 };
 use agent_lib::session::{Session, SessionConfig, SessionHandle};
 use agent_lib::skills::{SkillConfig, SkillLoader, SkillSource};
@@ -31,6 +33,7 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 use self::control::{ControlInput, RuntimeConfigPatch};
+use self::process_manager::{ProcessManager, ProcessSnapshot};
 use self::types::{
     AgentEvent, AgentHistoryMessage, AgentHistoryRole, AgentInputImage, AgentProvider,
     AgentRuntimeConfig, AgentStreamInput, AppError, GovernanceReport, McpAuthRuntimeConfig,
@@ -41,9 +44,9 @@ use self::types::{
     ProtocolGuidancePathVars, ProtocolGuidanceTemplate, ProtocolGuidanceToolConstraint,
     ProtocolInputImage, ProtocolMcpArgNormalization, ProtocolMcpPromptInfo,
     ProtocolMcpRejectPreview, ProtocolMcpResourceInfo, ProtocolMcpRewriteEntry,
-    ProtocolMcpToolInfo, ProtocolOpPayload, ProtocolPromptArgumentInfo, ProtocolPromptContent,
-    ProtocolPromptMessage, ProtocolSkillEntry, ProtocolTokenUsage, SkillScanEntry, SkillScanResult,
-    SkillsRuntimeConfig, WorkspaceRuntimeConfig,
+    ProtocolMcpToolInfo, ProtocolOpPayload, ProtocolProcessInfo, ProtocolPromptArgumentInfo,
+    ProtocolPromptContent, ProtocolPromptMessage, ProtocolSkillEntry, ProtocolTokenUsage,
+    SkillScanEntry, SkillScanResult, SkillsRuntimeConfig, WorkspaceRuntimeConfig,
 };
 
 struct ActiveTask {
@@ -53,16 +56,12 @@ struct ActiveTask {
 
 #[derive(Debug, Clone, Default)]
 struct RuntimeConfigPatchAppliedState {
-    system_prompt: Option<String>,
     mcp: Option<McpRuntimeConfig>,
     skills: Option<SkillsRuntimeConfig>,
 }
 
 impl RuntimeConfigPatchAppliedState {
     fn merge_patch(&mut self, patch: &RuntimeConfigPatch) {
-        if let Some(system_prompt) = patch.system_prompt.clone() {
-            self.system_prompt = Some(system_prompt);
-        }
         if let Some(mcp) = patch.mcp.clone() {
             self.mcp = Some(mcp);
         }
@@ -222,6 +221,7 @@ pub struct AgentService {
     runner: Arc<dyn Runner>,
     runtime_config: Option<AgentRuntimeConfig>,
     latest_governance_report: Option<GovernanceReport>,
+    process_manager: Arc<ProcessManager>,
     tasks: Arc<Mutex<HashMap<String, ActiveTask>>>,
     conversation_overrides: Arc<Mutex<HashMap<String, RuntimeConfigPatchAppliedState>>>,
     global_persisted_patch: Arc<Mutex<RuntimeConfigPatchAppliedState>>,
@@ -251,6 +251,7 @@ impl AgentService {
             runner: Arc::new(runner),
             runtime_config: Some(config),
             latest_governance_report,
+            process_manager: Arc::new(ProcessManager::new()),
             tasks: Arc::new(Mutex::new(HashMap::new())),
             conversation_overrides: Arc::new(Mutex::new(HashMap::new())),
             global_persisted_patch: Arc::new(Mutex::new(RuntimeConfigPatchAppliedState::default())),
@@ -263,6 +264,7 @@ impl AgentService {
             runner,
             runtime_config: None,
             latest_governance_report: None,
+            process_manager: Arc::new(ProcessManager::new()),
             tasks: Arc::new(Mutex::new(HashMap::new())),
             conversation_overrides: Arc::new(Mutex::new(HashMap::new())),
             global_persisted_patch: Arc::new(Mutex::new(RuntimeConfigPatchAppliedState::default())),
@@ -348,6 +350,68 @@ impl AgentService {
                     },
                 });
             }
+        }
+
+        let parsed_stream_input = parse_slash_input(&input.content);
+        if let ParsedStreamInput::ProcCommand(proc_command) = &parsed_stream_input {
+            seq += 1;
+            emit(AgentEvent::OpSubmitted {
+                task_id: task_id.clone(),
+                seq,
+                payload: ProtocolOpPayload::ProcCommand {
+                    command: proc_command.display_text(),
+                },
+            });
+
+            match self.handle_proc_command(proc_command).await {
+                Ok((payload, output)) => {
+                    seq += 1;
+                    emit(AgentEvent::ProtocolEvent {
+                        task_id: task_id.clone(),
+                        seq,
+                        payload,
+                    });
+                    emit(AgentEvent::Completed {
+                        task_id: task_id.clone(),
+                        output,
+                    });
+                }
+                Err(message) => {
+                    seq += 1;
+                    emit(AgentEvent::ProtocolEvent {
+                        task_id: task_id.clone(),
+                        seq,
+                        payload: ProtocolEventPayload::ProcessError {
+                            action: proc_command.action_name().to_string(),
+                            message: message.clone(),
+                        },
+                    });
+                    emit(AgentEvent::Error {
+                        task_id: task_id.clone(),
+                        code: "proc_error".to_string(),
+                        message,
+                    });
+                }
+            }
+            return Ok(());
+        }
+
+        if let ParsedStreamInput::InvalidCommand { raw, message } = &parsed_stream_input {
+            seq += 1;
+            emit(AgentEvent::ProtocolEvent {
+                task_id: task_id.clone(),
+                seq,
+                payload: ProtocolEventPayload::Error {
+                    code: "invalid_command".to_string(),
+                    message: format!("{message} ({raw})"),
+                },
+            });
+            emit(AgentEvent::Error {
+                task_id: task_id.clone(),
+                code: "invalid_command".to_string(),
+                message: message.clone(),
+            });
+            return Ok(());
         }
 
         let mut prompt_directives: Option<PromptDirectives> = None;
@@ -658,6 +722,29 @@ impl AgentService {
             let mut seq = seq;
             let mut completed_sent = false;
             let mut aggregated_output = String::new();
+            let mut think_active = if is_command_input { None } else { Some(()) };
+
+            if think_active.is_some() {
+                seq += 1;
+                emit(AgentEvent::ProtocolEvent {
+                    task_id: task_id_for_worker.clone(),
+                    seq,
+                    payload: ProtocolEventPayload::ThinkStatus { active: true },
+                });
+            }
+
+            macro_rules! emit_think_stop {
+                () => {
+                    if think_active.take().is_some() {
+                        seq += 1;
+                        emit(AgentEvent::ProtocolEvent {
+                            task_id: task_id_for_worker.clone(),
+                            seq,
+                            payload: ProtocolEventPayload::ThinkStatus { active: false },
+                        });
+                    }
+                };
+            }
 
             loop {
                 let next_event =
@@ -665,6 +752,7 @@ impl AgentService {
                 let event = match next_event {
                     Ok(Some(event)) => event,
                     Ok(None) => {
+                        emit_think_stop!();
                         seq += 1;
                         emit(AgentEvent::ProtocolEvent {
                             task_id: task_id_for_worker.clone(),
@@ -682,6 +770,7 @@ impl AgentService {
                         break;
                     }
                     Err(_) => {
+                        emit_think_stop!();
                         seq += 1;
                         emit(AgentEvent::ProtocolEvent {
                             task_id: task_id_for_worker.clone(),
@@ -713,6 +802,9 @@ impl AgentService {
 
                 match event {
                     Event::ModelStreaming { chunk } => {
+                        if !chunk.trim().is_empty() {
+                            emit_think_stop!();
+                        }
                         if !chunk.is_empty() {
                             aggregated_output.push_str(&chunk);
                             emit(AgentEvent::Delta {
@@ -722,6 +814,7 @@ impl AgentService {
                         }
                     }
                     Event::ModelComplete { content, .. } => {
+                        emit_think_stop!();
                         if !completed_sent {
                             let output = if content.is_empty() {
                                 aggregated_output.clone()
@@ -754,6 +847,7 @@ impl AgentService {
                         }
                     }
                     Event::TurnComplete { result } => {
+                        emit_think_stop!();
                         if !completed_sent {
                             let output = if aggregated_output.trim().is_empty() {
                                 value_to_text(&result)
@@ -768,6 +862,7 @@ impl AgentService {
                         break;
                     }
                     Event::TurnAborted { reason } => {
+                        emit_think_stop!();
                         emit(AgentEvent::Error {
                             task_id: task_id_for_worker.clone(),
                             code: "turn_aborted".to_string(),
@@ -779,6 +874,7 @@ impl AgentService {
                         break;
                     }
                     Event::Error { error } => {
+                        emit_think_stop!();
                         let error_code_value = error_code(&error);
                         let lower_text = error.to_string().to_lowercase();
                         if error_code_value == "mcp_error"
@@ -829,6 +925,60 @@ impl AgentService {
             },
         );
         Ok(())
+    }
+
+    async fn handle_proc_command(
+        &self,
+        command: &ProcCommand,
+    ) -> Result<(ProtocolEventPayload, String), String> {
+        match command {
+            ProcCommand::Start { command } => {
+                let snapshot = self.process_manager.start_process(command.clone()).await?;
+                let process = protocol_process_info_from_snapshot(&snapshot);
+                let output = format!(
+                    "process started: id={}, pid={:?}, command={}",
+                    snapshot.id, snapshot.pid, snapshot.command
+                );
+                Ok((ProtocolEventPayload::ProcessStarted { process }, output))
+            }
+            ProcCommand::List => {
+                let snapshots = self.process_manager.list_processes().await?;
+                let processes = snapshots
+                    .iter()
+                    .map(protocol_process_info_from_snapshot)
+                    .collect::<Vec<_>>();
+                let output =
+                    serde_json::to_string_pretty(&processes).unwrap_or_else(|_| "[]".to_string());
+                Ok((ProtocolEventPayload::ProcessList { processes }, output))
+            }
+            ProcCommand::Logs { process_id, lines } => {
+                let logs = self
+                    .process_manager
+                    .process_logs(process_id, *lines)
+                    .await?;
+                let output = if logs.is_empty() {
+                    "(no logs)".to_string()
+                } else {
+                    logs.join("\n")
+                };
+                Ok((
+                    ProtocolEventPayload::ProcessLogs {
+                        process_id: process_id.clone(),
+                        logs,
+                    },
+                    output,
+                ))
+            }
+            ProcCommand::Stop { process_id } => {
+                let snapshot = self.process_manager.stop_process(process_id).await?;
+                let process = protocol_process_info_from_snapshot(&snapshot);
+                let output = format!(
+                    "process stopped: id={}, status={}, exit_code={:?}",
+                    snapshot.id, snapshot.status, snapshot.exit_code
+                );
+                Ok((ProtocolEventPayload::ProcessStopped { process }, output))
+            }
+        }
     }
 
     async fn chat_stream_legacy<F>(
@@ -4166,9 +4316,6 @@ fn apply_patch_state_to_config(
     config: &mut AgentRuntimeConfig,
     state: &RuntimeConfigPatchAppliedState,
 ) {
-    if let Some(system_prompt) = state.system_prompt.clone() {
-        config.system_prompt = system_prompt;
-    }
     if let Some(mcp) = state.mcp.clone() {
         config.mcp = mcp;
     }
@@ -4178,9 +4325,6 @@ fn apply_patch_state_to_config(
 }
 
 fn apply_runtime_patch_to_config(config: &mut AgentRuntimeConfig, patch: &RuntimeConfigPatch) {
-    if let Some(system_prompt) = patch.system_prompt.clone() {
-        config.system_prompt = system_prompt;
-    }
     if let Some(mcp) = patch.mcp.clone() {
         config.mcp = mcp;
     }
@@ -4488,6 +4632,24 @@ fn map_protocol_event(
             file_path: file_path.clone(),
             content: content.clone(),
         }),
+        Event::SubAgentStarted { mode, input } => Some(ProtocolEventPayload::SubAgentStarted {
+            mode: mode.as_str().to_string(),
+            input: input.clone(),
+        }),
+        Event::SubAgentProgress { mode, message } => Some(ProtocolEventPayload::SubAgentProgress {
+            mode: mode.as_str().to_string(),
+            message: message.clone(),
+        }),
+        Event::SubAgentCompleted { mode, output } => {
+            Some(ProtocolEventPayload::SubAgentCompleted {
+                mode: mode.as_str().to_string(),
+                output: output.clone(),
+            })
+        }
+        Event::SubAgentFailed { mode, error } => Some(ProtocolEventPayload::SubAgentFailed {
+            mode: mode.as_str().to_string(),
+            error: error.clone(),
+        }),
         _ => None,
     }
 }
@@ -4497,6 +4659,17 @@ fn protocol_usage(usage: &TokenUsage) -> ProtocolTokenUsage {
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
         total_tokens: usage.total_tokens,
+    }
+}
+
+fn protocol_process_info_from_snapshot(snapshot: &ProcessSnapshot) -> ProtocolProcessInfo {
+    ProtocolProcessInfo {
+        id: snapshot.id.clone(),
+        command: snapshot.command.clone(),
+        pid: snapshot.pid,
+        status: snapshot.status.clone(),
+        started_at_unix_ms: snapshot.started_at_unix_ms,
+        exit_code: snapshot.exit_code,
     }
 }
 
@@ -5116,12 +5289,23 @@ fn build_stream_op(
     workspace_root: &Path,
 ) -> (Op, ProtocolOpPayload, bool) {
     match parse_slash_input(&input.content) {
-        ParsedStreamInput::Command(command) => (
+        ParsedStreamInput::ShellCommand(command) => (
             Op::RunUserShellCommand {
                 command: command.clone(),
             },
             ProtocolOpPayload::RunUserShellCommand { command },
             true,
+        ),
+        ParsedStreamInput::SubAgent { mode, input } => (
+            Op::RunSubAgent {
+                mode,
+                input: input.clone(),
+            },
+            ProtocolOpPayload::RunSubAgent {
+                mode: mode.as_str().to_string(),
+                input,
+            },
+            false,
         ),
         ParsedStreamInput::Text(text) => {
             let cwd = workspace_root.to_path_buf();
@@ -5175,13 +5359,35 @@ fn build_stream_op(
                 false,
             )
         }
+        ParsedStreamInput::ProcCommand(command) => (
+            Op::RunUserShellCommand {
+                command: format!(
+                    "echo Unsupported /proc dispatch: {}",
+                    command.display_text()
+                ),
+            },
+            ProtocolOpPayload::ProcCommand {
+                command: command.display_text(),
+            },
+            true,
+        ),
+        ParsedStreamInput::InvalidCommand { raw, .. } => (
+            Op::RunUserShellCommand {
+                command: format!("echo Invalid command: {}", raw),
+            },
+            ProtocolOpPayload::RunUserShellCommand { command: raw },
+            true,
+        ),
     }
 }
 
 #[derive(Debug)]
 enum ParsedStreamInput {
     Text(String),
-    Command(String),
+    ShellCommand(String),
+    ProcCommand(ProcCommand),
+    SubAgent { mode: SubAgentMode, input: String },
+    InvalidCommand { raw: String, message: String },
 }
 
 const MULTIMODAL_MARKER: &str = "__AI_HELPER_MM_V1__";
@@ -5200,8 +5406,148 @@ fn parse_slash_input(raw_content: &str) -> ParsedStreamInput {
     if command.is_empty() {
         ParsedStreamInput::Text(trimmed.to_string())
     } else {
-        ParsedStreamInput::Command(command.to_string())
+        let (head, rest) = split_head_and_rest(command);
+        match head.as_str() {
+            "proc" => parse_proc_command(rest, command),
+            "sub" => parse_sub_command(rest, command),
+            _ => ParsedStreamInput::ShellCommand(command.to_string()),
+        }
     }
+}
+
+#[derive(Debug)]
+enum ProcCommand {
+    Start { command: String },
+    List,
+    Logs { process_id: String, lines: usize },
+    Stop { process_id: String },
+}
+
+impl ProcCommand {
+    fn display_text(&self) -> String {
+        match self {
+            Self::Start { command } => format!("start {command}"),
+            Self::List => "list".to_string(),
+            Self::Logs { process_id, lines } => format!("logs {process_id} {lines}"),
+            Self::Stop { process_id } => format!("stop {process_id}"),
+        }
+    }
+
+    fn action_name(&self) -> &'static str {
+        match self {
+            Self::Start { .. } => "start",
+            Self::List => "list",
+            Self::Logs { .. } => "logs",
+            Self::Stop { .. } => "stop",
+        }
+    }
+}
+
+fn split_head_and_rest(command: &str) -> (String, &str) {
+    let mut parts = command.splitn(2, char::is_whitespace);
+    let head = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
+    let rest = parts.next().unwrap_or_default().trim();
+    (head, rest)
+}
+
+fn parse_proc_command(rest: &str, raw_command: &str) -> ParsedStreamInput {
+    if rest.is_empty() {
+        return ParsedStreamInput::InvalidCommand {
+            raw: format!("/{}", raw_command),
+            message:
+                "usage: /proc start <cmd> | /proc list | /proc logs <id> [lines] | /proc stop <id>"
+                    .to_string(),
+        };
+    }
+
+    let mut pieces = rest.split_whitespace();
+    let action = pieces.next().unwrap_or_default().to_ascii_lowercase();
+    match action.as_str() {
+        "start" => {
+            let command = rest
+                .splitn(2, char::is_whitespace)
+                .nth(1)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if command.is_empty() {
+                ParsedStreamInput::InvalidCommand {
+                    raw: format!("/{}", raw_command),
+                    message: "/proc start requires a command".to_string(),
+                }
+            } else {
+                ParsedStreamInput::ProcCommand(ProcCommand::Start { command })
+            }
+        }
+        "list" => ParsedStreamInput::ProcCommand(ProcCommand::List),
+        "logs" => {
+            let process_id = pieces.next().unwrap_or_default().trim().to_string();
+            if process_id.is_empty() {
+                return ParsedStreamInput::InvalidCommand {
+                    raw: format!("/{}", raw_command),
+                    message: "/proc logs requires a process id".to_string(),
+                };
+            }
+            let lines = pieces
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(200)
+                .clamp(1, 2000);
+            ParsedStreamInput::ProcCommand(ProcCommand::Logs { process_id, lines })
+        }
+        "stop" => {
+            let process_id = pieces.next().unwrap_or_default().trim().to_string();
+            if process_id.is_empty() {
+                ParsedStreamInput::InvalidCommand {
+                    raw: format!("/{}", raw_command),
+                    message: "/proc stop requires a process id".to_string(),
+                }
+            } else {
+                ParsedStreamInput::ProcCommand(ProcCommand::Stop { process_id })
+            }
+        }
+        _ => ParsedStreamInput::InvalidCommand {
+            raw: format!("/{}", raw_command),
+            message: "unsupported /proc action. use start | list | logs | stop".to_string(),
+        },
+    }
+}
+
+fn parse_sub_command(rest: &str, raw_command: &str) -> ParsedStreamInput {
+    if rest.is_empty() {
+        return ParsedStreamInput::InvalidCommand {
+            raw: format!("/{}", raw_command),
+            message: "usage: /sub explore <input> | /sub plan <input>".to_string(),
+        };
+    }
+
+    let mut pieces = rest.splitn(2, char::is_whitespace);
+    let mode_text = pieces
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let input = pieces.next().unwrap_or_default().trim().to_string();
+
+    if input.is_empty() {
+        return ParsedStreamInput::InvalidCommand {
+            raw: format!("/{}", raw_command),
+            message: "/sub requires non-empty input".to_string(),
+        };
+    }
+
+    let mode = match mode_text.as_str() {
+        "explore" => SubAgentMode::Explore,
+        "plan" => SubAgentMode::Plan,
+        _ => {
+            return ParsedStreamInput::InvalidCommand {
+                raw: format!("/{}", raw_command),
+                message: "unsupported /sub mode. use explore | plan".to_string(),
+            };
+        }
+    };
+
+    ParsedStreamInput::SubAgent { mode, input }
 }
 
 fn encode_multimodal_text(text: &str, images: &[AgentInputImage]) -> String {
@@ -5270,13 +5616,53 @@ mod tests {
     #[test]
     fn slash_prefixed_text_becomes_command() {
         let parsed = parse_slash_input("/pwd");
-        assert!(matches!(parsed, ParsedStreamInput::Command(command) if command == "pwd"));
+        assert!(matches!(parsed, ParsedStreamInput::ShellCommand(command) if command == "pwd"));
     }
 
     #[test]
     fn double_slash_is_escaped_text() {
         let parsed = parse_slash_input("//pwd");
         assert!(matches!(parsed, ParsedStreamInput::Text(text) if text == "/pwd"));
+    }
+
+    #[test]
+    fn parse_proc_start_command() {
+        let parsed = parse_slash_input("/proc start echo hello");
+        assert!(matches!(
+            parsed,
+            ParsedStreamInput::ProcCommand(ProcCommand::Start { command })
+            if command == "echo hello"
+        ));
+    }
+
+    #[test]
+    fn parse_proc_logs_command_with_default_lines() {
+        let parsed = parse_slash_input("/proc logs abc123");
+        assert!(matches!(
+            parsed,
+            ParsedStreamInput::ProcCommand(ProcCommand::Logs { process_id, lines })
+            if process_id == "abc123" && lines == 200
+        ));
+    }
+
+    #[test]
+    fn parse_sub_plan_command() {
+        let parsed = parse_slash_input("/sub plan refactor the mcp client");
+        assert!(matches!(
+            parsed,
+            ParsedStreamInput::SubAgent { mode: SubAgentMode::Plan, input }
+            if input == "refactor the mcp client"
+        ));
+    }
+
+    #[test]
+    fn parse_sub_invalid_mode_returns_invalid_command() {
+        let parsed = parse_slash_input("/sub codegen implement feature");
+        assert!(matches!(
+            parsed,
+            ParsedStreamInput::InvalidCommand { message, .. }
+            if message.contains("unsupported /sub mode")
+        ));
     }
 
     #[test]
@@ -5299,6 +5685,31 @@ mod tests {
         assert!(matches!(
             payload,
             ProtocolOpPayload::RunUserShellCommand { command } if command == "echo hello"
+        ));
+    }
+
+    #[test]
+    fn build_stream_op_creates_sub_agent_from_slash_input() {
+        let input = AgentStreamInput {
+            content: "/sub explore inspect runtime config".to_string(),
+            images: Vec::new(),
+            conversation_id: None,
+            recent_messages: Vec::new(),
+        };
+        let config = AgentRuntimeConfig::default();
+        let (op, payload, is_command) =
+            build_stream_op(&input, &config, None, None, Path::new("."));
+
+        assert!(!is_command);
+        assert!(matches!(
+            op,
+            Op::RunSubAgent { mode: SubAgentMode::Explore, input }
+            if input == "inspect runtime config"
+        ));
+        assert!(matches!(
+            payload,
+            ProtocolOpPayload::RunSubAgent { mode, input }
+            if mode == "explore" && input == "inspect runtime config"
         ));
     }
 
@@ -6845,9 +7256,6 @@ fn load_runtime_config() -> AgentRuntimeConfig {
     if let Ok(max_tokens) = std::env::var("AGENT_MAX_TOKENS") {
         config.max_tokens = max_tokens.parse::<u32>().ok();
     }
-    if let Ok(system_prompt) = std::env::var("AGENT_SYSTEM_PROMPT") {
-        config.system_prompt = system_prompt;
-    }
     if let Ok(workspace_root) = std::env::var("AGENT_WORKSPACE_ROOT") {
         config.workspace.root_dir = workspace_root;
     }
@@ -7039,7 +7447,9 @@ impl AgentLibRunner {
             }
         };
 
-        let agent = builder.with_instructions(config.system_prompt).build()?;
+        let agent = builder
+            .with_instructions(agent_lib::guide_prompt::guide_agent_system_prompt())
+            .build()?;
         Ok(Self { agent })
     }
 }

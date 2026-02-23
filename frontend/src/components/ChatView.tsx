@@ -77,6 +77,7 @@ const ChatView: React.FC = () => {
     failStream,
     cancelStream,
     setCurrentConversation,
+    activeThinkTaskId,
     streamingTaskId,
     exportConversation,
     deleteConversation,
@@ -89,7 +90,7 @@ const ChatView: React.FC = () => {
   const [isCompactLayout, setIsCompactLayout] = useState(detectCompactLayout);
   const [sidebarOpen, setSidebarOpen] = useState(() => !detectCompactLayout());
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [protocolOpen, setProtocolOpen] = useState(() => !detectCompactLayout());
+  const [protocolOpen, setProtocolOpen] = useState(false);
   const [draftInput, setDraftInput] = useState<InputCard | null>(null);
   const [workspaceEditorOpen, setWorkspaceEditorOpen] = useState(false);
   const [workspaceDraft, setWorkspaceDraft] = useState(() => config.workspace.rootDir ?? '');
@@ -644,7 +645,6 @@ const ChatView: React.FC = () => {
   }, []);
 
   const isStreaming = streamingTaskId !== null;
-
   return (
     <div className="app-shell">
       <div className="app-canvas">
@@ -819,6 +819,9 @@ const ChatView: React.FC = () => {
             <section className="chat-column">
               <MessageList
                 messages={currentConversation?.messages || []}
+                protocolCards={currentConversation?.protocolCards || []}
+                streamingTaskId={streamingTaskId}
+                activeThinkTaskId={activeThinkTaskId}
                 onRegenerateMessage={handleRegenerateMessage}
                 onContinueFromMessage={handleContinueFromMessage}
               />

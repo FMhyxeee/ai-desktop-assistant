@@ -441,13 +441,9 @@ mod tests {
         incoming_config.memory.enabled = true;
         incoming_config.control.enabled = true;
 
-        let raw =
-            serde_json::to_value(&incoming_config).expect("incoming config should serialize");
-        let merged = merge_runtime_config_with_previous(
-            &raw,
-            incoming_config.clone(),
-            Some(&previous),
-        );
+        let raw = serde_json::to_value(&incoming_config).expect("incoming config should serialize");
+        let merged =
+            merge_runtime_config_with_previous(&raw, incoming_config.clone(), Some(&previous));
 
         assert!(merged.memory.enabled);
         assert!(merged.control.enabled);

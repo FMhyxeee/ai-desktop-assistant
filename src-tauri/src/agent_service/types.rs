@@ -24,7 +24,6 @@ pub struct AgentRuntimeConfig {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub max_tokens: Option<u32>,
-    pub system_prompt: String,
     #[serde(default)]
     pub workspace: WorkspaceRuntimeConfig,
     pub mcp: McpRuntimeConfig,
@@ -45,7 +44,6 @@ impl Default for AgentRuntimeConfig {
             api_key: None,
             base_url: None,
             max_tokens: None,
-            system_prompt: "You are a desktop AI assistant.".to_string(),
             workspace: WorkspaceRuntimeConfig::default(),
             mcp: McpRuntimeConfig::default(),
             skills: SkillsRuntimeConfig::default(),
@@ -318,6 +316,13 @@ pub enum ProtocolOpPayload {
     RunUserShellCommand {
         command: String,
     },
+    ProcCommand {
+        command: String,
+    },
+    RunSubAgent {
+        mode: String,
+        input: String,
+    },
     Interrupt,
 }
 
@@ -327,6 +332,17 @@ pub struct ProtocolTokenUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtocolProcessInfo {
+    pub id: String,
+    pub command: String,
+    pub pid: Option<u32>,
+    pub status: String,
+    pub started_at_unix_ms: u64,
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,6 +370,26 @@ pub enum ProtocolEventPayload {
     },
     RunUserShellCommand {
         command: String,
+    },
+    ProcessStarted {
+        process: ProtocolProcessInfo,
+    },
+    ProcessList {
+        processes: Vec<ProtocolProcessInfo>,
+    },
+    ProcessLogs {
+        process_id: String,
+        logs: Vec<String>,
+    },
+    ProcessStopped {
+        process: ProtocolProcessInfo,
+    },
+    ProcessError {
+        action: String,
+        message: String,
+    },
+    ThinkStatus {
+        active: bool,
     },
     Warning {
         message: String,
@@ -399,6 +435,22 @@ pub enum ProtocolEventPayload {
         skill_name: String,
         file_path: String,
         content: String,
+    },
+    SubAgentStarted {
+        mode: String,
+        input: String,
+    },
+    SubAgentProgress {
+        mode: String,
+        message: String,
+    },
+    SubAgentCompleted {
+        mode: String,
+        output: String,
+    },
+    SubAgentFailed {
+        mode: String,
+        error: String,
     },
     ConversationTitleSuggestion {
         conversation_id: String,
@@ -619,8 +671,6 @@ pub enum PatchDecisionSource {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProtocolRuntimeConfigPatch {
-    #[serde(default)]
-    pub system_prompt: Option<String>,
     #[serde(default)]
     pub mcp: Option<McpRuntimeConfig>,
     #[serde(default)]

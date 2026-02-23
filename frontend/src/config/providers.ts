@@ -15,8 +15,6 @@ export interface ProviderPreset {
   defaultModel: string;
   modelHint: string;
   defaultApiKeyEnv: string;
-  defaultSystemPrompt: string;
-  promptHint: string;
   supportsApiKey: boolean;
   supportsBaseUrl: boolean;
   supportsMaxTokens?: boolean;
@@ -34,8 +32,6 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     defaultModel: 'gpt-4o-mini',
     modelHint: '推荐：gpt-4o-mini（性价比）或 gpt-4.1（效果更强）。',
     defaultApiKeyEnv: 'OPENAI_API_KEY',
-    defaultSystemPrompt: '你是一个严谨、高效的 AI 助手。请优先给出结论与可执行步骤。',
-    promptHint: '适合通用问答、代码解释与文档整理。',
     supportsApiKey: true,
     supportsBaseUrl: false,
     apiKeyLabel: 'OpenAI API Key',
@@ -48,8 +44,6 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     defaultModel: 'glm-5',
     modelHint: '推荐：glm-5（通用）或 glm-4.7-flashx（响应更快）。',
     defaultApiKeyEnv: 'GLM_API_KEY',
-    defaultSystemPrompt: '你是一个专业中文 AI 助手。请先给结论，再给步骤，必要时给示例。',
-    promptHint: '适合中文问答、代码修复与工具调用任务。',
     supportsApiKey: true,
     supportsBaseUrl: true,
     apiKeyLabel: 'GLM API Key',
@@ -64,8 +58,6 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     defaultModel: 'glm-5-coding',
     modelHint: '推荐：glm-5-coding（优先）或 glm-4.7-coding。',
     defaultApiKeyEnv: 'GLM_API_KEY',
-    defaultSystemPrompt: '你是资深编程助手。请输出可直接执行的改动方案，并附验证步骤。',
-    promptHint: '适合重构、多文件修改与复杂工程任务。',
     supportsApiKey: true,
     supportsBaseUrl: true,
     apiKeyLabel: 'GLM API Key',
@@ -80,8 +72,6 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     defaultModel: 'claude-3-5-sonnet-latest',
     modelHint: '推荐：claude-3-5-sonnet-latest。',
     defaultApiKeyEnv: 'ANTHROPIC_API_KEY',
-    defaultSystemPrompt: '你是重视结构化表达的 AI 助手。请分点清晰说明，并标注关键风险。',
-    promptHint: '适合长上下文分析、评审与复杂写作。',
     supportsApiKey: true,
     supportsBaseUrl: true,
     supportsMaxTokens: true,
@@ -97,8 +87,6 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     defaultModel: 'qwen2.5-coder:7b',
     modelHint: '推荐：qwen2.5-coder:7b 或 deepseek-coder 系列。',
     defaultApiKeyEnv: 'LOCAL_API_KEY',
-    defaultSystemPrompt: '你是本地离线编码助手。回答应简洁、可落地，并优先结合当前项目上下文。',
-    promptHint: '适合私有环境、本地调试和低延迟场景。',
     supportsApiKey: false,
     supportsBaseUrl: true,
     baseUrlLabel: 'Local Base URL',
@@ -160,7 +148,6 @@ export const createDefaultConfig = (provider: AgentProvider = AgentProvider.Open
     apiKey: '',
     baseUrl: preset.supportsBaseUrl ? '' : undefined,
     maxTokens: preset.supportsMaxTokens ? 1024 : undefined,
-    systemPrompt: preset.defaultSystemPrompt,
     workspace: createDefaultWorkspaceConfig(),
     mcp: createDefaultMcpConfig(),
     skills: createDefaultSkillsConfig(),
@@ -178,7 +165,6 @@ export const applyProviderDefaults = (config: AppConfig, provider: AgentProvider
     apiKey: '',
     baseUrl: preset.supportsBaseUrl ? '' : undefined,
     maxTokens: preset.supportsMaxTokens ? (config.maxTokens ?? 1024) : undefined,
-    systemPrompt: preset.defaultSystemPrompt,
     workspace: config.workspace,
     mcp: config.mcp,
     skills: config.skills,
@@ -391,10 +377,6 @@ export const normalizeStoredConfig = (raw: unknown): Partial<AppConfig> => {
 
   const apiKey = normalizeOptionalText(source.apiKey) ?? legacyApiKey ?? '';
   const baseUrl = normalizeOptionalText(source.baseUrl) ?? normalizeOptionalText(source.glmUrl) ?? '';
-  const systemPrompt =
-    typeof source.systemPrompt === 'string'
-      ? source.systemPrompt
-      : createDefaultConfig(provider).systemPrompt;
 
   const normalized: Partial<AppConfig> = {
     provider,
@@ -405,7 +387,6 @@ export const normalizeStoredConfig = (raw: unknown): Partial<AppConfig> => {
     ),
     apiKeyEnv,
     apiKey,
-    systemPrompt,
     workspace: normalizeWorkspaceConfig(source.workspace),
     mcp: normalizeMcpRuntimeConfig(source.mcp),
     skills: normalizeSkillsRuntimeConfig(source.skills),

@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use agent_lib::guide_prompt::{
+    guide_agent_system_prompt, runtime_control_system_prompt, title_generator_system_prompt,
+};
 use agent_lib::model::{Message, ModelClient};
 use serde::{Deserialize, Serialize};
 
@@ -12,8 +15,6 @@ use super::types::{
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeConfigPatch {
     #[serde(default)]
-    pub system_prompt: Option<String>,
-    #[serde(default)]
     pub mcp: Option<McpRuntimeConfig>,
     #[serde(default)]
     pub skills: Option<SkillsRuntimeConfig>,
@@ -21,12 +22,11 @@ pub struct RuntimeConfigPatch {
 
 impl RuntimeConfigPatch {
     pub fn is_empty(&self) -> bool {
-        self.system_prompt.is_none() && self.mcp.is_none() && self.skills.is_none()
+        self.mcp.is_none() && self.skills.is_none()
     }
 
     pub fn to_protocol_patch(&self) -> ProtocolRuntimeConfigPatch {
         ProtocolRuntimeConfigPatch {
-            system_prompt: self.system_prompt.clone(),
             mcp: self.mcp.clone(),
             skills: self.skills.clone(),
         }
@@ -95,11 +95,6 @@ pub fn evaluate_rules(input: &ControlInput) -> ControlDecision {
         summary_parts.push("rule: disable skills".to_string());
     }
 
-    if let Some(system_prompt) = parse_system_prompt_override(text) {
-        patch.system_prompt = Some(system_prompt);
-        summary_parts.push("rule: update system prompt".to_string());
-    }
-
     let patch = if patch.is_empty() { None } else { Some(patch) };
     let summary = if summary_parts.is_empty() {
         "no config change intent detected by rules".to_string()
@@ -123,17 +118,7 @@ pub fn evaluate_rules(input: &ControlInput) -> ControlDecision {
 
 pub fn should_try_model_fallback(input: &str) -> bool {
     let normalized = input.to_lowercase();
-    let keywords = [
-        "mcp",
-        "skills",
-        "skill",
-        "system prompt",
-        "system_prompt",
-        "prompt",
-        "config",
-        "配置",
-        "提示词",
-    ];
+    let keywords = ["mcp", "skills", "skill", "config", "配置"];
     keywords.iter().any(|keyword| normalized.contains(keyword))
 }
 
@@ -142,7 +127,6 @@ pub async fn evaluate_model_fallback(
     model: Arc<dyn ModelClient>,
 ) -> Option<ControlDecision> {
     let config_snapshot = serde_json::json!({
-        "systemPrompt": input.effective_config.system_prompt,
         "mcp": input.effective_config.mcp,
         "skills": input.effective_config.skills,
     });
@@ -156,12 +140,7 @@ pub async fn evaluate_model_fallback(
     );
 
     let messages = vec![
-        Message::system(
-            "You are a runtime control planner. Return only JSON with shape: \
-            {\"confidence\":0..1,\"summary\":\"...\",\"developerInstructions\":\"...\",\
-            \"patch\":{\"systemPrompt\":string|null,\"mcp\":object|null,\"skills\":object|null}}. \
-            If no config change is needed, set patch to null.",
-        ),
+        Message::system(runtime_control_system_prompt()),
         Message::user(user_prompt),
     ];
 
@@ -202,9 +181,6 @@ pub fn assemble_developer_instructions(
     config: &AgentRuntimeConfig,
     patch: Option<&RuntimeConfigPatch>,
 ) -> String {
-    let active_system_prompt = patch
-        .and_then(|item| item.system_prompt.clone())
-        .unwrap_or_else(|| config.system_prompt.clone());
     let mcp_enabled = patch
         .and_then(|item| item.mcp.as_ref().map(|cfg| cfg.enabled))
         .unwrap_or(config.mcp.enabled);
@@ -214,7 +190,9 @@ pub fn assemble_developer_instructions(
 
     format!(
         "{}\n\n[Runtime control context]\n- MCP enabled: {}\n- Skills enabled: {}\n- Follow approved runtime changes only.\n- Never assume unapproved config mutations are active.",
-        active_system_prompt, mcp_enabled, skills_enabled
+        guide_agent_system_prompt(),
+        mcp_enabled,
+        skills_enabled
     )
 }
 
@@ -229,7 +207,7 @@ async fn suggest_conversation_title_by_model(
     );
 
     let messages = vec![
-        Message::system("You generate conversation titles. Return JSON only: {\"title\":\"...\"}."),
+        Message::system(title_generator_system_prompt()),
         Message::user(user_prompt),
     ];
 
@@ -403,28 +381,6 @@ fn extract_first_json_object(text: &str) -> Option<String> {
     None
 }
 
-fn parse_system_prompt_override(raw: &str) -> Option<String> {
-    let markers = [
-        "system prompt:",
-        "system_prompt:",
-        "系统提示词:",
-        "系统提示:",
-        "/system ",
-    ];
-
-    let lower = raw.to_lowercase();
-    for marker in markers {
-        if let Some(index) = lower.find(marker) {
-            let value = raw[index + marker.len()..].trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-
-    None
-}
-
 fn is_enable_mcp_intent(text: &str) -> bool {
     ["enable mcp", "turn on mcp", "开启mcp", "启用mcp", "打开mcp"]
         .iter()
@@ -481,7 +437,6 @@ mod tests {
             api_key: None,
             base_url: None,
             max_tokens: None,
-            system_prompt: "base prompt".to_string(),
             workspace: Default::default(),
             mcp: McpRuntimeConfig::default(),
             skills: SkillsRuntimeConfig::default(),
@@ -525,26 +480,9 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_rules_detects_system_prompt_override() {
-        let input = ControlInput {
-            user_input: "system prompt: be concise and strict".to_string(),
-            recent_messages: Vec::new(),
-            effective_config: make_config(),
-        };
-
-        let decision = evaluate_rules(&input);
-        assert!(decision.patch.is_some());
-        let patch = decision.patch.unwrap_or_default();
-        assert_eq!(
-            patch.system_prompt.as_deref(),
-            Some("be concise and strict")
-        );
-    }
-
-    #[test]
     fn fallback_keyword_detection_works() {
         assert!(should_try_model_fallback("update config for tools"));
-        assert!(should_try_model_fallback("调整提示词"));
+        assert!(should_try_model_fallback("请调整 mcp 配置"));
         assert!(!should_try_model_fallback("just say hello"));
     }
 

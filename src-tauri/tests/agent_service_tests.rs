@@ -26,6 +26,47 @@ impl Runner for MockRunner {
     }
 }
 
+fn default_local_runtime_config() -> AgentRuntimeConfig {
+    AgentRuntimeConfig {
+        provider: AgentProvider::Local,
+        model: "qwen2.5-coder:7b".to_string(),
+        model_supports_image_input: true,
+        api_key_env: "LOCAL_API_KEY".to_string(),
+        api_key: None,
+        base_url: None,
+        max_tokens: None,
+        workspace: WorkspaceRuntimeConfig::default(),
+        mcp: McpRuntimeConfig::default(),
+        skills: SkillsRuntimeConfig::default(),
+        memory: Default::default(),
+        control: Default::default(),
+    }
+}
+
+async fn collect_stream_events(
+    service: &AgentService,
+    task_id: &str,
+    input: &str,
+) -> Vec<AgentEvent> {
+    let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let events_ref = Arc::clone(&events);
+
+    service
+        .chat_stream(
+            task_id.to_string(),
+            AgentStreamInput::text(input),
+            move |event| {
+                events_ref.lock().unwrap().push(event);
+            },
+        )
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    let snapshot = events.lock().unwrap().clone();
+    snapshot
+}
+
 #[tokio::test]
 async fn chat_returns_runner_output() {
     let runner = Arc::new(MockRunner {
@@ -210,7 +251,6 @@ async fn startup_stream_emits_governance_protocol_event() {
         api_key: None,
         base_url: None,
         max_tokens: None,
-        system_prompt: "local prompt".to_string(),
         workspace: WorkspaceRuntimeConfig::default(),
         mcp: McpRuntimeConfig::default(),
         skills: SkillsRuntimeConfig::default(),
@@ -259,7 +299,6 @@ async fn stream_emits_guidance_context_and_governance() {
         api_key: None,
         base_url: None,
         max_tokens: None,
-        system_prompt: "local prompt".to_string(),
         workspace: WorkspaceRuntimeConfig::default(),
         mcp: McpRuntimeConfig::default(),
         skills: SkillsRuntimeConfig::default(),
@@ -317,7 +356,6 @@ async fn warning_compat_still_present_with_guidance_context() {
         api_key: None,
         base_url: None,
         max_tokens: None,
-        system_prompt: "local prompt".to_string(),
         workspace: WorkspaceRuntimeConfig::default(),
         mcp: McpRuntimeConfig::default(),
         skills: SkillsRuntimeConfig::default(),
@@ -374,7 +412,6 @@ async fn governance_scan_flags_duplicate_mcp_server_names() {
         api_key: None,
         base_url: None,
         max_tokens: None,
-        system_prompt: "local prompt".to_string(),
         workspace: WorkspaceRuntimeConfig::default(),
         mcp: McpRuntimeConfig::default(),
         skills: SkillsRuntimeConfig::default(),
@@ -403,4 +440,82 @@ async fn governance_scan_flags_duplicate_mcp_server_names() {
         .issues
         .iter()
         .any(|issue| issue.code == "mcp_server_name_duplicate"));
+}
+
+#[tokio::test]
+async fn proc_commands_manage_process_lifecycle() {
+    let mut config = default_local_runtime_config();
+    config.mcp.enabled = false;
+    let service = AgentService::new_with_config(config).await.unwrap();
+
+    let command = if cfg!(windows) {
+        "echo proc-start && ping -n 4 127.0.0.1 >nul && echo proc-done"
+    } else {
+        "echo proc-start && sleep 2 && echo proc-done"
+    };
+
+    let start_events = collect_stream_events(
+        &service,
+        "proc-start-task",
+        &format!("/proc start {command}"),
+    )
+    .await;
+
+    let process_id = start_events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ProtocolEvent {
+                payload: ProtocolEventPayload::ProcessStarted { process },
+                ..
+            } => Some(process.id.clone()),
+            _ => None,
+        })
+        .expect("expected ProcessStarted event");
+
+    let list_events = collect_stream_events(&service, "proc-list-task", "/proc list").await;
+    let listed = list_events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::ProtocolEvent {
+                payload: ProtocolEventPayload::ProcessList { processes },
+                ..
+            } if processes.iter().any(|item| item.id == process_id)
+        )
+    });
+    assert!(listed, "process should appear in /proc list");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let logs_events = collect_stream_events(
+        &service,
+        "proc-logs-task",
+        &format!("/proc logs {process_id} 50"),
+    )
+    .await;
+    let has_logs = logs_events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::ProtocolEvent {
+                payload: ProtocolEventPayload::ProcessLogs { process_id: pid, logs },
+                ..
+            } if pid == &process_id && !logs.is_empty()
+        )
+    });
+    assert!(has_logs, "process logs should be collected");
+
+    let stop_events = collect_stream_events(
+        &service,
+        "proc-stop-task",
+        &format!("/proc stop {process_id}"),
+    )
+    .await;
+    let stopped = stop_events.iter().any(|event| {
+        matches!(
+            event,
+            AgentEvent::ProtocolEvent {
+                payload: ProtocolEventPayload::ProcessStopped { process },
+                ..
+            } if process.id == process_id
+        )
+    });
+    assert!(stopped, "expected ProcessStopped event");
 }

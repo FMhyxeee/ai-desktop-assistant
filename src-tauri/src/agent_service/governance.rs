@@ -51,18 +51,6 @@ fn check_agent_runtime_config(config: &AgentRuntimeConfig, issues: &mut Vec<Gove
         );
     }
 
-    if config.system_prompt.trim().is_empty() {
-        push_issue(
-            issues,
-            GovernanceSeverity::Warning,
-            "agent",
-            "agent_system_prompt_empty",
-            "System prompt is empty.",
-            None,
-            Some("Set a non-empty system prompt to keep behavior stable.".to_string()),
-        );
-    }
-
     let requires_api_key = !matches!(config.provider, AgentProvider::Local);
     let inline_api_key = normalize_optional(config.api_key.as_deref());
     let api_key_env_name = config.api_key_env.trim();
@@ -800,7 +788,6 @@ mod tests {
             api_key: None,
             base_url: None,
             max_tokens: None,
-            system_prompt: "prompt".to_string(),
             workspace: Default::default(),
             mcp: McpRuntimeConfig::default(),
             skills: SkillsRuntimeConfig::default(),

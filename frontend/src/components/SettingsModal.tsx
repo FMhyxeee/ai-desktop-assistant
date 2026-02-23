@@ -144,7 +144,6 @@ const normalizeConfigForSave = (config: AppConfig): AppConfig => ({
   apiKey: (config.apiKey ?? '').trim(),
   baseUrl: (config.baseUrl ?? '').trim(),
   maxTokens: normalizePositiveInt(config.maxTokens),
-  systemPrompt: config.systemPrompt.trim(),
   workspace: {
     rootDir: (normalizeText(config.workspace.rootDir) ?? ''),
   },
@@ -600,16 +599,6 @@ const SettingsModal: React.FC<SettingsModalProps> = ({ isOpen, onClose }) => {
                   />
                 </section>
               )}
-
-              <section className="field-group">
-                <label className="field-label" htmlFor="system-prompt">系统提示词（System Prompt）</label>
-                <textarea
-                  id="system-prompt"
-                  className="field-textarea"
-                  value={localConfig.systemPrompt}
-                  onChange={(event) => setLocalConfig((prev) => ({ ...prev, systemPrompt: event.target.value }))}
-                />
-              </section>
 
               <section className="field-group">
                 <div className="settings-inline-head">

@@ -63,7 +63,6 @@ interface RuntimeConfigPayload {
   apiKey: string | null;
   baseUrl: string | null;
   maxTokens: number | null;
-  systemPrompt: string;
   workspace: RuntimeWorkspacePayload;
   mcp: RuntimeMcpPayload;
   skills: RuntimeSkillsPayload;
@@ -167,7 +166,6 @@ const toRuntimeConfigPayload = (config: AppConfig): RuntimeConfigPayload => {
     apiKey,
     baseUrl,
     maxTokens: normalizePositiveInt(config.maxTokens),
-    systemPrompt: config.systemPrompt.trim(),
     workspace: toRuntimeWorkspacePayload(config),
     mcp: toRuntimeMcpPayload(config),
     skills: toRuntimeSkillsPayload(config),

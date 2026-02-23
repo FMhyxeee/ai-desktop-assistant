@@ -55,6 +55,7 @@ interface AppState {
 
   activeStream: ActiveStream | null;
   activeProtocolStreamingCard: ActiveProtocolStreamingCard | null;
+  activeThinkTaskId: string | null;
   streamingTaskId: string | null;
   lastError: string | null;
   beginStream: (conversationId: string, taskId: string, inputCard: InputCard) => string | null;
@@ -92,6 +93,16 @@ const toInputCardFromOpPayload = (payload: ProtocolOpPayload): InputCard | undef
       content: `/${payload.command}`,
     };
   }
+  if (payload.type === 'proc_command') {
+    return {
+      content: `/proc ${payload.command}`,
+    };
+  }
+  if (payload.type === 'run_sub_agent') {
+    return {
+      content: `/sub ${payload.mode} ${payload.input}`,
+    };
+  }
   return undefined;
 };
 
@@ -101,6 +112,10 @@ const summarizeOpPayload = (payload: ProtocolOpPayload): string => {
       return `UserTurn | ${payload.text.slice(0, 80)}`;
     case 'run_user_shell_command':
       return `RunUserShellCommand | ${payload.command}`;
+    case 'proc_command':
+      return `ProcCommand | ${payload.command}`;
+    case 'run_sub_agent':
+      return `RunSubAgent | ${payload.mode} | ${payload.input.slice(0, 80)}`;
     case 'interrupt':
       return 'Interrupt';
   }
@@ -130,6 +145,18 @@ const summarizeEventPayload = (payload: ProtocolEventPayload): string => {
       return `ToolCallResult | ${payload.tool}`;
     case 'run_user_shell_command':
       return `RunUserShellCommand | ${payload.command}`;
+    case 'process_started':
+      return `ProcessStarted | ${payload.process.id} | pid:${payload.process.pid ?? 'n/a'}`;
+    case 'process_list':
+      return `ProcessList | ${payload.processes.length} process(es)`;
+    case 'process_logs':
+      return `ProcessLogs | ${payload.process_id} | ${payload.logs.length} line(s)`;
+    case 'process_stopped':
+      return `ProcessStopped | ${payload.process.id} | ${payload.process.status}`;
+    case 'process_error':
+      return `ProcessError | ${payload.action} | ${payload.message}`;
+    case 'think_status':
+      return payload.active ? 'ThinkStatus | active' : 'ThinkStatus | inactive';
     case 'warning':
       return `Warning | ${payload.message}`;
     case 'error':
@@ -156,6 +183,14 @@ const summarizeEventPayload = (payload: ProtocolEventPayload): string => {
       return `SkillApplied | ${payload.name}`;
     case 'skill_file_content':
       return `SkillFileContent | ${payload.skill_name}/${payload.file_path}`;
+    case 'sub_agent_started':
+      return `SubAgentStarted | ${payload.mode}`;
+    case 'sub_agent_progress':
+      return `SubAgentProgress | ${payload.mode} | ${payload.message}`;
+    case 'sub_agent_completed':
+      return `SubAgentCompleted | ${payload.mode}`;
+    case 'sub_agent_failed':
+      return `SubAgentFailed | ${payload.mode} | ${payload.error}`;
     case 'governance_report':
       return `GovernanceReport | B:${payload.report.blockerCount} W:${payload.report.warningCount} I:${payload.report.infoCount}`;
     case 'guidance_context':
@@ -176,10 +211,14 @@ const levelFromEventPayload = (payload: ProtocolEventPayload): ProtocolCardLevel
   switch (payload.type) {
     case 'error':
     case 'turn_aborted':
+    case 'process_error':
+    case 'sub_agent_failed':
       return 'error';
     case 'tool_call_requested':
       return payload.normalization?.rejectPreview ? 'warning' : 'info';
     case 'warning':
+      return 'warning';
+    case 'config_change_request':
       return 'warning';
     case 'model_complete':
     case 'turn_complete':
@@ -193,8 +232,17 @@ const levelFromEventPayload = (payload: ProtocolEventPayload): ProtocolCardLevel
     case 'skill_content':
     case 'skill_applied':
     case 'skill_file_content':
+    case 'process_started':
+    case 'process_list':
+    case 'process_logs':
+    case 'process_stopped':
+    case 'sub_agent_completed':
     case 'conversation_title_suggestion':
       return 'success';
+    case 'sub_agent_started':
+    case 'sub_agent_progress':
+    case 'think_status':
+      return 'info';
     case 'governance_report':
       if (payload.report.blockerCount > 0) {
         return 'error';
@@ -205,8 +253,6 @@ const levelFromEventPayload = (payload: ProtocolEventPayload): ProtocolCardLevel
       return 'success';
     case 'guidance_context':
       return 'info';
-    case 'config_change_request':
-      return 'warning';
     case 'config_change_result':
       return payload.approved ? 'success' : 'warning';
     default:
@@ -220,9 +266,6 @@ const mergePersistedPatchIntoConfig = (
 ): AppConfig => {
   const next: AppConfig = { ...config };
 
-  if (typeof patch.systemPrompt === 'string' && patch.systemPrompt.trim().length > 0) {
-    next.systemPrompt = patch.systemPrompt;
-  }
   if (patch.mcp && typeof patch.mcp === 'object') {
     next.mcp = {
       ...next.mcp,
@@ -381,6 +424,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         currentConversationId: nextCurrentConversationId,
         activeStream: shouldResetStream ? null : state.activeStream,
         activeProtocolStreamingCard: shouldResetStream ? null : state.activeProtocolStreamingCard,
+        activeThinkTaskId: shouldResetStream ? null : state.activeThinkTaskId,
         streamingTaskId: shouldResetStream ? null : state.streamingTaskId,
       };
     });
@@ -403,6 +447,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         }),
         activeStream: shouldResetStream ? null : state.activeStream,
         activeProtocolStreamingCard: shouldResetStream ? null : state.activeProtocolStreamingCard,
+        activeThinkTaskId: shouldResetStream ? null : state.activeThinkTaskId,
         streamingTaskId: shouldResetStream ? null : state.streamingTaskId,
       };
     });
@@ -503,6 +548,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       const currentProtocolStream = state.activeProtocolStreamingCard;
 
       let nextActiveProtocolStream = state.activeProtocolStreamingCard;
+      let nextActiveThinkTaskId = state.activeThinkTaskId;
 
       const updateConversation = (conversation: Conversation): Conversation => {
         if (conversation.id !== stream.conversationId) {
@@ -517,6 +563,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         });
 
         if (payload.type === 'model_streaming' && currentProtocolStream?.taskId === taskId) {
+          nextActiveThinkTaskId = null;
           protocolCards = protocolCards.map((card) => {
             if (card.id !== currentProtocolStream.cardId) {
               return card;
@@ -571,6 +618,12 @@ export const useAppStore = create<AppState>((set, get) => ({
           nextActiveProtocolStream = null;
         }
 
+        if (payload.type === 'think_status') {
+          nextActiveThinkTaskId = payload.active ? taskId : null;
+        } else if (terminalEvent) {
+          nextActiveThinkTaskId = null;
+        }
+
         return {
           ...conversation,
           protocolCards: [...protocolCards, card],
@@ -581,6 +634,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       return {
         conversations: state.conversations.map(updateConversation),
         activeProtocolStreamingCard: nextActiveProtocolStream,
+        activeThinkTaskId: nextActiveThinkTaskId,
         config:
           payload.type === 'config_change_result' &&
           payload.approved &&
@@ -610,6 +664,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   activeStream: null,
   activeProtocolStreamingCard: null,
+  activeThinkTaskId: null,
   streamingTaskId: null,
   lastError: null,
   beginStream: (conversationId, taskId, inputCard) => {
@@ -645,6 +700,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           }
         : null,
       activeProtocolStreamingCard: null,
+      activeThinkTaskId: null,
       streamingTaskId: initialized ? taskId : null,
       lastError: null,
     }));
@@ -712,6 +768,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         }),
         activeStream: null,
         activeProtocolStreamingCard: null,
+        activeThinkTaskId: null,
         streamingTaskId: null,
       };
     });
@@ -721,6 +778,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       const stream = state.activeStream;
       if (!stream || stream.taskId !== taskId) {
         return {
+          activeThinkTaskId:
+            state.activeThinkTaskId === taskId ? null : state.activeThinkTaskId,
           lastError: message,
         };
       }
@@ -749,6 +808,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         }),
         activeStream: null,
         activeProtocolStreamingCard: null,
+        activeThinkTaskId: null,
         streamingTaskId: null,
         lastError: message,
       };
@@ -788,6 +848,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         }),
         activeStream: null,
         activeProtocolStreamingCard: null,
+        activeThinkTaskId: null,
         streamingTaskId: null,
       };
     });
@@ -848,6 +909,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         currentConversationId: resolvedCurrentConversationId,
         activeStream: null,
         activeProtocolStreamingCard: null,
+        activeThinkTaskId: null,
         streamingTaskId: null,
         isHydrated: true,
       });
@@ -877,6 +939,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         currentConversationId: resolvedCurrentConversationId,
         activeStream: null,
         activeProtocolStreamingCard: null,
+        activeThinkTaskId: null,
         streamingTaskId: null,
         lastError: null,
       });
