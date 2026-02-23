@@ -14,6 +14,7 @@ import type {
   ProtocolEventPayload,
   ProtocolOpPayload,
   ProtocolRuntimeConfigPatch,
+  ToolApprovalRequest,
 } from '../types';
 
 type NewMessage = Omit<Message, 'id' | 'timestamp'>;
@@ -56,7 +57,7 @@ interface AppState {
   activeStream: ActiveStream | null;
   activeProtocolStreamingCard: ActiveProtocolStreamingCard | null;
   activeThinkTaskId: string | null;
-  streamingTaskId: string | null;
+  streamingTaskIds: Set<string>;
   lastError: string | null;
   beginStream: (conversationId: string, taskId: string, inputCard: InputCard) => string | null;
   appendStreamDelta: (taskId: string, chunk: string) => void;
@@ -69,6 +70,11 @@ interface AppState {
   reloadWorkspaceConversations: () => Promise<void>;
 
   exportConversation: (conversationId: string) => void;
+
+  // Permission & Approval System
+  pendingApprovalRequest: ToolApprovalRequest | null;
+  setPendingApprovalRequest: (request: ToolApprovalRequest | null) => void;
+  resolveApprovalRequest: (approved: boolean, rememberChoice: boolean) => Promise<void>;
 }
 
 const defaultConfig: AppConfig = createDefaultConfig();
@@ -418,6 +424,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         state.currentConversationId === id ? (remainingConversations[0]?.id ?? null) : state.currentConversationId;
 
       const shouldResetStream = state.activeStream?.conversationId === id;
+      const nextStreamingTaskIds = shouldResetStream ? new Set<string>() : state.streamingTaskIds;
 
       return {
         conversations: remainingConversations,
@@ -425,13 +432,14 @@ export const useAppStore = create<AppState>((set, get) => ({
         activeStream: shouldResetStream ? null : state.activeStream,
         activeProtocolStreamingCard: shouldResetStream ? null : state.activeProtocolStreamingCard,
         activeThinkTaskId: shouldResetStream ? null : state.activeThinkTaskId,
-        streamingTaskId: shouldResetStream ? null : state.streamingTaskId,
+        streamingTaskIds: nextStreamingTaskIds,
       };
     });
   },
   clearConversation: (conversationId) => {
     set((state) => {
       const shouldResetStream = state.activeStream?.conversationId === conversationId;
+      const nextStreamingTaskIds = shouldResetStream ? new Set<string>() : state.streamingTaskIds;
       return {
         conversations: state.conversations.map((conversation) => {
           if (conversation.id !== conversationId) {
@@ -448,7 +456,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         activeStream: shouldResetStream ? null : state.activeStream,
         activeProtocolStreamingCard: shouldResetStream ? null : state.activeProtocolStreamingCard,
         activeThinkTaskId: shouldResetStream ? null : state.activeThinkTaskId,
-        streamingTaskId: shouldResetStream ? null : state.streamingTaskId,
+        streamingTaskIds: nextStreamingTaskIds,
       };
     });
   },
@@ -665,45 +673,53 @@ export const useAppStore = create<AppState>((set, get) => ({
   activeStream: null,
   activeProtocolStreamingCard: null,
   activeThinkTaskId: null,
-  streamingTaskId: null,
+  streamingTaskIds: new Set<string>(),
   lastError: null,
   beginStream: (conversationId, taskId, inputCard) => {
     const assistantMessageId = uuidv4();
     const now = Date.now();
     let initialized = false;
 
-    set((state) => ({
-      conversations: state.conversations.map((conversation) => {
-        if (conversation.id !== conversationId) {
-          return conversation;
-        }
-        initialized = true;
-        const streamMessage: Message = {
-          id: assistantMessageId,
-          role: 'assistant',
-          content: '',
-          timestamp: now,
-          isStreaming: true,
-        };
-        return {
-          ...conversation,
-          messages: [...conversation.messages, streamMessage],
-          updatedAt: now,
-        };
-      }),
-      activeStream: initialized
-        ? {
-            taskId,
-            conversationId,
-            assistantMessageId,
-            inputCard,
+    set((state) => {
+      // Check if task already exists in streaming set
+      if (state.streamingTaskIds.has(taskId)) {
+        return state;
+      }
+
+      const nextStreamingTaskIds = new Set(state.streamingTaskIds);
+      nextStreamingTaskIds.add(taskId);
+
+      return {
+        conversations: state.conversations.map((conversation) => {
+          if (conversation.id !== conversationId) {
+            return conversation;
           }
-        : null,
-      activeProtocolStreamingCard: null,
-      activeThinkTaskId: null,
-      streamingTaskId: initialized ? taskId : null,
-      lastError: null,
-    }));
+          initialized = true;
+          const streamMessage: Message = {
+            id: assistantMessageId,
+            role: 'assistant',
+            content: '',
+            timestamp: now,
+            isStreaming: true,
+          };
+          return {
+            ...conversation,
+            messages: [...conversation.messages, streamMessage],
+            updatedAt: now,
+          };
+        }),
+        activeStream: initialized
+          ? {
+              taskId,
+              conversationId,
+              assistantMessageId,
+              inputCard,
+            }
+          : state.activeStream,
+        streamingTaskIds: nextStreamingTaskIds,
+        lastError: null,
+      };
+    });
 
     return initialized ? assistantMessageId : null;
   },
@@ -746,6 +762,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (!stream || stream.taskId !== taskId) {
         return state;
       }
+
+      const nextStreamingTaskIds = new Set(state.streamingTaskIds);
+      nextStreamingTaskIds.delete(taskId);
+
       return {
         conversations: state.conversations.map((conversation) => {
           if (conversation.id !== stream.conversationId) {
@@ -766,10 +786,8 @@ export const useAppStore = create<AppState>((set, get) => ({
             updatedAt: Date.now(),
           };
         }),
-        activeStream: null,
-        activeProtocolStreamingCard: null,
-        activeThinkTaskId: null,
-        streamingTaskId: null,
+        activeStream: nextStreamingTaskIds.size === 0 ? null : state.activeStream,
+        streamingTaskIds: nextStreamingTaskIds,
       };
     });
   },
@@ -777,12 +795,20 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((state) => {
       const stream = state.activeStream;
       if (!stream || stream.taskId !== taskId) {
+        const nextStreamingTaskIds = new Set(state.streamingTaskIds);
+        nextStreamingTaskIds.delete(taskId);
+
         return {
+          streamingTaskIds: nextStreamingTaskIds,
           activeThinkTaskId:
             state.activeThinkTaskId === taskId ? null : state.activeThinkTaskId,
           lastError: message,
         };
       }
+
+      const nextStreamingTaskIds = new Set(state.streamingTaskIds);
+      nextStreamingTaskIds.delete(taskId);
+
       return {
         conversations: state.conversations.map((conversation) => {
           if (conversation.id !== stream.conversationId) {
@@ -806,10 +832,8 @@ export const useAppStore = create<AppState>((set, get) => ({
             updatedAt: Date.now(),
           };
         }),
-        activeStream: null,
-        activeProtocolStreamingCard: null,
-        activeThinkTaskId: null,
-        streamingTaskId: null,
+        activeStream: nextStreamingTaskIds.size === 0 ? null : state.activeStream,
+        streamingTaskIds: nextStreamingTaskIds,
         lastError: message,
       };
     });
@@ -820,6 +844,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       if (!stream || stream.taskId !== taskId) {
         return state;
       }
+
+      const nextStreamingTaskIds = new Set(state.streamingTaskIds);
+      nextStreamingTaskIds.delete(taskId);
+
       return {
         conversations: state.conversations.map((conversation) => {
           if (conversation.id !== stream.conversationId) {
@@ -846,10 +874,8 @@ export const useAppStore = create<AppState>((set, get) => ({
             updatedAt: Date.now(),
           };
         }),
-        activeStream: null,
-        activeProtocolStreamingCard: null,
-        activeThinkTaskId: null,
-        streamingTaskId: null,
+        activeStream: nextStreamingTaskIds.size === 0 ? null : state.activeStream,
+        streamingTaskIds: nextStreamingTaskIds,
       };
     });
   },
@@ -884,9 +910,18 @@ export const useAppStore = create<AppState>((set, get) => ({
           : undefined
       );
 
-      const conversations = Array.isArray(bootstrapResponse.conversations)
+      let conversations = Array.isArray(bootstrapResponse.conversations)
         ? bootstrapResponse.conversations.map(normalizeConversation)
         : [];
+
+      // Sort conversations: pinned first, then by updatedAt descending
+      conversations.sort((a, b) => {
+        if (Boolean(a.pinned) !== Boolean(b.pinned)) {
+          return a.pinned ? -1 : 1;
+        }
+        return b.updatedAt - a.updatedAt;
+      });
+
       const hasCurrentConversation = conversations.some(
         (conversation) => conversation.id === bootstrapResponse.currentConversationId
       );
@@ -910,7 +945,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         activeStream: null,
         activeProtocolStreamingCard: null,
         activeThinkTaskId: null,
-        streamingTaskId: null,
+        streamingTaskIds: new Set<string>(),
         isHydrated: true,
       });
     } catch (error) {
@@ -921,9 +956,18 @@ export const useAppStore = create<AppState>((set, get) => ({
   reloadWorkspaceConversations: async () => {
     try {
       const bootstrapResponse = await TauriAPI.storageBootstrap();
-      const conversations = Array.isArray(bootstrapResponse.conversations)
+      let conversations = Array.isArray(bootstrapResponse.conversations)
         ? bootstrapResponse.conversations.map(normalizeConversation)
         : [];
+
+      // Sort conversations: pinned first, then by updatedAt descending
+      conversations.sort((a, b) => {
+        if (Boolean(a.pinned) !== Boolean(b.pinned)) {
+          return a.pinned ? -1 : 1;
+        }
+        return b.updatedAt - a.updatedAt;
+      });
+
       const hasCurrentConversation = conversations.some(
         (conversation) => conversation.id === bootstrapResponse.currentConversationId
       );
@@ -940,7 +984,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         activeStream: null,
         activeProtocolStreamingCard: null,
         activeThinkTaskId: null,
-        streamingTaskId: null,
+        streamingTaskIds: new Set<string>(),
         lastError: null,
       });
     } catch (error) {
@@ -968,6 +1012,38 @@ export const useAppStore = create<AppState>((set, get) => ({
         });
       }
     })();
+  },
+
+  // Permission & Approval System
+  pendingApprovalRequest: null,
+  setPendingApprovalRequest: (request) => {
+    set({ pendingApprovalRequest: request });
+  },
+  resolveApprovalRequest: async (approved, rememberChoice) => {
+    const request = get().pendingApprovalRequest;
+    if (!request) {
+      logger.warn('No pending approval request to resolve');
+      return;
+    }
+
+    try {
+      // Emit approval result event to backend
+      // Note: This assumes the backend is listening for approval resolution events
+      // The actual implementation may need adjustment based on your backend architecture
+      logger.info('Approval request resolved', {
+        requestId: request.requestId,
+        approved,
+        rememberChoice,
+      });
+
+      // TODO: Call Tauri API to resolve approval
+      // await TauriAPI.resolveToolApproval(request.requestId, approved, rememberChoice);
+
+      // Clear the pending request
+      set({ pendingApprovalRequest: null });
+    } catch (error) {
+      logger.error('Failed to resolve approval request', { error, request });
+    }
   },
 }));
 
@@ -1080,7 +1156,7 @@ useAppStore.subscribe((state) => {
     return;
   }
 
-  const delayMs = state.streamingTaskId ? PERSIST_STREAMING_DEBOUNCE_MS : PERSIST_DEBOUNCE_MS;
+  const delayMs = state.streamingTaskIds.size > 0 ? PERSIST_STREAMING_DEBOUNCE_MS : PERSIST_DEBOUNCE_MS;
   schedulePersistToTauriStore(
     {
       config: state.config,

@@ -413,6 +413,22 @@ export type ProtocolEventPayload =
       applied: boolean;
       reason: string;
       patch?: ProtocolRuntimeConfigPatch | null;
+    }
+  | {
+      type: 'tool_approval_required';
+      request_id: string;
+      tool: string;
+      args: unknown;
+      risk_level: 'low' | 'medium' | 'high';
+      reason: string;
+      expires_at_unix_ms: number;
+    }
+  | {
+      type: 'tool_approval_result';
+      request_id: string;
+      approved: boolean;
+      remember_choice: boolean;
+      reason: string;
     };
 
 export interface ProtocolCard {
@@ -623,4 +639,30 @@ export interface PersonalMemoryListResponse {
 
 export interface MemoryDeletePersonalRequest {
   id: number;
+}
+
+// Permission and Approval System Types
+
+export interface ToolApprovalRequest {
+  requestId: string;
+  taskId: string;
+  tool: string;
+  args: unknown;
+  riskLevel: 'low' | 'medium' | 'high';
+  reason: string;
+  expiresAtUnixMs: number;
+  timestamp: number;
+}
+
+export interface PermissionPolicy {
+  approvalPolicy: ApprovalPolicy;
+  toolAllowList: string[];
+  toolDenyList: string[];
+  rememberApprovals: boolean;
+}
+
+export interface ApprovalResolution {
+  requestId: string;
+  approved: boolean;
+  rememberChoice: boolean;
 }

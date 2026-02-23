@@ -6,6 +6,7 @@ import ChatInput from './ChatInput';
 import ProtocolPanel from './ProtocolPanel';
 import Sidebar from './Sidebar';
 import SettingsModal from './SettingsModal';
+import ApprovalModal from './ApprovalModal';
 import type {
   AgentEvent,
   AgentHistoryMessage,
@@ -78,13 +79,16 @@ const ChatView: React.FC = () => {
     cancelStream,
     setCurrentConversation,
     activeThinkTaskId,
-    streamingTaskId,
+    streamingTaskIds,
     exportConversation,
     deleteConversation,
     retryFromCard,
     hydrate,
     reloadWorkspaceConversations,
     isHydrated,
+    pendingApprovalRequest,
+    setPendingApprovalRequest,
+    resolveApprovalRequest,
   } = useAppStore();
 
   const [isCompactLayout, setIsCompactLayout] = useState(detectCompactLayout);
@@ -306,8 +310,24 @@ const ChatView: React.FC = () => {
           if (event.payload && typeof event.seq === 'number') {
             const payload = event.payload as ProtocolEventPayload;
             addProtocolEventCard(event.task_id, event.seq, payload);
+
+            // Handle conversation title suggestion
             if (payload.type === 'conversation_title_suggestion') {
               renameConversation(payload.conversation_id, payload.title);
+            }
+
+            // Handle tool approval required
+            if (payload.type === 'tool_approval_required') {
+              setPendingApprovalRequest({
+                requestId: payload.request_id,
+                taskId: event.task_id,
+                tool: payload.tool,
+                args: payload.args,
+                riskLevel: payload.risk_level,
+                reason: payload.reason,
+                expiresAtUnixMs: payload.expires_at_unix_ms,
+                timestamp: Date.now(),
+              });
             }
           }
           break;
@@ -325,6 +345,7 @@ const ChatView: React.FC = () => {
       flushPendingDeltaForTask,
       queueDeltaChunk,
       renameConversation,
+      setPendingApprovalRequest,
     ]
   );
 
@@ -370,9 +391,12 @@ const ChatView: React.FC = () => {
 
   const handleSendMessage = useCallback(
     async (input: InputCard) => {
-      if (!isHydrated || streamingTaskId) {
+      if (!isHydrated) {
         return;
       }
+
+      // Allow multiple concurrent streams - remove single-stream blocking
+      // The backend will handle concurrency limits
 
       const conversationId = ensureConversation();
       if (currentConversationId !== conversationId) {
@@ -458,7 +482,7 @@ const ChatView: React.FC = () => {
       failStream,
       isHydrated,
       setCurrentConversation,
-      streamingTaskId,
+      streamingTaskIds,
     ]
   );
 
@@ -494,7 +518,7 @@ const ChatView: React.FC = () => {
 
   const handleRegenerateMessage = useCallback(
     (assistantMessageId: string) => {
-      if (!currentConversation || streamingTaskId) {
+      if (!currentConversation || streamingTaskIds.size > 0) {
         return;
       }
 
@@ -516,12 +540,12 @@ const ChatView: React.FC = () => {
 
       void handleSendMessage(toInputCardFromUserMessage(previousUserMessage));
     },
-    [currentConversation, handleSendMessage, streamingTaskId, toInputCardFromUserMessage]
+    [currentConversation, handleSendMessage, streamingTaskIds, toInputCardFromUserMessage]
   );
 
   const handleRetryCard = useCallback(
     (cardId: string) => {
-      if (!currentConversationId || streamingTaskId) {
+      if (!currentConversationId || streamingTaskIds.size > 0) {
         return;
       }
       const input = retryFromCard(currentConversationId, cardId);
@@ -529,25 +553,31 @@ const ChatView: React.FC = () => {
         void handleSendMessage(input);
       }
     },
-    [currentConversationId, handleSendMessage, retryFromCard, streamingTaskId]
+    [currentConversationId, handleSendMessage, retryFromCard, streamingTaskIds]
   );
 
   const handleCancelStream = useCallback(async () => {
-    if (!streamingTaskId) {
+    // Cancel the most recent stream (activeStream)
+    // In a truly parallel system, we might want to cancel specific streams
+    // For now, we'll cancel the active stream if it exists
+    const activeStream = useAppStore.getState().activeStream;
+    if (!activeStream) {
       return;
     }
 
+    const { taskId } = activeStream;
+
     try {
-      await TauriAPI.cancelAgentTask(streamingTaskId);
+      await TauriAPI.cancelAgentTask(taskId);
     } catch (error) {
       logger.error('Failed to cancel stream task', {
-        taskId: streamingTaskId,
+        taskId,
         error,
       });
     } finally {
-      cancelStream(streamingTaskId);
+      cancelStream(taskId);
     }
-  }, [cancelStream, streamingTaskId]);
+  }, [cancelStream]);
 
   const handleResolveConfigChangeRequest = useCallback(
     async (taskId: string, requestId: string, approved: boolean, persist: boolean) => {
@@ -585,7 +615,7 @@ const ChatView: React.FC = () => {
   }, [workspaceDraftNormalized]);
 
   const handleApplyWorkspace = useCallback(async () => {
-    if (streamingTaskId) {
+    if (streamingTaskIds.size > 0) {
       setWorkspaceFeedback({
         type: 'error',
         message: 'A session is running. Stop generation before changing workspace.',
@@ -633,7 +663,7 @@ const ChatView: React.FC = () => {
   }, [
     config,
     reloadWorkspaceConversations,
-    streamingTaskId,
+    streamingTaskIds,
     updateConfig,
     workspaceChanged,
     workspaceDraftNormalized,
@@ -644,7 +674,7 @@ const ChatView: React.FC = () => {
     setWorkspaceFeedback(null);
   }, []);
 
-  const isStreaming = streamingTaskId !== null;
+  const isStreaming = streamingTaskIds.size > 0;
   return (
     <div className="app-shell">
       <div className="app-canvas">
@@ -820,7 +850,7 @@ const ChatView: React.FC = () => {
               <MessageList
                 messages={currentConversation?.messages || []}
                 protocolCards={currentConversation?.protocolCards || []}
-                streamingTaskId={streamingTaskId}
+                streamingTaskIds={streamingTaskIds}
                 activeThinkTaskId={activeThinkTaskId}
                 onRegenerateMessage={handleRegenerateMessage}
                 onContinueFromMessage={handleContinueFromMessage}
@@ -847,6 +877,12 @@ const ChatView: React.FC = () => {
       </div>
 
       <SettingsModal isOpen={settingsOpen} onClose={() => setSettingsOpen(false)} />
+
+      <ApprovalModal
+        request={pendingApprovalRequest}
+        onResolve={resolveApprovalRequest}
+        onClose={() => setPendingApprovalRequest(null)}
+      />
     </div>
   );
 };

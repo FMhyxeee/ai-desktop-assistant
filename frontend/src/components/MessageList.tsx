@@ -19,7 +19,7 @@ interface MessageListProps {
   messages: Message[];
   protocolCards: ProtocolCard[];
   streamingMessage?: Message;
-  streamingTaskId?: string | null;
+  streamingTaskIds?: Set<string>;
   activeThinkTaskId?: string | null;
   onRegenerateMessage?: (messageId: string) => void;
   onContinueFromMessage?: (messageId: string) => void;
@@ -136,7 +136,7 @@ const MessageList: React.FC<MessageListProps> = ({
   messages,
   protocolCards,
   streamingMessage,
-  streamingTaskId,
+  streamingTaskIds,
   activeThinkTaskId,
   onRegenerateMessage,
   onContinueFromMessage,
@@ -197,14 +197,24 @@ const MessageList: React.FC<MessageListProps> = ({
     }
 
     let forcedStreamingBind = false;
-    if (streamingTaskId) {
-      const streamingAssistantMessage = [...assistantMessages]
+    // Handle multiple concurrent streaming tasks
+    if (streamingTaskIds && streamingTaskIds.size > 0) {
+      const streamingAssistantMessages = [...assistantMessages]
         .reverse()
-        .find((message) => message.isStreaming);
-      if (streamingAssistantMessage && !messageTaskMap.has(streamingAssistantMessage.id)) {
-        messageTaskMap.set(streamingAssistantMessage.id, streamingTaskId);
-        forcedStreamingBind = true;
-      }
+        .filter((message) => message.isStreaming);
+
+      // Bind each streaming message to a task ID from the set
+      streamingAssistantMessages.forEach((streamingMessage, index) => {
+        if (!messageTaskMap.has(streamingMessage.id)) {
+          // Get the corresponding task ID from the set
+          // In order, assign streaming messages to task IDs
+          const taskIdArray = Array.from(streamingTaskIds);
+          if (index < taskIdArray.length) {
+            messageTaskMap.set(streamingMessage.id, taskIdArray[index]);
+            forcedStreamingBind = true;
+          }
+        }
+      });
     }
 
     const unboundAssistantMessageIds = assistantMessages
@@ -218,7 +228,7 @@ const MessageList: React.FC<MessageListProps> = ({
       forcedStreamingBind,
       unboundAssistantMessageIds,
     };
-  }, [allMessages, sortedProtocolCards, streamingTaskId]);
+  }, [allMessages, sortedProtocolCards, streamingTaskIds]);
 
   useEffect(() => {
     const viewport = viewportRef.current;
