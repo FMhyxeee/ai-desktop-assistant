@@ -5351,7 +5351,7 @@ fn build_stream_op(
                 ProtocolOpPayload::UserTurn {
                     model: config.model.clone(),
                     cwd: cwd.to_string_lossy().to_string(),
-                    approval_policy: "never_ask".to_string(),
+                    approval_policy: "never-ask".to_string(),
                     sandbox_policy: "persistent".to_string(),
                     text,
                     images: protocol_images,
@@ -7217,6 +7217,7 @@ fn error_code(error: &AgentError) -> String {
         AgentError::Session(_) => "session_error",
         AgentError::NotImplemented(_) => "not_implemented",
         AgentError::InvalidConfig(_) => "invalid_config",
+        AgentError::Timeout(_) => "timeout",
     }
     .to_string()
 }

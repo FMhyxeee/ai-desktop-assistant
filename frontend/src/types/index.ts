@@ -208,13 +208,16 @@ export interface AgentHistoryMessage {
   content: string;
 }
 
+export type ApprovalPolicy = 'always-ask' | 'read-only-safe' | 'never-ask';
+export type SandboxPolicy = 'readonly' | 'persistent' | 'in-memory';
+
 export type ProtocolOpPayload =
   | {
       type: 'user_turn';
       model: string;
       cwd: string;
-      approval_policy: string;
-      sandbox_policy: string;
+      approval_policy: ApprovalPolicy;
+      sandbox_policy: SandboxPolicy;
       text: string;
       images?: Array<{
         name: string;
