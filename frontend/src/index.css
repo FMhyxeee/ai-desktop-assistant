@@ -1269,6 +1269,27 @@ select {
   color: #0e6f5e;
 }
 
+.assistant-think-content {
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(240, 245, 250, 0.9);
+  border: 1px solid rgba(184, 199, 223, 0.5);
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.assistant-think-content pre {
+  margin: 0;
+  padding: 0;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: var(--ink-700);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+}
+
 .assistant-tool-event {
   border: 1px solid rgba(183, 198, 223, 0.82);
   border-radius: 9px;

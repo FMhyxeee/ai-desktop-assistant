@@ -36,6 +36,7 @@ interface ThinkTimeline {
   entries: ThinkTimelineEntry[];
   isRunning: boolean;
   runningSinceMs: number | null;
+  reasoningContent: string;
 }
 
 const formatTime = (timestamp: number): string =>
@@ -74,6 +75,7 @@ const EXCLUDED_TOOL_EVENT_TYPES = new Set<string>([
   'turn_started',
   'turn_complete',
   'think_status',
+  'reasoning_streaming',
   'guidance_context',
   'governance_report',
   'conversation_title_suggestion',
@@ -81,6 +83,7 @@ const EXCLUDED_TOOL_EVENT_TYPES = new Set<string>([
   'config_change_request',
   'config_change_result',
 ]);
+
 
 const isToolCard = (card: ProtocolCard): boolean => {
   if (card.direction === 'op') {
@@ -98,6 +101,7 @@ const buildThinkTimeline = (
   activeThinkTaskId: string | null | undefined
 ): ThinkTimeline => {
   const thinkCards = taskCards.filter((card) => card.direction === 'event' && card.type === 'think_status');
+  const reasoningCards = taskCards.filter((card) => card.direction === 'event' && card.type === 'reasoning_streaming');
   const entries: ThinkTimelineEntry[] = [];
   let startedAt: number | null = null;
 
@@ -125,12 +129,19 @@ const buildThinkTimeline = (
 
   const isRunning = Boolean((taskId && activeThinkTaskId === taskId) || startedAt !== null);
 
+  // 提取推理内容
+  const reasoningContent = reasoningCards
+    .map((card) => (card.payload as { type: 'reasoning_streaming'; chunk: string }).chunk)
+    .join('');
+
   return {
     entries,
     isRunning,
     runningSinceMs: startedAt,
+    reasoningContent,
   };
 };
+
 
 const MessageList: React.FC<MessageListProps> = ({
   messages,
@@ -322,7 +333,7 @@ const MessageList: React.FC<MessageListProps> = ({
           const thinkTimeline = buildThinkTimeline(taskCards, taskId, activeThinkTaskId);
           const toolCards = taskCards.filter(isToolCard);
 
-          const hasThinkSection = thinkTimeline.entries.length > 0 || thinkTimeline.isRunning;
+          const hasThinkSection = thinkTimeline.entries.length > 0 || thinkTimeline.isRunning || thinkTimeline.reasoningContent.length > 0;
           const hasToolSection = toolCards.length > 0;
           const isThinkExpanded = thinkTimeline.isRunning
             ? true
@@ -408,7 +419,13 @@ const MessageList: React.FC<MessageListProps> = ({
 
                         {isThinkExpanded && (
                           <div className="assistant-detail-body">
+                            {thinkTimeline.reasoningContent && (
+                              <div className="assistant-think-content">
+                                <pre>{thinkTimeline.reasoningContent}</pre>
+                              </div>
+                            )}
                             <ul className="assistant-think-timeline">
+
                               {thinkTimeline.entries.map((entry) => (
                                 <li key={entry.id} className="assistant-think-item">
                                   <span className="assistant-think-label">{entry.label}</span>

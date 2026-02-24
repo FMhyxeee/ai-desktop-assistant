@@ -163,6 +163,9 @@ const summarizeEventPayload = (payload: ProtocolEventPayload): string => {
       return `ProcessError | ${payload.action} | ${payload.message}`;
     case 'think_status':
       return payload.active ? 'ThinkStatus | active' : 'ThinkStatus | inactive';
+    case 'reasoning_streaming':
+      return `ReasoningStreaming | ${payload.chunk.length} chars`;
+
     case 'warning':
       return `Warning | ${payload.message}`;
     case 'error':
@@ -248,7 +251,9 @@ const levelFromEventPayload = (payload: ProtocolEventPayload): ProtocolCardLevel
     case 'sub_agent_started':
     case 'sub_agent_progress':
     case 'think_status':
+    case 'reasoning_streaming':
       return 'info';
+
     case 'governance_report':
       if (payload.report.blockerCount > 0) {
         return 'error';

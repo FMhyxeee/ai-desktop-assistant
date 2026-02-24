@@ -391,6 +391,11 @@ pub enum ProtocolEventPayload {
     ThinkStatus {
         active: bool,
     },
+    /// 推理内容流式输出 (GLM 思考模式)
+    ReasoningStreaming {
+        chunk: String,
+    },
+
     Warning {
         message: String,
     },

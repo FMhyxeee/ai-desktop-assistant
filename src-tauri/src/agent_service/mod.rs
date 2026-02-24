@@ -801,7 +801,21 @@ impl AgentService {
                 }
 
                 match event {
+                    Event::ReasoningStreaming { chunk } => {
+                        // 推理内容流式输出 - 发送到前端
+                        if !chunk.is_empty() {
+                            seq += 1;
+                            emit(AgentEvent::ProtocolEvent {
+                                task_id: task_id_for_worker.clone(),
+                                seq,
+                                payload: ProtocolEventPayload::ReasoningStreaming {
+                                    chunk,
+                                },
+                            });
+                        }
+                    }
                     Event::ModelStreaming { chunk } => {
+
                         if !chunk.trim().is_empty() {
                             emit_think_stop!();
                         }
@@ -4498,6 +4512,10 @@ fn map_protocol_event(
         Event::ModelStreaming { chunk } => Some(ProtocolEventPayload::ModelStreaming {
             chunk: chunk.clone(),
         }),
+        Event::ReasoningStreaming { chunk } => Some(ProtocolEventPayload::ReasoningStreaming {
+            chunk: chunk.clone(),
+        }),
+
         Event::ModelComplete { content, usage } => Some(ProtocolEventPayload::ModelComplete {
             content: content.clone(),
             usage: protocol_usage(usage),

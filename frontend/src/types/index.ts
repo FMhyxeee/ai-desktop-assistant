@@ -297,6 +297,10 @@ export type ProtocolEventPayload =
       active: boolean;
     }
   | {
+      type: 'reasoning_streaming';
+      chunk: string;
+    }
+  | {
       type: 'warning';
       message: string;
     }
